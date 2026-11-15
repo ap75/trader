@@ -380,7 +380,7 @@ def test_bot_without_job_queue_still_starts(make_client, cfg_db, monkeypatch, ca
     app = b.build_app()
     monkeypatch.setattr(type(app), "job_queue", property(lambda self: None))
     monkeypatch.setattr(type(app.bot), "set_my_commands", lambda self, *a, **k: asyncio.sleep(0))
-    monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda cfg, cb: NS(start=lambda: None, stop=lambda: None))
+    monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda *a: NS(start=lambda: None, stop=lambda: None))
     asyncio.run(app.post_init(app))
     assert "нет JobQueue" in caplog.text
 
@@ -401,10 +401,11 @@ def test_bot_schedules_collector(make_client, cfg_db, monkeypatch):
     monkeypatch.setattr(type(app.job_queue), "run_repeating",
                         lambda self, cb, interval, first, name: jobs.append((cb, interval, first, name)))
     monkeypatch.setattr(type(app.bot), "set_my_commands", lambda self, *a, **k: asyncio.sleep(0))
-    monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda cfg, cb: NS(start=lambda: None, stop=lambda: None))
+    monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda *a: NS(start=lambda: None, stop=lambda: None))
     monkeypatch.setattr("optbot.bot.time.time", lambda: 899.5)
     asyncio.run(app.post_init(app))
-    assert jobs == [(b._collect_job, 900, pytest.approx(5.5), "collector")]
+    assert (b._collect_job, 900, pytest.approx(5.5), "collector") in jobs
+    assert (b._sync_job, 3600, 10, "journal_sync") in jobs   # сверка журнала: при старте и каждый час
 
 
 def test_bot_collector_disabled(make_client, cfg_db, monkeypatch):
@@ -414,9 +415,9 @@ def test_bot_collector_disabled(make_client, cfg_db, monkeypatch):
     jobs = []
     monkeypatch.setattr(type(app.job_queue), "run_repeating", lambda self, *a, **k: jobs.append(a))
     monkeypatch.setattr(type(app.bot), "set_my_commands", lambda self, *a, **k: asyncio.sleep(0))
-    monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda cfg, cb: NS(start=lambda: None, stop=lambda: None))
+    monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda *a: NS(start=lambda: None, stop=lambda: None))
     asyncio.run(app.post_init(app))
-    assert jobs == []
+    assert [j for j in jobs if j and j[0] == b._collect_job] == []
 
 
 def test_store_failure_reports_legs_missing(make_client, cfg_db, monkeypatch):
@@ -476,3 +477,39 @@ def test_bad_instrument_symbol_skipped(client, fake):
         return r
     fake.get_instruments_info = with_bad
     assert all(i.symbol != "BTC-WEIRD" for i in client.load_instruments("BTC", force=True))
+
+
+def test_set_wal_retries_while_locked(monkeypatch):
+    calls = []
+
+    class Conn:
+        def execute(self, sql):
+            calls.append(sql)
+            if len(calls) < 3:
+                raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(db.time, "sleep", lambda s: None)
+    db._set_wal(Conn())
+    assert len(calls) == 3
+
+
+def test_set_wal_gives_up_and_other_errors(monkeypatch):
+    class Locked:
+        def execute(self, sql):
+            raise sqlite3.OperationalError("database is locked")
+
+    class Broken:
+        def execute(self, sql):
+            raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(db.time, "sleep", lambda s: None)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        db._set_wal(Locked(), timeout=0)
+    with pytest.raises(sqlite3.OperationalError, match="disk"):
+        db._set_wal(Broken())
+
+
+@pytest.mark.parametrize("raw,out", [("", 60), ("30", 30), ("4", 60), ("2000", 60), ("abc", 60)])
+def test_int_in_env(monkeypatch, caplog, raw, out):
+    from optbot.config import _int_in
+    monkeypatch.setenv("X_SYNC", raw)
+    assert _int_in("X_SYNC", 60, 5, 1440) == out
+    assert ("нужно целое" in caplog.text) == (raw not in ("", "30"))

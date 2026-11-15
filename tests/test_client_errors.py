@@ -47,7 +47,7 @@ def test_place_order_sends_link_id(client, fake):
     r = OrderRequest(symbol=BTC_PUT, side="Buy", qty=D("0.01"), price=D("20"))
     res = client.place_order(r)
     sent = fake.called("place_order")[0]
-    assert sent["orderLinkId"] == r.link_id and r.link_id.startswith("ob-") and len(r.link_id) <= 36
+    assert sent["orderLinkId"] == r.link_id and r.link_id.startswith("man-u000000-") and len(r.link_id) <= 36
     assert sent["price"] == "20" and sent["timeInForce"] == "GTC" and r.sent
     assert res["orderId"] == fake.orders[-1]["orderId"]
 
@@ -161,6 +161,35 @@ def test_amend_rechecks_fills_at_confirm(make_client, cfg, fake):
     o.update(cumExecQty="0.05", leavesQty="0", cumExecValue="1")  # между превью и подтверждением всё исполнилось
     with pytest.raises(RiskError, match="больше уже исполненного"):
         c.amend_order(o["orderId"], r)
+
+
+@pytest.mark.parametrize("iv,change", [("0.5", dict(qty="0.04")), ("0.5", dict(price="30", orderIv="0.7")),
+                                       ("", dict(price="30"))])  # IV не пришла — любая смена цены чужая
+def test_amend_rejected_if_order_changed_after_preview(client, fake, iv, change):
+    o = fake.add_order(BTC_PUT, qty="0.05", price="20", order_iv=iv)
+    r, _ = client.amend_request(BTC_PUT, o["orderId"], price=D("25"))
+    o.update(change)
+    with pytest.raises(RiskError, match="изменили после превью"):
+        client.amend_order(o["orderId"], r)
+    assert not fake.called("amend_order") and not r.sent
+
+
+@pytest.mark.parametrize("drift", [dict(price="22"), dict(orderIv="0.55")])
+def test_amend_market_drift_is_not_a_change(client, fake, drift):
+    """Ордер по IV: биржа двигает цену; ценовой ордер: пересчитывает IV — это не чужое изменение."""
+    o = fake.add_order(BTC_PUT, qty="0.05", price="20", order_iv="0.5")
+    r, _ = client.amend_request(BTC_PUT, o["orderId"], qty=D("0.04"))
+    o.update(drift)
+    client.amend_order(o["orderId"], r)
+    assert fake.called("amend_order")
+
+
+def test_amend_partial_fill_after_preview_is_not_a_change(client, fake):
+    o = fake.add_order(BTC_PUT, qty="0.05", price="20")
+    r, _ = client.amend_request(BTC_PUT, o["orderId"], price=D("25"))
+    o.update(cumExecQty="0.01", leavesQty="0.04", cumExecValue="0.2")
+    client.amend_order(o["orderId"], r)
+    assert fake.orders[0]["price"] == "25"
 
 
 def test_amend_inactive_at_confirm(client, fake):

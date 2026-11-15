@@ -22,6 +22,7 @@ os.environ.update(
     ALLOW_ALL_GROUP_MEMBERS_VIEW="false", SENSITIVE_COMMANDS_DM_ONLY="true",
 )
 
+import dataclasses  # noqa: E402
 import time  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 
@@ -34,8 +35,9 @@ from tests.fakes import FakeHTTP  # noqa: E402
 
 
 @pytest.fixture
-def cfg() -> Settings:
-    return Settings()
+def cfg(tmp_path) -> Settings:
+    # своя БД на тест: журнал и сборщик не делят данные между тестами
+    return dataclasses.replace(Settings(), db_path=str(tmp_path / "market.db"))
 
 
 @pytest.fixture

@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import html
 import logging
@@ -53,6 +54,7 @@ from telegram.ext import (
 
 from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
 from .collector import Collector, seconds_to_next_slot
+from .journal import Journal, fmt_report, parse_period
 from .config import Settings, settings
 from .ws import ExecutionWatcher
 from .fmt import (
@@ -79,6 +81,8 @@ HELP = """Просмотр:
 /bal /greeks [BASE] — счёт*
 /pos [BASE] — позиции (кнопки «Закрыть»)*
 /orders [BASE] — ордера (кнопки «Изменить», «Отменить»)*
+/journal [ПЕРИОД] [csv] — журнал сделок и PnL*
+   ПЕРИОД: сегодня | вчера | 7d | 2026-11-01 | 2026-11-01..2026-11-15
 /id — ваш user id и chat id
 
 Торговля (только трейдеры):
@@ -133,6 +137,7 @@ class Pending:
     who: Who
     created: float
     lookup: Callable[[], str] | None = None  # после сбоя сети: узнать, что на самом деле на бирже
+    order_id: str | None = None       # действие над существующим ордером — выполняется под его блокировкой
 
 
 def guarded(level: str, sensitive: bool = False):
@@ -175,6 +180,7 @@ class OptionsBot:
         self.c = client
         self.cfg = cfg
         self.collector = Collector(client, cfg)
+        self.journal = Journal(cfg)
         self.pending: dict[str, Pending] = {}
         self.tokens: dict[str, dict] = {}            # короткие ключи для данных кнопок (лимит 64 байта)
         # (chat_id, id сообщения-вопроса) -> (токен меню amend, время); живут сутки, чтобы на поздний ответ
@@ -184,6 +190,8 @@ class OptionsBot:
         self._app: Application | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dm_failed: set[int] = set()
+        # orderId -> [блокировка, сколько держат/ждут]: изменения/отмены одного ордера идут строго по очереди
+        self._order_locks: dict[str, list] = {}
 
     # ---------- доступ ----------
     def who(self, update: Update) -> Who:
@@ -246,6 +254,24 @@ class OptionsBot:
         context.application.create_task(self.notify(context.bot, text, w))
 
     # ---------- утилиты ----------
+    @contextlib.asynccontextmanager
+    async def _order_lock(self, order_id: str | None):
+        """Последовательность действий над одним ордером. Проверка «ордер не изменился после превью»
+        и отправка — два запроса к бирже; без блокировки два почти одновременных подтверждения оба
+        видят старый ордер, и второе молча затирает первое."""
+        if not order_id:
+            yield
+            return
+        entry = self._order_locks.setdefault(order_id, [asyncio.Lock(), 0])
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if not entry[1]:
+                self._order_locks.pop(order_id, None)
+
     def _tok(self, **data) -> str:
         now = time.monotonic()
         for k in [k for k, v in self.tokens.items() if now - v["_t"] > TOKEN_TTL]:
@@ -387,9 +413,9 @@ class OptionsBot:
     # ---------- торговля ----------
     async def _ask_confirm(self, update: Update, context, w: Who, text: str, event: str,
                            action: Callable[[], dict], done: Callable[[dict], str], q=None,
-                           lookup: Callable[[], str] | None = None):
+                           lookup: Callable[[], str] | None = None, order_id: str | None = None):
         pid = secrets.token_hex(6)
-        self.pending[pid] = Pending(text, action, done, event, w, time.monotonic(), lookup)
+        self.pending[pid] = Pending(text, action, done, event, w, time.monotonic(), lookup, order_id)
         self.audit(f"{event}.request", w, pid=pid, order=text.replace("\n", " | "))
         who_line = f"\nИнициатор: {w.name}" if w.is_group else ""
         body = pre(f"{env_banner(self.cfg.env)}\n{text}{who_line}\n\n"
@@ -437,9 +463,21 @@ class OptionsBot:
         def lookup() -> str:
             return self.c.order_status_after_failure(req)
 
+        def place() -> dict:
+            # orderLinkId с хешем пользователя; «кто выставил» пишется в журнал ДО отправки на биржу
+            if not req.link_id:
+                req.link_id = self.journal.register_order(w.user_id, w.name, w.chat_id)
+            try:
+                return self.c.place_order(req)
+            except Exception as e:
+                if not req.sent or (isinstance(e, BybitError) and not isinstance(e, BybitNetworkError)):
+                    self.journal.forget_order(req.link_id)  # точно не на бирже — не оставлять «призрак»
+                    req.link_id = None
+                raise
+
         await self._ask_confirm(
             update, context, w, fmt_order_preview(req, req.ticker), event,
-            action=lambda: self.c.place_order(req),
+            action=place,
             done=lambda r: f"✅ Ордер принят\n{req.describe()}\norderId {r.get('orderId')}",
             lookup=lookup,
         )
@@ -484,7 +522,7 @@ class OptionsBot:
             update, context, w, fmt_amend_preview(req, orig, req.ticker), "amend",
             action=lambda: self.c.amend_order(oid, req),
             done=lambda r: f"✅ Ордер изменён\n{req.describe()}\norderId {r.get('orderId')}",
-            q=q, lookup=lookup,
+            q=q, lookup=lookup, order_id=oid,
         )
 
     async def _amend_menu(self, update: Update, w: Who, symbol: str, order_id: str):
@@ -497,8 +535,9 @@ class OptionsBot:
         bid, ask, mark = _d(t.get("bid1Price")), _d(t.get("ask1Price")), _d(t.get("markPrice"))
         mid = (bid + ask) / 2 if bid and ask else mark
         prices = {k: v for k, v in (("bid", bid), ("mid", mid), ("ask", ask), ("mark", mark)) if v > 0}
-        tok = self._tok(symbol=inst.symbol, oid=order_id, user=w.user_id,
+        tok = self._tok(symbol=inst.symbol, oid=order_id, user=w.user_id, name=w.name,
                         prices={k: str(v) for k, v in prices.items()})
+        self.audit("amend.menu", w, symbol=inst.symbol, order_id=order_id)
         text = (f"Изменить ордер {short_symbol(inst.symbol)}\n"
                 f"сейчас: {orig['side'].upper()} {orig['qty']} @ {px(orig.get('price'))}\n"
                 f"рынок: bid {px(bid)} / ask {px(ask)}  mark {px(mark)}\n\n"
@@ -518,10 +557,13 @@ class OptionsBot:
             self.tokens.pop(tok, None)
             await self.edit(q, pre("Изменение отменено"))
         elif choice == "other":
+            # selective + упоминание: поле ответа открывается только у автора меню, а не у всей группы
+            mention = f'<a href="tg://user?id={w.user_id}">{html.escape(w.name)}</a>'
             prompt = await update.effective_message.reply_text(
-                f"Новая цена для {short_symbol(d['symbol'])} — ответом на это сообщение:\n"
+                f"{mention}, новая цена для {html.escape(short_symbol(d['symbol']))} — ответом на это сообщение:\n"
                 "160   или   iv50   или   160 0.02 (цена и количество)",
-                reply_markup=ForceReply(input_field_placeholder="160 / iv50 / 160 0.02"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=ForceReply(selective=True, input_field_placeholder="160 / iv50 / 160 0.02"),
             )
             self.awaiting[(prompt.chat_id, prompt.message_id)] = (tok, time.monotonic())
         else:
@@ -542,7 +584,8 @@ class OptionsBot:
             self.awaiting.pop(key, None)
             raise ValueError("Меню устарело — откройте /orders заново")
         if d["user"] != w.user_id:
-            return
+            raise ValueError(f"Этот вопрос для {d.get('name') or 'другого трейдера'}. "
+                             "Чтобы изменить ордер самому — /orders → ✏️")
         parts = (msg.text or "").split()
         if len(parts) not in (1, 2):
             raise ValueError("Формат: ЦЕНА | ivNN [КОЛИЧЕСТВО], например 160 или iv50 или 160 0.02")
@@ -567,7 +610,8 @@ class OptionsBot:
         inst = await self.call(self.c.resolve_symbol, symbol)
         self.audit("cancel.request", w, symbol=inst.symbol, order_id=order_id)
         try:
-            res = await self.call(self.c.cancel_order, inst.symbol, order_id)
+            async with self._order_lock(order_id):  # без выяснения статуса — оно не должно держать ордер
+                res = await self.call(self.c.cancel_order, inst.symbol, order_id)
         except BybitNetworkError as e:
             self.audit("cancel.unknown", w, symbol=inst.symbol, order_id=order_id, err=str(e))
             try:
@@ -627,7 +671,10 @@ class OptionsBot:
         await q.answer("Отправляю…")
         await self.edit(q, pre(f"{p.text}\n\n⏳ Отправка…"))
         try:
-            res = await self.call(p.action)
+            # блокировка — только на проверку и отправку: выяснение статуса после сбоя (до 1–2 мин)
+            # не должно задерживать, например, срочную отмену этого ордера другим трейдером
+            async with self._order_lock(p.order_id):
+                res = await self.call(p.action)
         except BybitNetworkError as e:
             # запрос мог дойти до биржи — не говорим «ошибка», выясняем фактическое состояние
             self.audit(f"{p.event}.unknown", w, pid=pid, err=str(e))
@@ -715,17 +762,86 @@ class OptionsBot:
             return
         (log.warning if res.errors else log.info)("Сборщик: %s", res)
 
+    # ---------- журнал сделок ----------
+    async def _sync_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Сверка журнала с биржей. Исполнения, которых не было в WebSocket, — одним сводным уведомлением."""
+        try:
+            res = await asyncio.to_thread(self.journal.sync, self.c)
+        except Exception:
+            log.exception("Журнал: сверка не выполнена")
+            return
+        (log.warning if res.errors else log.info)("Журнал: %s", res)
+        missed = res.missed
+        if not missed:
+            return
+        log.warning("Журнал: %d исполнений без уведомления найдено сверкой (бот был выключен или обрыв WebSocket)",
+                    len(missed))
+        sent = 0
+        try:
+            lines = []
+            srcs = await asyncio.to_thread(self.journal.describe_many, [r.get("orderLinkId") for r in missed[:10]])
+            for r in missed[:10]:
+                src = srcs[r.get("orderLinkId")]
+                lines.append(f"{r.get('side', '?').upper()} {r.get('execQty')} {short_symbol(r.get('symbol', '?'))} "
+                             f"@ {r.get('execPrice')} · {src}")
+            more = f"\n… и ещё {len(missed) - 10}" if len(missed) > 10 else ""
+            sent = await self._broadcast(pre(f"{env_banner(self.cfg.env)}\n🔄 Сверка журнала: {len(missed)} исполн., "
+                                             f"пропущенных уведомлениями\n" + "\n".join(lines) + more), "сверки")
+        except Exception:
+            log.exception("Журнал: сводка сверки не отправлена")
+        if not sent:  # никому не дошло — вернуть «не объявлено», объявит следующая сверка
+            await asyncio.to_thread(self.journal.unnotify, [r.get("execId") for r in missed])
+
+    @guarded("view", sensitive=True)
+    async def cmd_journal(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
+        args = [a for a in context.args if a.lower() != "csv"]
+        want_csv = len(args) != len(context.args)
+        if len(args) > 1:
+            raise ValueError("Формат: /journal [сегодня|вчера|7d|ДАТА|ДАТА..ДАТА] [csv]")
+        if not self.cfg.journal_enabled:
+            raise ValueError("Журнал выключен (JOURNAL_ENABLED=false)")
+        start, end, label = parse_period(args)
+        rep = await asyncio.to_thread(self.journal.report, start, end, label)
+        await self.reply(update, f"{env_banner(self.cfg.env)}\n\n{fmt_report(rep)}")
+        if want_csv:
+            data = await asyncio.to_thread(self.journal.csv_bytes, start, end)
+            name = f"journal-{self.cfg.env}-{label.replace('..', '_').replace(' ', '').replace('.', '')}.csv"
+            await update.effective_chat.send_document(document=data, filename=name)
+
     # ---------- исполнения (WebSocket) ----------
     def _on_ws_executions(self, rows: list[dict]) -> None:
+        """Вызывается из потока pybit: только передаёт в asyncio (запись в БД может ждать блокировку —
+        поток WebSocket ждать не должен)."""
+        if self._loop and self._app:
+            self._loop.call_soon_threadsafe(lambda: self._app.create_task(self._ws_executions(rows)))
+
+    def _on_ws_orders(self, rows: list[dict]) -> None:
         """Вызывается из потока pybit."""
         if self._loop and self._app:
-            self._loop.call_soon_threadsafe(lambda: self._app.create_task(self.on_executions(rows)))
+            self._loop.call_soon_threadsafe(lambda: self._app.create_task(self._ws_orders(rows)))
+
+    async def _ws_executions(self, rows: list[dict]) -> None:
+        """Запись в журнал и уведомление только о ещё не объявленных (дубли WS и объявленное сверкой — нет)."""
+        try:
+            rows = await asyncio.to_thread(self.journal.record_executions, rows, "ws")
+        except Exception:
+            log.exception("Журнал: исполнения из WebSocket не записаны")  # уведомление важнее — шлём всё
+        if rows:
+            await self.on_executions(rows)
+
+    async def _ws_orders(self, rows: list[dict]) -> None:
+        try:
+            await asyncio.to_thread(self.journal.record_orders, rows)
+        except Exception:
+            log.exception("Журнал: ордера из WebSocket не записаны")
 
     async def on_executions(self, rows: list[dict]):
         by_order: dict[str, list[dict]] = {}
         for r in rows:
             by_order.setdefault(r.get("orderId", "?"), []).append(r)
         texts = []
+        srcs = await asyncio.to_thread(self.journal.describe_many,
+                                       [rs[-1].get("orderLinkId") for rs in by_order.values()])
         for oid, rs in by_order.items():
             qty = sum((_d(r.get("execQty")) for r in rs), _d(0))
             value = sum((_d(r.get("execQty")) * _d(r.get("execPrice")) for r in rs), _d(0))
@@ -735,7 +851,7 @@ class OptionsBot:
             etype = last.get("execType", "Trade")
             kind = {"Trade": "", "Delivery": " (поставка/экспирация)", "Settle": " (расчёт)",
                     "BustTrade": " (ликвидация)"}.get(etype, f" ({etype})")
-            src = "через бота" if (last.get("orderLinkId") or "").startswith("ob-") else "вне бота"
+            src = srcs[last.get("orderLinkId")]
             left = _d(last.get("leavesQty"))
             status = "ордер исполнен полностью" if left == 0 else f"остаток {left}"
             texts.append(f"💥 Исполнение{kind}\n"
@@ -743,19 +859,26 @@ class OptionsBot:
                          f"комиссия {fee:.4g} · {status}\nордер {oid[:8]} · {src}")
             audit_log.info("exec symbol=%s side=%s qty=%s avg=%s fee=%s type=%s order_id=%s link_id=%s",
                            last.get("symbol"), last.get("side"), qty, avg, fee, etype, oid, last.get("orderLinkId"))
-        if not texts or not self._app:
-            return
-        msg = pre(f"{env_banner(self.cfg.env)}\n" + "\n\n".join(texts))
+        if texts:
+            await self._broadcast(pre(f"{env_banner(self.cfg.env)}\n" + "\n\n".join(texts)), "об исполнении")
+
+    async def _broadcast(self, msg: str, what: str) -> int:
+        """В разрешённые группы и в личку трейдерам (кроме тех, кому личка недоступна). -> сколько доставлено."""
+        if not self._app:
+            return 0
+        sent = 0
         targets = sorted(self.cfg.tg_allowed_chat_ids) + sorted(self.cfg.tg_trader_ids - self._dm_failed)
         for chat_id in targets:
             try:
                 await self._app.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
+                sent += 1
             except TelegramError as e:
                 permanent = isinstance(e, Forbidden) or (
                     isinstance(e, BadRequest) and "chat not found" in str(e).lower())
                 if chat_id > 0 and permanent:
                     self._dm_failed.add(chat_id)  # не начинал диалог / заблокировал бота — больше не пробуем
-                log.warning("Уведомление об исполнении в %s не доставлено: %s", chat_id, e)
+                log.warning("Уведомление %s в %s не доставлено: %s", what, chat_id, e)
+        return sent
 
     @staticmethod
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -772,6 +895,7 @@ class OptionsBot:
         ("pos", "cmd_pos", "позиции"),
         ("orders", "cmd_orders", "открытые ордера"),
         ("greeks", "cmd_greeks", "греки портфеля"),
+        ("journal", "cmd_journal", "журнал сделок и PnL"),
         ("buy", "cmd_buy", "купить опцион"),
         ("sell", "cmd_sell", "продать опцион"),
         ("close", "cmd_close", "закрыть позицию"),
@@ -784,16 +908,22 @@ class OptionsBot:
         async def post_init(app: Application):
             await app.bot.set_my_commands([BotCommand(n, d) for n, _, d in self.COMMANDS])
             self._app, self._loop = app, asyncio.get_running_loop()
-            self.watcher = ExecutionWatcher(self.cfg, self._on_ws_executions)
+            self.watcher = ExecutionWatcher(self.cfg, self._on_ws_executions, self._on_ws_orders)
             try:
                 await asyncio.to_thread(self.watcher.start)
             except Exception:
                 log.exception("WebSocket исполнений не подключён — уведомлений об исполнениях не будет")
 
-            if self.cfg.collector_enabled and app.job_queue is None:
-                log.warning("Сборщик выключен: нет JobQueue — установите python-telegram-bot[job-queue] "
-                            "(pip install -r requirements.txt)")
-            elif self.cfg.collector_enabled:
+            if app.job_queue is None and (self.cfg.collector_enabled or self.cfg.journal_enabled):
+                log.warning("Сборщик и сверка журнала выключены: нет JobQueue — установите "
+                            "python-telegram-bot[job-queue] (pip install -r requirements.txt)")
+                return
+            if self.cfg.journal_enabled:
+                # при старте (догрузить пропущенное, пока бот был выключен) и далее по расписанию
+                app.job_queue.run_repeating(self._sync_job, interval=self.cfg.journal_sync_min * 60, first=10,
+                                            name="journal_sync")
+                log.info("Журнал: сверка через 10 с и далее каждые %d мин", self.cfg.journal_sync_min)
+            if self.cfg.collector_enabled:
                 first = seconds_to_next_slot(time.time(), self.cfg.collector_interval_min)
                 app.job_queue.run_repeating(self._collect_job, interval=self.cfg.collector_interval_min * 60,
                                             first=first, name="collector")

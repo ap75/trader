@@ -11,7 +11,11 @@
 2. **Код-ревью** диффа; найденное исправить или показать пользователю.
 3. **Полный прогон** `.venv/bin/pytest` — все тесты зелёные, в том числе после исправлений по ревью.
 
-Коммиты: 1–3 строки, без `Co-Authored-By`. Коммитить по просьбе пользователя.
+4. **Перед коммитом — актуальность документации**: `docs/guides.py` (PDF ru/uk: admin, trader, viewer — пересобрать),
+   `PLAN.md`, `CLAUDE.md`, `.env.example`, `--help`/справка бота. Новые команды, настройки, файлы данных и шаги
+   развёртывания должны быть описаны.
+
+Коммиты: на английском, 1–3 строки, без `Co-Authored-By`. Коммитить по просьбе пользователя.
 
 ## Безопасность
 
@@ -27,6 +31,9 @@
 .venv/bin/python -m optbot.bot                  # бот
 .venv/bin/python -m optbot.cli --help           # CLI
 .venv/bin/python smoke_order.py                 # ордер далеко от рынка -> отмена (только demo/testnet)
+.venv/bin/python -m optbot.collector --once|--stats      # сборщик: срез вручную | что накоплено
+.venv/bin/python -m optbot.journal --sync | --report 7d [--csv f]   # журнал сделок
+cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
 ```
 
@@ -36,3 +43,12 @@
 - retCode 10000/10016/10019 — состояние неизвестно (как сбой сети); после сбоя искать ордер по `orderLinkId`.
 - `execution/list`, `order/history`: окно времени ≤ 7 дней, пагинация `nextPageCursor`.
 - Цена поставки опционов — `/v5/market/new-delivery-price` (`/delivery-price` для опционов пуст).
+- `asset/delivery-record`: окно ≤ 30 дней.
+- `execution/list`, `order/history` для option без `baseCoin` отдают все базовые активы (не только BTC).
+- `order/history` фильтрует окно startTime/endTime по **времени создания** ордера; по `orderId` — без окна.
+
+## Данные
+
+SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`) и журнал сделок (`journal.py`).
+Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
+Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

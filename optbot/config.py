@@ -33,6 +33,19 @@ def _minutes_divisor(name: str, default: int) -> int:
     return n if 1 <= n <= 60 and 60 % n == 0 else 0
 
 
+def _int_in(name: str, default: int, lo: int, hi: int) -> int:
+    """Целое в [lo, hi]; неверное — значение по умолчанию с предупреждением (настройка не критична)."""
+    v = (os.getenv(name) or "").strip()
+    try:
+        n = int(v) if v else default
+        if lo <= n <= hi:
+            return n
+    except ValueError:
+        pass
+    logging.getLogger("optbot.config").warning("%s=%r: нужно целое %d…%d — использую %d", name, v, lo, hi, default)
+    return default
+
+
 def _list(name: str, default: str = "") -> list[str]:
     return [x.strip().upper() for x in os.getenv(name, default).split(",") if x.strip()]
 
@@ -82,6 +95,13 @@ class Settings:
     # Пусто — своя БД на окружение (data/market-<env>.db): данные testnet не смешиваются с mainnet/demo.
     # Итоговый путь — свойство db_file (относительные пути — от корня проекта, а не от текущей папки).
     db_path: str = os.getenv("DB_PATH", "").strip()
+
+    # Журнал сделок (этап 2): ордера, исполнения, поставки — в той же БД
+    journal_enabled: bool = _bool("JOURNAL_ENABLED", True)
+    journal_sync_min: int = _int_in("JOURNAL_SYNC_MIN", 60, 5, 1440)        # сверка по REST
+    journal_backfill_days: int = _int_in("JOURNAL_BACKFILL_DAYS", 30, 1, 730)  # глубина первой выгрузки
+    # секрет для хеша пользователя в orderLinkId; пусто — производный от BYBIT_API_SECRET
+    journal_secret: str = os.getenv("JOURNAL_SECRET", "").strip()
 
     # Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

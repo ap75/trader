@@ -1,5 +1,6 @@
 """Telegram-бот на подставном Telegram и подставном Bybit: доступ, подтверждение, сбои, уведомления."""
 import asyncio
+import contextlib
 import html
 import re
 import time
@@ -356,6 +357,160 @@ def test_custom_price_reply(b, tg):
     run(b.on_reply(u, tg.ctx()))
     run(b.on_callback(tg.upd(TRADER, data=f"ok:{pid_from(tg)}"), tg.ctx()))
     assert (o["price"], o["qty"]) == ("30", "0.04")
+
+
+def _open_custom_price(bb, tg, uid=TRADER, chat="dm"):
+    run(bb.cmd_orders(tg.upd(uid, chat=chat), tg.ctx()))
+    run(bb.on_callback(tg.upd(uid, chat=chat, data=next(x for x in tg.buttons() if x.startswith("am:"))), tg.ctx()))
+    u = tg.upd(uid, chat=chat, data=next(x for x in tg.buttons() if x.endswith(":other")))
+    run(bb.on_callback(u, tg.ctx()))
+    return u
+
+
+def test_custom_price_prompt_only_for_menu_owner(b, tg):
+    """Поле ответа открывается только у автора меню (selective + упоминание), а не у всей группы."""
+    b.c.http.add_order(BTC_PUT)
+    seen = {}
+    orig = TG._rec(tg, "reply")
+
+    async def rec(*a, **kw):
+        seen.update(kw, text=a[0] if a else kw.get("text"))
+        return await orig(*a, **kw)
+    run(b.cmd_orders(tg.upd(TRADER, ), tg.ctx()))
+    run(b.on_callback(tg.upd(TRADER, data=next(x for x in tg.buttons() if x.startswith("am:"))), tg.ctx()))
+    u = tg.upd(TRADER, data=next(x for x in tg.buttons() if x.endswith(":other")))
+    u.effective_message.reply_text = rec
+    run(b.on_callback(u, tg.ctx()))
+    assert seen["reply_markup"].selective is True
+    assert f'href="tg://user?id={TRADER}"' in seen["text"] and seen["parse_mode"] == "HTML"
+
+
+def test_reply_to_someone_elses_prompt_explains(make_bot, cfg, tg):
+    """Второй трейдер ответил на чужой вопрос «Своя цена…» — не молчим, объясняем; ордер не трогаем."""
+    bb = make_bot(with_cfg(cfg, tg_trader_ids={TRADER, 11}))
+    o = bb.c.http.add_order(BTC_PUT, qty="0.05", price="20")
+    _open_custom_price(bb, tg)
+    (chat, mid), _ = next(iter(bb.awaiting.items()))
+    u = tg.upd(11, text="160", reply_to=mid)
+    u.effective_message.chat_id = chat
+    run(bb.on_reply(u, tg.ctx()))
+    assert "Этот вопрос для user10" in tg.last() and "/orders" in tg.last()
+    assert o["price"] == "20" and (chat, mid) in bb.awaiting  # автор меню всё ещё может ответить
+
+
+def test_amend_rejected_if_changed_by_other_after_preview(make_bot, cfg, tg):
+    """Оба открыли превью; первый подтвердил — подтверждение второго не откатывает его изменение."""
+    bb = make_bot(with_cfg(cfg, tg_trader_ids={TRADER, 11}))
+    o = bb.c.http.add_order(BTC_PUT, qty="0.05", price="20")
+    run(bb.cmd_amend(tg.upd(TRADER), tg.ctx(BTC_PUT, o["orderId"], "25")))
+    pid_a = pid_from(tg)
+    run(bb.cmd_amend(tg.upd(11), tg.ctx(BTC_PUT, o["orderId"], "20", "0.04")))
+    pid_b = pid_from(tg)
+    run(bb.on_callback(tg.upd(TRADER, data=f"ok:{pid_a}"), tg.ctx()))
+    assert o["price"] == "25"
+    run(bb.on_callback(tg.upd(11, data=f"ok:{pid_b}"), tg.ctx()))
+    assert "изменили после превью" in tg.last("edit") and "0.05 @ 25" in tg.last("edit")
+    assert (o["qty"], o["price"]) == ("0.05", "25")
+    assert len(bb.c.http.called("amend_order")) == 1
+
+
+def _race_bot(make_bot, cfg, tg, monkeypatch):
+    """Два трейдера с превью одного ордера; чтение ордера медленное — проверка и отправка разнесены."""
+    bb = make_bot(with_cfg(cfg, tg_trader_ids={TRADER, 11}))
+    o = bb.c.http.add_order(BTC_PUT, qty="0.05", price="20")
+    run(bb.cmd_amend(tg.upd(TRADER), tg.ctx(BTC_PUT, o["orderId"], "25")))
+    pid_a = pid_from(tg)
+    run(bb.cmd_amend(tg.upd(11), tg.ctx(BTC_PUT, o["orderId"], "20", "0.04")))
+    pid_b = pid_from(tg)
+    slow = bb.c.get_order
+
+    def get_order(*a, **kw):
+        r = slow(*a, **kw)
+        r = dict(r) if r else r  # снимок, как от настоящего API (подделка отдаёт живой dict)
+        time.sleep(0.2)  # оба подтверждения успевают прочитать ордер до отправки
+        return r
+    monkeypatch.setattr(bb.c, "get_order", get_order)
+
+    async def both():
+        await asyncio.gather(bb.on_callback(tg.upd(TRADER, data=f"ok:{pid_a}"), tg.ctx()),
+                             bb.on_callback(tg.upd(11, data=f"ok:{pid_b}"), tg.ctx()))
+    return bb, o, both
+
+
+def test_simultaneous_amend_confirms_serialized(make_bot, cfg, tg, monkeypatch):
+    bb, o, both = _race_bot(make_bot, cfg, tg, monkeypatch)
+    run(both())
+    assert len(bb.c.http.called("amend_order")) == 1
+    assert sum("изменили после превью" in t for k, t, _ in tg.out if k == "edit") == 1
+    assert bb._order_locks == {}  # блокировки не копятся
+
+
+def test_race_reproduces_without_lock(make_bot, cfg, tg, monkeypatch):
+    """Контроль: без блокировки тот же сценарий даёт две отправки — тест выше действительно ловит гонку."""
+    bb, o, both = _race_bot(make_bot, cfg, tg, monkeypatch)
+    @contextlib.asynccontextmanager
+    async def no_lock(oid):
+        yield
+    monkeypatch.setattr(bb, "_order_lock", no_lock)
+    run(both())
+    assert len(bb.c.http.called("amend_order")) == 2
+
+
+def test_cancel_waits_for_amend_on_same_order(make_bot, cfg, tg, monkeypatch):
+    bb, o, _ = _race_bot(make_bot, cfg, tg, monkeypatch)
+    pid_a = next(pid for pid, p in bb.pending.items() if p.who.user_id == TRADER)
+
+    async def go():
+        await asyncio.gather(bb.on_callback(tg.upd(TRADER, data=f"ok:{pid_a}"), tg.ctx()),
+                             bb.cmd_cancel(tg.upd(11), tg.ctx(BTC_PUT, o["orderId"])))
+    run(go())
+    names = [n for n, _ in bb.c.http.calls if n in ("amend_order", "cancel_order")]
+    assert names == ["amend_order", "cancel_order"] and bb.c.http.orders == []
+
+
+def test_cancel_not_blocked_by_status_lookup(make_bot, cfg, tg, monkeypatch):
+    """Сбой связи при amend: выяснение статуса идёт без блокировки — отмена ордера другим трейдером не ждёт."""
+    from optbot.bybit_client import BybitNetworkError
+    bb = make_bot(with_cfg(cfg, tg_trader_ids={TRADER, 11}))
+    o = bb.c.http.add_order(BTC_PUT, qty="0.05", price="20")
+    run(bb.cmd_amend(tg.upd(TRADER), tg.ctx(BTC_PUT, o["orderId"], "25")))
+    pid = pid_from(tg)
+    bb.c.http.after["amend_order"] = BybitNetworkError("timeout")
+    order = []
+
+    def lookup(*a, **kw):
+        time.sleep(0.3)
+        order.append("lookup")
+        return "статус"
+    monkeypatch.setattr(bb.c, "amend_status_after_failure", lookup)
+
+    async def go():
+        async def cancel():
+            await asyncio.sleep(0.1)  # отмена приходит, пока идёт выяснение статуса
+            await bb.cmd_cancel(tg.upd(11), tg.ctx(BTC_PUT, o["orderId"]))
+            order.append("cancel")
+        await asyncio.gather(bb.on_callback(tg.upd(TRADER, data=f"ok:{pid}"), tg.ctx()), cancel())
+    run(go())
+    assert order == ["cancel", "lookup"] and bb.c.http.orders == []
+
+
+def test_cancel_status_lookup_outside_lock(b, tg, monkeypatch):
+    from optbot.bybit_client import BybitNetworkError
+    o = b.c.http.add_order(BTC_PUT)
+    b.c.http.fail["cancel_order"] = BybitNetworkError("timeout")
+    held = []
+    real = b.c.get_order
+    monkeypatch.setattr(b.c, "get_order", lambda *a, **kw: held.append(dict(b._order_locks)) or real(*a, **kw))
+    run(b.cmd_cancel(tg.upd(TRADER), tg.ctx(BTC_PUT, o["orderId"])))
+    assert held == [{}] and "Сбой связи" in tg.last()
+
+
+def test_amend_menu_audited(b, tg, caplog):
+    b.c.http.add_order(BTC_PUT)
+    with caplog.at_level("INFO", logger="optbot.trade"):
+        run(b.cmd_orders(tg.upd(TRADER), tg.ctx()))
+        run(b.on_callback(tg.upd(TRADER, data=next(x for x in tg.buttons() if x.startswith("am:"))), tg.ctx()))
+    assert any("amend.menu" in r.getMessage() for r in caplog.records)
 
 
 def test_cancel_button_from_orders(b, tg):

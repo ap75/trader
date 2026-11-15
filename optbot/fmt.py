@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import time
+
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -131,6 +133,15 @@ def fmt_balance(b: dict) -> str:
         rows = [[c["coin"], num(c.get("equity")), money(c.get("unrealisedPnl"))] for c in coins]
         lines.append(_table(["Coin", "Equity", "uPnL"], rows, "lrr"))
     return "\n".join(lines)
+
+
+HOUR_MS = 3_600_000
+DAY_MS = 86_400_000
+
+
+def utc(ms: int, seconds: bool = False) -> str:
+    """Миллисекунды -> 'ГГГГ-ММ-ДД ЧЧ:ММ[:СС]' в UTC."""
+    return time.strftime("%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M", time.gmtime(ms / 1000))
 
 
 def short_symbol(sym: str) -> str:

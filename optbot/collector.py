@@ -21,10 +21,10 @@ from dataclasses import dataclass, field
 from . import db
 from .bybit_client import BybitError, OptionsClient, _d, group_by_strike, parse_option_symbol, spread_pct
 from .config import Settings, settings
+from .fmt import DAY_MS, utc
 
 log = logging.getLogger("optbot.collector")
 
-DAY_MS = 86_400_000
 
 
 def slot_start(now_ms: int, interval_min: int) -> int:
@@ -52,10 +52,6 @@ def iv_at_delta(points: list[tuple[float, float]], target: float) -> float | Non
         if d0 <= target <= d1:
             return v0 if d1 == d0 else v0 + (v1 - v0) * (target - d0) / (d1 - d0)
     return None
-
-
-def _fmt_ms(ms: int) -> str:
-    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ms / 1000))
 
 
 def expiry_metrics(rows: list[dict], ts_ms: int, expiry_ms: int) -> dict | None:
@@ -109,7 +105,7 @@ class RunResult:
 
     def __str__(self) -> str:
         err = f", ошибки: {'; '.join(self.errors)}" if self.errors else ""
-        dup = f", пропущено {self.skipped} (слот {_fmt_ms(self.ts)} UTC уже записан)" if self.skipped else ""
+        dup = f", пропущено {self.skipped} (слот {utc(self.ts)} UTC уже записан)" if self.skipped else ""
         miss = f", нет котировок ног: {', '.join(self.legs_missing)}" if self.legs_missing else ""
         return f"срезов {self.snapshots}, ног {self.legs} за {self.seconds:.1f} с{dup}{miss}{err}"
 
@@ -234,7 +230,7 @@ def stats(path: str) -> str:
                 "SELECT base, COUNT(DISTINCT ts) slots, COUNT(*) n, MIN(ts) first, MAX(ts) last "
                 "FROM snapshots GROUP BY base ORDER BY base"):
             lines.append(f"{r['base']}: срезов {r['slots']} ({r['n']} строк), "
-                         f"{_fmt_ms(r['first'])} … {_fmt_ms(r['last'])} UTC")
+                         f"{utc(r['first'])} … {utc(r['last'])} UTC")
         legs = conn.execute("SELECT COUNT(*) FROM leg_marks").fetchone()[0]
         tracked = conn.execute("SELECT COUNT(*) FROM tracked_symbols").fetchone()[0]
         return "\n".join(lines or ["данных нет"]) + f"\nног на слежении {tracked}, котировок ног {legs}"

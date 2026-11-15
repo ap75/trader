@@ -1,0 +1,22 @@
+# Пользовательская служба systemd (без root): ~/.config/systemd/user/options-bot.service
+# Telegram-бот, вместе с ним — сборщик срезов и сверка журнала. Проект — в ~/trader (%h — домашняя папка).
+# Установка — deploy/README.md.
+[Unit]
+Description=Bybit options Telegram bot
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trader
+ExecStart=%h/trader/.venv/bin/python -m optbot.bot
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+# В пользовательском systemd нет multi-user.target: с ней служба не стартует после перезагрузки.
+WantedBy=default.target

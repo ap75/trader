@@ -23,6 +23,7 @@ from decimal import Decimal, InvalidOperation
 
 from .bybit_client import BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError
 from .config import settings
+from .journal import Journal
 from .fmt import (
     env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_orders,
     fmt_order_preview, fmt_positions, fmt_ticker, parse_iv, to_dec,
@@ -56,6 +57,8 @@ def submit(c: OptionsClient, req: OrderRequest) -> None:
     if not confirm(fmt_order_preview(req, req.ticker)):
         print("Отменено пользователем")
         return
+    journal = Journal(c.cfg)
+    req.link_id = journal.register_order(None, "CLI", None, source="cli")  # до отправки
     try:
         res = c.place_order(req)
     except BybitNetworkError as e:
@@ -67,6 +70,9 @@ def submit(c: OptionsClient, req: OrderRequest) -> None:
             status = f"не удалось выяснить ({e2})"
         print(f"Статус: {status}\nНе повторяйте, пока не проверите orders/positions.", file=sys.stderr)
         raise SystemExit(2)
+    except Exception:
+        journal.forget_order(req.link_id)  # не сетевая ошибка — ордер точно не на бирже
+        raise
     print(f"Ордер принят: orderId={res.get('orderId')}  linkId={res.get('orderLinkId')}")
 
 

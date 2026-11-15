@@ -7,7 +7,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
@@ -17,6 +16,7 @@ from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
 
 from .config import Settings, settings as default_settings
+from .linkid import new_link_id
 
 log = logging.getLogger("optbot.client")
 
@@ -78,6 +78,7 @@ class OrderRequest:
     amend_filled: Decimal = Decimal(0)        # уже исполнено у изменяемого ордера (cumExecQty)
     amend_filled_value: Decimal = Decimal(0)  # и на какую сумму (cumExecValue)
     amend_created_ms: int = 0                 # createdTime изменяемого ордера
+    amend_seen: tuple = ()                    # (qty, price, orderIv) ордера на момент превью
     sent: bool = False           # запрос на биржу ушёл (до этого сбой сети = ничего не изменилось)
     link_id: str | None = None   # orderLinkId — задаётся при отправке; по нему ищем ордер после сбоя сети
     ticker: dict | None = None   # тикер, полученный в prepare_order (для превью без повторного запроса)
@@ -92,6 +93,20 @@ class OrderRequest:
         )
         ro = " (reduce-only)" if self.reduce_only else ""
         return f"{self.side.upper()} {self.qty} {self.symbol} {what}{ro}"
+
+
+def _amend_state(o: dict) -> tuple:
+    return _d(o.get("qty")), _d(o.get("price")), _d(o.get("orderIv"))
+
+
+def _changed_since(seen: tuple, cur: dict) -> bool:
+    """Изменил ли кто-то ордер после превью. Количество — точно; цена ИЛИ IV: у ордера по IV биржа
+    сама двигает цену вслед за рынком (IV прежняя), у ценового — пересчитывает IV (цена прежняя).
+    Чужая смена цены меняет и IV, поэтому заметна."""
+    qty, price, iv = seen
+    c_qty, c_price, c_iv = _amend_state(cur)
+    iv_same = bool(iv) and abs(c_iv - iv) <= Decimal("0.0005")  # IV неизвестна — оправдать сдвиг цены нечем
+    return c_qty != qty or (c_price != price and not iv_same)
 
 
 def parse_option_symbol(sym: str) -> tuple[str, str, Decimal, str] | None:
@@ -570,7 +585,8 @@ class OptionsClient:
 
     def place_order(self, req: OrderRequest) -> dict:
         req = self.prepare_order(req)
-        req.link_id = f"ob-{uuid.uuid4().hex[:24]}"
+        if not req.link_id:  # бот задаёт свой (с хешем пользователя) и пишет его в журнал до отправки
+            req.link_id = new_link_id()
         params = dict(
             category=CATEGORY,
             symbol=req.symbol,
@@ -588,6 +604,47 @@ class OptionsClient:
                 params["price"] = str(req.price)
         req.sent = True
         return self._call(self.http.place_order, **params)
+
+    # ---------- история (журнал сделок) ----------
+    MAX_PAGES = 200  # защита от бесконечной пагинации
+
+    def _paged(self, fn, **params) -> list[dict]:
+        """Все страницы ответа по nextPageCursor."""
+        out: list[dict] = []
+        for _ in range(self.MAX_PAGES):
+            res = self._call(fn, **params)
+            rows = res.get("list") or []
+            out += rows
+            cursor = res.get("nextPageCursor")
+            if not cursor or not rows:
+                return out
+            params["cursor"] = cursor
+        raise BybitError(f"Больше {self.MAX_PAGES} страниц ответа — сузьте окно времени")
+
+    def executions(self, start_ms: int, end_ms: int) -> list[dict]:
+        """execution/list: окно ≤ 7 дней (иначе 10001)."""
+        return self._paged(self.http.get_executions, category=CATEGORY, startTime=start_ms, endTime=end_ms,
+                           limit=100)
+
+    def order_history(self, start_ms: int, end_ms: int) -> list[dict]:
+        """order/history: окно ≤ 7 дней."""
+        return self._paged(self.http.get_order_history, category=CATEGORY, startTime=start_ms, endTime=end_ms,
+                           limit=50)
+
+    def order_by_id(self, order_id: str) -> dict | None:
+        """order/history по orderId — без окна времени (окно фильтрует по времени создания)."""
+        rows = self._call(self.http.get_order_history, category=CATEGORY, orderId=order_id).get("list") or []
+        return next((o for o in rows if o.get("orderId") == order_id), None)
+
+    def delivery_records(self, start_ms: int, end_ms: int) -> list[dict]:
+        """asset/delivery-record: окно ≤ 30 дней (сверено на demo)."""
+        return self._paged(self.http.get_option_delivery_record, category=CATEGORY, startTime=start_ms,
+                           endTime=end_ms, limit=50)
+
+    def delivery_prices(self, base: str) -> list[dict]:
+        """market/new-delivery-price: последние 50 поставок по активу {deliveryPrice, deliveryTime}, без пагинации."""
+        return self._call(self.http.get_new_delivery_price, category=CATEGORY,
+                          baseCoin=base.upper()).get("list") or []
 
     def find_order_by_link(self, symbol: str, link_id: str) -> dict | None:
         """Ордер по orderLinkId среди активных и в истории (для выяснения статуса после сбоя сети)."""
@@ -689,6 +746,7 @@ class OptionsClient:
             iv=iv, reduce_only=bool(orig.get("reduceOnly")), amend_of=order_id,
             amend_filled=_d(orig.get("cumExecQty")), amend_filled_value=_d(orig.get("cumExecValue")),
             amend_created_ms=int(orig.get("createdTime") or 0),
+            amend_seen=_amend_state(orig),
         )
         req = self.prepare_order(req)
         same_qty = req.qty == _d(orig["qty"])
@@ -704,6 +762,10 @@ class OptionsClient:
         cur = self.get_order(req.symbol, order_id)
         if not cur:
             raise RiskError(f"Ордер {order_id} больше не активен (исполнен или отменён)")
+        if req.amend_seen and _changed_since(req.amend_seen, cur):
+            raise RiskError(
+                f"Ордер изменили после превью (другой трейдер или вне бота): сейчас {cur.get('side', '').upper()} "
+                f"{cur.get('qty')} @ {cur.get('price')} — откройте изменение заново")
         req.amend_filled = _d(cur.get("cumExecQty"))
         req.amend_filled_value = _d(cur.get("cumExecValue"))
         req = self.prepare_order(req)

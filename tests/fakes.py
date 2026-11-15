@@ -6,6 +6,10 @@ import uuid
 from decimal import Decimal
 from datetime import datetime, timezone
 
+from pybit.exceptions import InvalidRequestError
+
+from optbot.fmt import DAY_MS  # noqa: E402
+
 EXP = "27NOV26"
 EXP_MS = int(datetime(2026, 11, 27, 8, tzinfo=timezone.utc).timestamp() * 1000)
 BTC_PUT = f"BTC-{EXP}-60000-P-USDT"
@@ -50,6 +54,10 @@ class FakeHTTP:
         self.orders: list[dict] = []           # активные
         self.history: list[dict] = []          # закрытые
         self.greeks: list[dict] = []
+        self.executions: list[dict] = []       # execution/list
+        self.deliveries: list[dict] = []       # asset/delivery-record
+        self.delivery_px: dict[str, list[dict]] = {}  # base -> market/new-delivery-price
+        self.page_size: int | None = None      # принудительная пагинация (проверка cursor)
         self.calls: list[tuple[str, dict]] = []
         self.fail: dict[str, Exception] = {}   # метод -> исключение (один раз)
         self.after: dict[str, Exception] = {}  # метод выполняется, затем бросает (обрыв после отправки)
@@ -63,6 +71,46 @@ class FakeHTTP:
 
     def called(self, name) -> list[dict]:
         return [kw for n, kw in self.calls if n == name]
+
+    @staticmethod
+    def _window(startTime, endTime, max_days):
+        if startTime is not None and endTime is not None and endTime - startTime > max_days * DAY_MS:
+            raise InvalidRequestError("req", f"The time range cannot exceed {max_days} days.", 10001, "0", {})
+
+    def _page(self, rows, limit, cursor):
+        size = min(limit, self.page_size or limit)
+        start = int(cursor or 0)
+        nxt = str(start + size) if start + size < len(rows) else ""
+        return ok({"list": rows[start:start + size], "nextPageCursor": nxt, "category": "option"})
+
+    @staticmethod
+    def _in(rows, key, startTime, endTime):
+        return [r for r in rows if (startTime is None or int(r[key]) >= startTime)
+                and (endTime is None or int(r[key]) <= endTime)]
+
+    def add_exec(self, symbol, side="Buy", qty="0.01", price="100", fee="0.1", t=None, link="ob-test",
+                 exec_type="Trade", order_id="o1", exec_id=None) -> dict:
+        e = {"execId": exec_id or str(uuid.uuid4()), "orderId": order_id, "orderLinkId": link, "symbol": symbol,
+             "side": side, "execQty": qty, "execPrice": price, "execValue": str(Decimal(qty) * Decimal(price)),
+             "execFee": fee, "execType": exec_type, "execTime": str(t if t is not None else int(time.time() * 1000)),
+             "isMaker": False, "markPrice": price, "indexPrice": "65000", "tradeIv": "0.5", "leavesQty": "0"}
+        self.executions.append(e)
+        return e
+
+    # ---------- история ----------
+    def get_executions(self, category, startTime=None, endTime=None, limit=50, cursor=None, **kw):
+        self._rec("get_executions", locals())
+        self._window(startTime, endTime, 7)
+        return self._page(self._in(self.executions, "execTime", startTime, endTime), limit, cursor)
+
+    def get_option_delivery_record(self, category, startTime=None, endTime=None, limit=50, cursor=None, **kw):
+        self._rec("get_option_delivery_record", locals())
+        self._window(startTime, endTime, 30)
+        return self._page(self._in(self.deliveries, "deliveryTime", startTime, endTime), limit, cursor)
+
+    def get_new_delivery_price(self, category, baseCoin):
+        self._rec("get_new_delivery_price", locals())
+        return ok({"category": "option", "list": self.delivery_px.get(baseCoin, [])})
 
     def add_order(self, symbol, side="Buy", qty="0.05", price="20", filled="0", value="0", status="New",
                   reduce_only=False, created_ms=None, order_iv="", oid=None) -> dict:
@@ -123,16 +171,19 @@ class FakeHTTP:
                 rows = [o for o in rows if o["orderLinkId"] == orderLinkId]
         return ok({"list": rows[:limit]})
 
-    def get_order_history(self, category, symbol=None, orderLinkId=None, startTime=None, limit=50, cursor=None):
+    def get_order_history(self, category, symbol=None, orderLinkId=None, startTime=None, endTime=None, limit=50,
+                          cursor=None, orderId=None):
         self._rec("get_order_history", locals())
+        self._window(startTime, endTime, 7)
         rows = self.history + self.orders
+        if orderId:  # как у Bybit: по id — без окна времени
+            return ok({"list": [o for o in rows if o["orderId"] == orderId], "nextPageCursor": ""})
         if symbol:
             rows = [o for o in rows if o["symbol"] == symbol]
         if orderLinkId:
             rows = [o for o in rows if o["orderLinkId"] == orderLinkId]
-        if startTime:
-            rows = [o for o in rows if int(o["createdTime"]) >= startTime]
-        return ok({"list": rows, "nextPageCursor": ""})
+        rows = self._in(rows, "createdTime", startTime, endTime)
+        return self._page(rows, limit, cursor)
 
     # ---------- торговля ----------
     def place_order(self, **kw):
