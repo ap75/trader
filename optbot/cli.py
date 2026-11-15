@@ -21,7 +21,7 @@ import argparse
 import sys
 from decimal import Decimal, InvalidOperation
 
-from .bybit_client import BybitError, OptionsClient, OrderRequest, RiskError
+from .bybit_client import BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError
 from .config import settings
 from .fmt import (
     env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_orders,
@@ -53,10 +53,20 @@ def confirm(text: str) -> bool:
 
 def submit(c: OptionsClient, req: OrderRequest) -> None:
     req = c.prepare_order(req)
-    if not confirm(fmt_order_preview(req, c.ticker(req.symbol))):
+    if not confirm(fmt_order_preview(req, req.ticker)):
         print("Отменено пользователем")
         return
-    res = c.place_order(req)
+    try:
+        res = c.place_order(req)
+    except BybitNetworkError as e:
+        print(f"Сбой связи с биржей: {e}", file=sys.stderr)
+        print("Выясняю статус…", file=sys.stderr)
+        try:
+            status = c.order_status_after_failure(req)
+        except Exception as e2:
+            status = f"не удалось выяснить ({e2})"
+        print(f"Статус: {status}\nНе повторяйте, пока не проверите orders/positions.", file=sys.stderr)
+        raise SystemExit(2)
     print(f"Ордер принят: orderId={res.get('orderId')}  linkId={res.get('orderLinkId')}")
 
 
@@ -142,8 +152,17 @@ def run(args: argparse.Namespace, c: OptionsClient) -> None:
             print("Отменён:", c.cancel_order(sym, args.order_id).get("orderId"))
     elif cmd == "amend":
         req, orig = c.amend_request(args.symbol, args.order_id, args.qty, args.price, args.iv)
-        if confirm(fmt_amend_preview(req, orig, c.ticker(req.symbol))):
-            print("Изменён:", c.amend_order(args.order_id, req).get("orderId"))
+        if confirm(fmt_amend_preview(req, orig, req.ticker)):
+            try:
+                print("Изменён:", c.amend_order(args.order_id, req).get("orderId"))
+            except BybitNetworkError as e:
+                print(f"Сбой связи с биржей: {e}\nВыясняю статус…", file=sys.stderr)
+                try:
+                    status = c.amend_status_after_failure(args.order_id, req)
+                except Exception as e2:
+                    status = f"не удалось выяснить ({e2})"
+                print(f"Статус: {status}\nНе повторяйте, пока не проверите orders.", file=sys.stderr)
+                raise SystemExit(2)
         else:
             print("Отменено пользователем")
     elif cmd == "cancel-all":

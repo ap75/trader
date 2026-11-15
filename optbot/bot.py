@@ -45,13 +45,13 @@ from typing import Callable
 
 from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     AIORateLimiter, Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, TypeHandler, filters,
 )
 
-from .bybit_client import BybitError, OptionsClient, OrderRequest, RiskError, _d
+from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
 from .config import Settings, settings
 from .ws import ExecutionWatcher
 from .fmt import (
@@ -131,6 +131,7 @@ class Pending:
     event: str                        # имя события для аудита
     who: Who
     created: float
+    lookup: Callable[[], str] | None = None  # после сбоя сети: узнать, что на самом деле на бирже
 
 
 def guarded(level: str, sensitive: bool = False):
@@ -174,7 +175,9 @@ class OptionsBot:
         self.cfg = cfg
         self.pending: dict[str, Pending] = {}
         self.tokens: dict[str, dict] = {}            # короткие ключи для данных кнопок (лимит 64 байта)
-        self.awaiting: dict[tuple[int, int], str] = {}  # (chat_id, id сообщения-вопроса) -> токен меню amend
+        # (chat_id, id сообщения-вопроса) -> (токен меню amend, время); живут сутки, чтобы на поздний ответ
+        # сказать «меню устарело», а не молчать
+        self.awaiting: dict[tuple[int, int], tuple[str, float]] = {}
         self.watcher: ExecutionWatcher | None = None
         self._app: Application | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -245,6 +248,8 @@ class OptionsBot:
         now = time.monotonic()
         for k in [k for k, v in self.tokens.items() if now - v["_t"] > TOKEN_TTL]:
             del self.tokens[k]
+        for k in [k for k, (_, ts) in self.awaiting.items() if now - ts > 86400]:
+            del self.awaiting[k]
         t = secrets.token_hex(4)
         self.tokens[t] = {**data, "_t": now}
         return t
@@ -379,9 +384,10 @@ class OptionsBot:
 
     # ---------- торговля ----------
     async def _ask_confirm(self, update: Update, context, w: Who, text: str, event: str,
-                           action: Callable[[], dict], done: Callable[[dict], str], q=None):
+                           action: Callable[[], dict], done: Callable[[dict], str], q=None,
+                           lookup: Callable[[], str] | None = None):
         pid = secrets.token_hex(6)
-        self.pending[pid] = Pending(text, action, done, event, w, time.monotonic())
+        self.pending[pid] = Pending(text, action, done, event, w, time.monotonic(), lookup)
         self.audit(f"{event}.request", w, pid=pid, order=text.replace("\n", " | "))
         who_line = f"\nИнициатор: {w.name}" if w.is_group else ""
         body = pre(f"{env_banner(self.cfg.env)}\n{text}{who_line}\n\n"
@@ -425,11 +431,15 @@ class OptionsBot:
 
     async def _confirm_order(self, update: Update, context, w: Who, req: OrderRequest, event: str):
         req = await self.call(self.c.prepare_order, req)
-        t = await self.call(self.c.ticker, req.symbol)
+
+        def lookup() -> str:
+            return self.c.order_status_after_failure(req)
+
         await self._ask_confirm(
-            update, context, w, fmt_order_preview(req, t), event,
+            update, context, w, fmt_order_preview(req, req.ticker), event,
             action=lambda: self.c.place_order(req),
             done=lambda r: f"✅ Ордер принят\n{req.describe()}\norderId {r.get('orderId')}",
+            lookup=lookup,
         )
 
     @guarded("trade")
@@ -463,19 +473,22 @@ class OptionsBot:
     async def _confirm_amend(self, update: Update, context, w: Who, symbol: str, order_id: str,
                              qty, price, iv, q=None):
         req, orig = await self.call(self.c.amend_request, symbol, order_id, qty, price, iv)
-        t = await self.call(self.c.ticker, req.symbol)
         oid = orig["orderId"]
+
+        def lookup() -> str:
+            return self.c.amend_status_after_failure(oid, req)
+
         await self._ask_confirm(
-            update, context, w, fmt_amend_preview(req, orig, t), "amend",
+            update, context, w, fmt_amend_preview(req, orig, req.ticker), "amend",
             action=lambda: self.c.amend_order(oid, req),
             done=lambda r: f"✅ Ордер изменён\n{req.describe()}\norderId {r.get('orderId')}",
-            q=q,
+            q=q, lookup=lookup,
         )
 
     async def _amend_menu(self, update: Update, w: Who, symbol: str, order_id: str):
         """Меню изменения ордера: цены bid/mid/ask/mark кнопками или своя цена ответом."""
         inst = await self.call(self.c.resolve_symbol, symbol)
-        orig = next((o for o in await self.call(self.c.open_orders, inst.base) if o["orderId"] == order_id), None)
+        orig = await self.call(self.c.get_order, inst.symbol, order_id)
         if not orig:
             raise ValueError("Ордер уже не активен — обновите /orders")
         t = await self.call(self.c.ticker, inst.symbol)
@@ -508,7 +521,7 @@ class OptionsBot:
                 "160   или   iv50   или   160 0.02 (цена и количество)",
                 reply_markup=ForceReply(input_field_placeholder="160 / iv50 / 160 0.02"),
             )
-            self.awaiting[(prompt.chat_id, prompt.message_id)] = tok
+            self.awaiting[(prompt.chat_id, prompt.message_id)] = (tok, time.monotonic())
         else:
             await self._confirm_amend(update, context, w, d["symbol"], d["oid"], None,
                                       _d(d["prices"][choice]), None, q=q)
@@ -518,11 +531,12 @@ class OptionsBot:
         """Ответ на вопрос «Своя цена…» из меню изменения ордера. Прочие ответы игнорируются."""
         msg = update.effective_message
         key = (msg.chat_id, msg.reply_to_message.message_id)
-        tok = self.awaiting.get(key)
-        if not tok or not w.can_trade:
-            return
+        entry = self.awaiting.get(key)
+        if not entry or not w.can_trade:
+            return  # ответ не на наш вопрос
+        tok, _ = entry
         d = self.tokens.get(tok)
-        if not d:
+        if not d or time.monotonic() - d["_t"] > TOKEN_TTL:
             self.awaiting.pop(key, None)
             raise ValueError("Меню устарело — откройте /orders заново")
         if d["user"] != w.user_id:
@@ -552,6 +566,15 @@ class OptionsBot:
         self.audit("cancel.request", w, symbol=inst.symbol, order_id=order_id)
         try:
             res = await self.call(self.c.cancel_order, inst.symbol, order_id)
+        except BybitNetworkError as e:
+            self.audit("cancel.unknown", w, symbol=inst.symbol, order_id=order_id, err=str(e))
+            try:
+                still = await self.call(self.c.get_order, inst.symbol, order_id)
+                status = "ордер ВСЁ ЕЩЁ АКТИВЕН — повторите отмену" if still else "ордер больше не активен"
+            except Exception as e2:
+                status = f"не удалось выяснить ({e2}) — проверьте /orders"
+            self.audit("cancel.lookup", w, symbol=inst.symbol, order_id=order_id, status=status)
+            raise ValueError(f"Сбой связи с биржей при отмене: {e}\nСтатус: {status}") from e
         except BybitError as e:
             self.audit("cancel.error", w, symbol=inst.symbol, order_id=order_id, err=str(e))
             raise
@@ -574,6 +597,7 @@ class OptionsBot:
             update, context, w, f"CANCEL ALL option orders: {base or 'ВСЕ базовые активы'}", "cancel_all",
             action=lambda: self.c.cancel_all(base),
             done=lambda r: f"✅ Отменено ордеров: {len(r.get('list', []))}",
+            lookup=lambda: f"открытых ордеров сейчас: {len(self.c.open_orders(base))} — проверьте /orders",
         )
 
     # ---------- кнопки ----------
@@ -602,9 +626,34 @@ class OptionsBot:
         await self.edit(q, pre(f"{p.text}\n\n⏳ Отправка…"))
         try:
             res = await self.call(p.action)
+        except BybitNetworkError as e:
+            # запрос мог дойти до биржи — не говорим «ошибка», выясняем фактическое состояние
+            self.audit(f"{p.event}.unknown", w, pid=pid, err=str(e))
+            try:  # промежуточное сообщение не должно мешать выяснению статуса
+                await self.edit(q, pre(f"{p.text}\n\n⚠️ Сбой связи с биржей: {e}\n"
+                                       f"⏳ Выясняю статус (обычно ~{int(sum(LOOKUP_DELAYS))} с, при плохой связи "
+                                       "до 1–2 мин)… Не повторяйте команду."))
+            except TelegramError:
+                log.warning("Не удалось показать «Выясняю статус…»", exc_info=True)
+            status = "не удалось выяснить"
+            if p.lookup:
+                try:
+                    status = await self.call(p.lookup)
+                except Exception as e2:
+                    status = f"не удалось выяснить ({e2})"
+            self.audit(f"{p.event}.lookup", w, pid=pid, status=status)
+            await self.edit(q, pre(f"{p.text}\n\n⚠️ Сбой связи с биржей: {e}\nСтатус: {status}\n"
+                                   "Не повторяйте, пока не проверите /orders и /pos."))
+            return
         except (BybitError, RiskError, ValueError) as e:
             self.audit(f"{p.event}.error", w, pid=pid, err=str(e))
             await self.edit(q, pre(f"{p.text}\n\n⛔ Ошибка: {e}"))
+            return
+        except Exception as e:
+            log.exception("Сбой при выполнении %s", p.event)
+            self.audit(f"{p.event}.error", w, pid=pid, err=f"{type(e).__name__}: {e}")
+            await self.edit(q, pre(f"{p.text}\n\n⛔ Внутренняя ошибка ({type(e).__name__}). "
+                                   "Проверьте /orders и /pos — запрос мог быть отправлен."))
             return
         result = p.done(res)
         self.audit(f"{p.event}.done", w, pid=pid, order_id=res.get("orderId"),
@@ -690,8 +739,10 @@ class OptionsBot:
             try:
                 await self._app.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
             except TelegramError as e:
-                if chat_id > 0:
-                    self._dm_failed.add(chat_id)  # пользователь не начинал диалог с ботом — больше не пробуем
+                permanent = isinstance(e, Forbidden) or (
+                    isinstance(e, BadRequest) and "chat not found" in str(e).lower())
+                if chat_id > 0 and permanent:
+                    self._dm_failed.add(chat_id)  # не начинал диалог / заблокировал бота — больше не пробуем
                 log.warning("Уведомление об исполнении в %s не доставлено: %s", chat_id, e)
 
     @staticmethod

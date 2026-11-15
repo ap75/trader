@@ -74,9 +74,14 @@ class Settings:
     # Баланс/позиции/ордера/греки — только в личке
     sensitive_commands_dm_only: bool = _bool("SENSITIVE_COMMANDS_DM_ONLY", True)
 
+    def __post_init__(self):
+        # клиент идёт в mainnet при любом значении, кроме testnet/demo — опечатка не должна туда вести
+        if self.env not in ("testnet", "demo", "mainnet"):
+            raise ValueError(f"BYBIT_ENV={self.env!r}: допустимо testnet, demo или mainnet")
+
     @property
     def is_mainnet(self) -> bool:
-        return self.env == "mainnet"
+        return self.env == "mainnet"  # значение проверено в __post_init__
 
 
 settings = Settings()
