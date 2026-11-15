@@ -1,6 +1,7 @@
 """Настройки из переменных окружения / файла .env."""
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -17,6 +18,19 @@ def _ids(name: str) -> set[int]:
 def _bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     return default if v is None or v.strip() == "" else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # корень проекта
+
+
+def _minutes_divisor(name: str, default: int) -> int:
+    """Минуты, делящие час (1, 5, 10, 15, 30, 60); неверное значение -> 0 (разбирается в __post_init__)."""
+    v = (os.getenv(name) or "").strip()
+    try:
+        n = int(v) if v else default
+    except ValueError:
+        return 0
+    return n if 1 <= n <= 60 and 60 % n == 0 else 0
 
 
 def _list(name: str, default: str = "") -> list[str]:
@@ -62,6 +76,13 @@ class Settings:
     # Суммарная премия открывающих (не reduce-only) опционных ордеров за сутки UTC, USDT
     max_daily_premium_usdt: Decimal = Decimal(os.getenv("MAX_DAILY_PREMIUM_USDT", "0"))
 
+    # Сборщик рыночных данных (этап 1): срез каждые N минут в SQLite
+    collector_enabled: bool = _bool("COLLECTOR_ENABLED", True)
+    collector_interval_min: int = _minutes_divisor("COLLECTOR_INTERVAL_MIN", 15)  # 0 — неверное значение
+    # Пусто — своя БД на окружение (data/market-<env>.db): данные testnet не смешиваются с mainnet/demo.
+    # Итоговый путь — свойство db_file (относительные пути — от корня проекта, а не от текущей папки).
+    db_path: str = os.getenv("DB_PATH", "").strip()
+
     # Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     # Группы, где бот работает (id групп отрицательные). Из остальных групп бот выходит.
@@ -78,6 +99,21 @@ class Settings:
         # клиент идёт в mainnet при любом значении, кроме testnet/demo — опечатка не должна туда вести
         if self.env not in ("testnet", "demo", "mainnet"):
             raise ValueError(f"BYBIT_ENV={self.env!r}: допустимо testnet, demo или mainnet")
+        v = self.collector_interval_min
+        if not (isinstance(v, int) and 1 <= v <= 60 and 60 % v == 0):
+            # необязательный сбор данных не должен блокировать бота и CLI (в т.ч. экстренную отмену ордеров):
+            # сборщик выключается, сетка слотов для ручного запуска — 15 минут
+            if self.collector_enabled:
+                logging.getLogger("optbot.config").error(
+                    "COLLECTOR_INTERVAL_MIN=%r: должен делить 60 (1, 5, 10, 15, 30, 60) — сборщик ВЫКЛЮЧЕН",
+                    os.getenv("COLLECTOR_INTERVAL_MIN") if v == 0 else v)
+            object.__setattr__(self, "collector_enabled", False)
+            object.__setattr__(self, "collector_interval_min", 15)
+
+    @property
+    def db_file(self) -> str:
+        path = self.db_path or os.path.join("data", f"market-{self.env}.db")
+        return path if os.path.isabs(path) else os.path.join(ROOT, path)
 
     @property
     def is_mainnet(self) -> bool:

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -16,6 +17,8 @@ from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
 
 from .config import Settings, settings as default_settings
+
+log = logging.getLogger("optbot.client")
 
 CATEGORY = "option"
 
@@ -91,6 +94,37 @@ class OrderRequest:
         return f"{self.side.upper()} {self.qty} {self.symbol} {what}{ro}"
 
 
+def parse_option_symbol(sym: str) -> tuple[str, str, Decimal, str] | None:
+    """'BTC-27NOV26-60000-P-USDT' -> ('BTC', '27NOV26', Decimal('60000'), 'P'); нестандартный символ -> None."""
+    parts = sym.split("-")
+    if len(parts) < 4 or parts[3] not in ("C", "P"):
+        return None
+    try:
+        strike = Decimal(parts[2])
+    except Exception:
+        return None
+    if not strike.is_finite() or strike <= 0:  # 'NaN', 'Infinity', '-1' — не страйк
+        return None
+    return parts[0], parts[1], strike, parts[3]
+
+
+def group_by_strike(rows: list[dict]) -> dict[Decimal, dict[str, dict]]:
+    """Тикеры одной экспирации -> {страйк: {'C': тикер колла, 'P': тикер пута}}. Нестандартные символы пропускаются."""
+    out: dict[Decimal, dict[str, dict]] = {}
+    for r in rows:
+        p = parse_option_symbol(r.get("symbol", ""))
+        if p:
+            out.setdefault(p[2], {})[p[3]] = r
+    return out
+
+
+def spread_pct(bid, ask):
+    """Спред в % от mid; None, если нет одной из сторон. Одна формула для риск-проверки и сборщика."""
+    if not bid or not ask or bid <= 0 or ask <= 0:
+        return None
+    return (ask - bid) / ((ask + bid) / 2) * 100
+
+
 def _d(x) -> Decimal:
     try:
         return Decimal(str(x)) if x not in (None, "") else Decimal(0)
@@ -140,14 +174,22 @@ class OptionsClient:
 
     # ---------- справочник инструментов ----------
     def load_instruments(self, base: str, force: bool = False) -> list[Instrument]:
+        """Справочник с кэшем на INSTRUMENTS_TTL. Блокировка — только на чтение/замену кэша, не на сетевые
+        запросы: долгая загрузка (сборщик, плохая связь) не задерживает торговые команды."""
+        base = base.upper()
         with self._instr_lock:
-            return self._load_instruments(base.upper(), force)
+            fresh = time.time() - self._instr_loaded_at.get(base, 0) < self.INSTRUMENTS_TTL
+            if fresh and not force:
+                return [i for i in self._instruments.values() if i.base == base]
+        out = self._fetch_instruments(base)
+        with self._instr_lock:
+            for sym in [s for s, i in self._instruments.items() if i.base == base]:
+                del self._instruments[sym]
+            self._instruments.update({i.symbol: i for i in out})
+            self._instr_loaded_at[base] = time.time()
+        return out
 
-    def _load_instruments(self, base: str, force: bool) -> list[Instrument]:
-        fresh = time.time() - self._instr_loaded_at.get(base, 0) < self.INSTRUMENTS_TTL
-        if fresh and not force:
-            return [i for i in self._instruments.values() if i.base == base]
-
+    def _fetch_instruments(self, base: str) -> list[Instrument]:
         cursor, out = None, []
         while True:
             params = dict(category=CATEGORY, baseCoin=base, limit=1000)
@@ -160,12 +202,15 @@ class OptionsClient:
                 if it.get("status") != "Trading":
                     continue
                 lot, pf = it.get("lotSizeFilter", {}), it.get("priceFilter", {})
-                parts = it["symbol"].split("-")  # BTC-27MAR26-70000-P-USDT
+                parsed = parse_option_symbol(it.get("symbol", ""))  # BTC-27MAR26-70000-P-USDT
+                if not parsed:
+                    log.warning("Нестандартный символ в справочнике пропущен: %s", it.get("symbol"))
+                    continue
                 out.append(Instrument(
                     symbol=it["symbol"],
                     base=base,
-                    option_type=it.get("optionsType") or ("Call" if parts[3] == "C" else "Put"),
-                    strike=_d(parts[2]),
+                    option_type=it.get("optionsType") or ("Call" if parsed[3] == "C" else "Put"),
+                    strike=parsed[2],
                     expiry_ms=int(it["deliveryTime"]),
                     tick_size=_d(pf.get("tickSize")),
                     qty_step=_d(lot.get("qtyStep")),
@@ -175,11 +220,6 @@ class OptionsClient:
             cursor = res.get("nextPageCursor")
             if not cursor:
                 break
-
-        for sym in [s for s, i in self._instruments.items() if i.base == base]:
-            del self._instruments[sym]
-        self._instruments.update({i.symbol: i for i in out})
-        self._instr_loaded_at[base] = time.time()
         return out
 
     def expiries(self, base: str) -> list[tuple[str, datetime]]:
@@ -194,8 +234,8 @@ class OptionsClient:
         base = s.split("-")[0]
         if base not in self.cfg.base_coins:
             raise ValueError(f"Базовый актив {base} не в списке BASE_COINS")
+        self.load_instruments(base)
         with self._instr_lock:
-            self.load_instruments(base)
             for cand in (s, f"{s}-{self.cfg.settle_coin}"):
                 if cand in self._instruments:
                     return self._instruments[cand]
@@ -220,16 +260,20 @@ class OptionsClient:
             raise BybitError(f"Нет тикера для {symbol}")
         return rows[0]
 
+    def perp_ticker(self, base: str) -> dict | None:
+        """Тикер линейного перпетуала BASEUSDT (markPrice, indexPrice, lastPrice)."""
+        rows = self._call(self.http.get_tickers, category="linear", symbol=f"{base.upper()}USDT").get("list", [])
+        return rows[0] if rows else None
+
     def chain(self, base: str, expiry_code: str, strikes_around_atm: int = 6) -> dict:
         """Цепочка опционов: строки по страйкам вокруг ATM, с котировками и греками."""
         rows = self.tickers(base, expiry_code)
         if not rows:
             raise BybitError(f"Нет данных для {base} {expiry_code}")
         underlying = _d(rows[0].get("underlyingPrice"))
-        by_strike: dict[Decimal, dict] = {}
-        for r in rows:
-            _, _, k, cp, *_ = r["symbol"].split("-")
-            by_strike.setdefault(_d(k), {})["call" if cp == "C" else "put"] = r
+        by_strike = group_by_strike(rows)
+        if not by_strike:
+            raise BybitError(f"Нет данных для {base} {expiry_code}")
         strikes = sorted(by_strike)
         atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - underlying))
         lo, hi = max(0, atm_idx - strikes_around_atm), atm_idx + strikes_around_atm + 1
@@ -238,7 +282,7 @@ class OptionsClient:
             "expiry": expiry_code.upper(),
             "underlying": underlying,
             "atm_strike": strikes[atm_idx],
-            "rows": [(k, by_strike[k].get("call"), by_strike[k].get("put")) for k in strikes[lo:hi]],
+            "rows": [(k, by_strike[k].get("C"), by_strike[k].get("P")) for k in strikes[lo:hi]],
         }
 
     # ---------- аккаунт ----------
@@ -386,8 +430,8 @@ class OptionsClient:
         if market:
             if not (ask if buy else bid):
                 raise RiskError(f"Нет встречных заявок ({'ask' if buy else 'bid'}) — рыночный ордер невозможен")
-            if bid > 0 and ask > 0:
-                spread = (ask - bid) / ((ask + bid) / 2) * 100
+            spread = spread_pct(bid, ask)
+            if spread is not None:
                 if spread > self.cfg.max_spread_pct:
                     raise RiskError(
                         f"Спред {spread:.1f}% > MAX_SPREAD_PCT={self.cfg.max_spread_pct}% — "

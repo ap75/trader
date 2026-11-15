@@ -41,7 +41,10 @@ class FakeHTTP:
                         "symbol": sym, "markPrice": "100", "bid1Price": "95", "ask1Price": "105",
                         "bid1Size": "10", "ask1Size": "10", "markIv": "0.5", "delta": "0.1" if cp == "C" else "-0.1",
                         "underlyingPrice": "65000" if base == "BTC" else "2000" if base == "ETH" else "70",
+                        "indexPrice": "64990" if base == "BTC" else "1999" if base == "ETH" else "69.9",
+                        "openInterest": "5",
                     }
+        self.perp: dict[str, str] = {}         # symbol перпетуала -> markPrice
         self.books: dict[str, dict] = {}       # symbol -> {"a": [[px, sz]], "b": [...]}; иначе из тикера
         self.positions: list[dict] = []
         self.orders: list[dict] = []           # активные
@@ -78,6 +81,8 @@ class FakeHTTP:
 
     def get_tickers(self, category, baseCoin=None, symbol=None, expDate=None):
         self._rec("get_tickers", locals())
+        if category == "linear":  # перпетуал BASEUSDT
+            return ok({"list": [{"symbol": symbol, "markPrice": self.perp.get(symbol, "65010")}]})
         if symbol:
             return ok({"list": [self.tickers[symbol]] if symbol in self.tickers else []})
         return ok({"list": [t for s, t in self.tickers.items() if s.startswith(baseCoin + "-")]})

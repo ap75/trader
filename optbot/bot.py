@@ -52,6 +52,7 @@ from telegram.ext import (
 )
 
 from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
+from .collector import Collector, seconds_to_next_slot
 from .config import Settings, settings
 from .ws import ExecutionWatcher
 from .fmt import (
@@ -173,6 +174,7 @@ class OptionsBot:
     def __init__(self, client: OptionsClient, cfg: Settings):
         self.c = client
         self.cfg = cfg
+        self.collector = Collector(client, cfg)
         self.pending: dict[str, Pending] = {}
         self.tokens: dict[str, dict] = {}            # короткие ключи для данных кнопок (лимит 64 байта)
         # (chat_id, id сообщения-вопроса) -> (токен меню amend, время); живут сутки, чтобы на поздний ответ
@@ -703,6 +705,16 @@ class OptionsBot:
             tok, _, how = rest.partition(":")
             await self._close_button(update, context, w, tok, how)
 
+    # ---------- сборщик рыночных данных ----------
+    async def _collect_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Задача JobQueue: срез в БД. Ошибки не роняют бота — следующий проход по расписанию."""
+        try:
+            res = await asyncio.to_thread(self.collector.collect)
+        except Exception:
+            log.exception("Сборщик: проход не выполнен")
+            return
+        (log.warning if res.errors else log.info)("Сборщик: %s", res)
+
     # ---------- исполнения (WebSocket) ----------
     def _on_ws_executions(self, rows: list[dict]) -> None:
         """Вызывается из потока pybit."""
@@ -777,6 +789,16 @@ class OptionsBot:
                 await asyncio.to_thread(self.watcher.start)
             except Exception:
                 log.exception("WebSocket исполнений не подключён — уведомлений об исполнениях не будет")
+
+            if self.cfg.collector_enabled and app.job_queue is None:
+                log.warning("Сборщик выключен: нет JobQueue — установите python-telegram-bot[job-queue] "
+                            "(pip install -r requirements.txt)")
+            elif self.cfg.collector_enabled:
+                first = seconds_to_next_slot(time.time(), self.cfg.collector_interval_min)
+                app.job_queue.run_repeating(self._collect_job, interval=self.cfg.collector_interval_min * 60,
+                                            first=first, name="collector")
+                log.info("Сборщик: каждые %d мин, первый срез через %.0f с, БД %s",
+                         self.cfg.collector_interval_min, first, self.cfg.db_file)
 
         async def post_shutdown(app: Application):
             if self.watcher:

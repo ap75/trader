@@ -4,8 +4,12 @@
 а load_dotenv не перезаписывает уже заданные — так тесты не зависят от локального .env.
 """
 import os
+import tempfile
 
 os.environ.update(
+    # своя временная БД: тест не может записать подставные данные в настоящую data/market-<env>.db
+    DB_PATH=os.path.join(tempfile.mkdtemp(prefix="optbot-test-"), "market.db"),
+    COLLECTOR_ENABLED="true", COLLECTOR_INTERVAL_MIN="15",
     BYBIT_ENV="demo", BYBIT_API_KEY="test-key", BYBIT_API_SECRET="test-secret",
     SETTLE_COIN="USDT", BASE_COINS="BTC,ETH,SOL",
     MAX_QTY_BTC="1", MAX_QTY_ETH="10", MAX_QTY_SOL="100",
