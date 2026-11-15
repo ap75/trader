@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import html
+import os
 import re
 import time
 from types import SimpleNamespace as NS
@@ -9,11 +10,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 import requests
-from telegram.error import Forbidden, NetworkError
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 from telegram.ext import ApplicationHandlerStop
 
 from optbot import bot as botmod
-from optbot.bot import OptionsBot
+from optbot.bot import GUIDE_LANGS, HELP, OptionsBot
 from tests.helpers import with_cfg
 from tests.fakes import BTC_PUT
 
@@ -557,3 +558,156 @@ def test_cancelall_confirm(b, tg):
     run(b.cmd_cancelall(tg.upd(TRADER), tg.ctx("BTC")))
     run(b.on_callback(tg.upd(TRADER, data=f"ok:{pid_from(tg)}"), tg.ctx()))
     assert "Отменено ордеров: 1" in tg.last("edit")
+
+
+# ---------- /guide ----------
+def _guide(bb, tg, uid, *args, lang_code=None, chat="dm", sender_chat=None, fail_fid=False, fail=None):
+    docs = []
+
+    async def reply_document(document, filename, caption=None, do_quote=None):
+        assert do_quote is False
+        if fail:
+            raise fail
+        if fail_fid and isinstance(document, str):
+            raise BadRequest("Wrong file identifier/http url specified")
+        docs.append((filename, document, caption))
+        return NS(document=NS(file_id=f"fid-{filename}"))
+    u = tg.upd(uid, chat=chat, sender_chat=sender_chat)
+    u.effective_user.language_code = lang_code
+    u.effective_message.reply_document = reply_document
+    run(bb.cmd_guide(u, tg.ctx(*args)))
+    return docs
+
+
+@pytest.mark.parametrize("uid,args,code,expect,title", [
+    (TRADER, (), None, "guide-trader-ru.pdf", "Инструкция трейдера"),
+    (TRADER, (), "uk", "guide-trader-uk.pdf", "Інструкція трейдера"),
+    (TRADER, ("RU",), "uk", "guide-trader-ru.pdf", "Инструкция трейдера"),   # аргумент важнее языка Telegram
+    (VIEWER, (), "en", "guide-viewer-ru.pdf", "Инструкция для просмотра"),
+    (VIEWER, ("uk",), None, "guide-viewer-uk.pdf", "Інструкція для перегляду"),
+])
+def test_guide_by_role_and_language(b, tg, uid, args, code, expect, title):
+    docs = _guide(b, tg, uid, *args, lang_code=code)
+    assert [(d[0], d[2]) for d in docs] == [(expect, title)]
+    assert docs[0][1].startswith(b"%PDF")   # настоящий файл из docs/
+
+
+def test_guide_never_admin(b, tg):
+    sent = []
+    for uid in (TRADER, VIEWER):
+        for lang in GUIDE_LANGS:
+            sent += [d[0] for d in _guide(b, tg, uid, lang)]
+    assert len(sent) == 4 and not any("admin" in n for n in sent)
+    assert _guide(b, tg, TRADER, "admin") == [] and "Формат: /guide" in tg.last()
+
+
+def test_guide_in_group(b, tg):
+    assert [d[0] for d in _guide(b, tg, TRADER, chat="g")] == ["guide-trader-ru.pdf"]
+
+
+def test_guide_open_view_member_and_anon_get_viewer_guide(make_bot, cfg, tg):
+    bb = make_bot(with_cfg(cfg, allow_all_group_members_view=True))
+    assert [d[0] for d in _guide(bb, tg, STRANGER, chat="g")] == ["guide-viewer-ru.pdf"]
+    bb._guide_sent.clear()
+    anon = _guide(bb, tg, TRADER, chat="g", sender_chat=NS(id=GROUP, title="Desk"))
+    assert [d[0] for d in anon] == ["guide-viewer-ru.pdf"]   # от имени группы — не трейдер
+
+
+def test_guide_stranger_gets_nothing(b, tg):
+    assert _guide(b, tg, STRANGER) == [] and tg.out == []
+
+
+def test_guide_cooldown_per_chat_and_file_id_reused(b, tg, monkeypatch):
+    first = _guide(b, tg, TRADER, chat="g")
+    assert first and isinstance(first[0][1], bytes)
+    n = len(tg.out)
+    assert _guide(b, tg, TRADER, chat="g") == [] and len(tg.out) == n   # повтор в группе — молча
+    assert [d[1] for d in _guide(b, tg, TRADER)] == ["fid-guide-trader-ru.pdf"]   # личка — свой чат; file_id
+    assert _guide(b, tg, TRADER) == [] and "только что отправлена" in tg.last()   # в личке — объяснение
+    monkeypatch.setattr("optbot.bot.GUIDE_COOLDOWN", 0)
+    assert [d[1] for d in _guide(b, tg, TRADER, chat="g")] == ["fid-guide-trader-ru.pdf"]
+    assert len(b._guide_ids) == 1   # одна запись на файл
+
+
+def test_guide_send_error_is_clear_and_allows_retry(b, tg, caplog):
+    assert _guide(b, tg, TRADER, fail=BadRequest("Chat not found")) == []
+    assert "Инструкция недоступна" in tg.last() and "Chat not found" in caplog.text
+    assert not b._guide_sent and not b._guide_ids   # ничего не ушло — повтор разрешён сразу
+    assert [d[0] for d in _guide(b, tg, TRADER)] == ["guide-trader-ru.pdf"]
+
+
+@pytest.mark.parametrize("err,cooldown_kept,reply", [
+    (TimedOut(), True, None),                                    # мог дойти: ни ошибки в чат, ни повтора сразу
+    (NetworkError("reset"), False, "повторите позже"),
+    (Forbidden("blocked"), False, "повторите позже"),
+    (BadRequest("Not enough rights to send documents"), False, "Инструкция недоступна"),
+])
+def test_guide_telegram_errors(b, tg, caplog, err, cooldown_kept, reply):
+    assert _guide(b, tg, TRADER, fail=err) == []
+    assert bool(b._guide_sent) is cooldown_kept
+    assert (tg.out[-1][1] if tg.out else None) is None if reply is None else reply in tg.last()
+    assert "Сбой обработчика" not in caplog.text   # не «Внутренняя ошибка»
+
+
+def test_guide_chat_error_keeps_file_id(b, tg):
+    _guide(b, tg, TRADER)
+    cached = dict(b._guide_ids)
+    b._guide_sent.clear()
+    assert _guide(b, tg, TRADER, fail=BadRequest("Chat not found")) == []   # и file_id, и загрузка отклонены
+    assert b._guide_ids == cached   # дело в чате — file_id сохранён
+
+
+def test_guide_truncated_pdf_not_sent(b, tg, monkeypatch, tmp_path):
+    (tmp_path / "guide-trader-ru.pdf").write_bytes(b"%PDF-1.4 ... half written")
+    monkeypatch.setattr("optbot.bot.GUIDE_DIR", tmp_path)
+    assert _guide(b, tg, TRADER) == [] and "Инструкция недоступна" in tg.last() and not b._guide_ids
+
+
+def test_guide_sent_pruned(b, tg, monkeypatch):
+    b._guide_sent[(123, "guide-trader-ru.pdf")] = time.monotonic() - 3600
+    _guide(b, tg, TRADER)
+    assert (123, "guide-trader-ru.pdf") not in b._guide_sent
+
+
+def test_guide_file_changing_during_read(b, tg, monkeypatch, tmp_path):
+    src = tmp_path / "guide-trader-ru.pdf"
+    src.write_bytes(b"%PDF full\n%%EOF\n")
+    monkeypatch.setattr("optbot.bot.GUIDE_DIR", tmp_path)
+    real = type(src).read_bytes
+
+    def partial(self):
+        data = real(self)
+        self.write_bytes(b"%PDF full, now longer\n%%EOF\n")   # git pull дописывает файл
+        return data
+    monkeypatch.setattr(type(src), "read_bytes", partial)
+    assert _guide(b, tg, TRADER) == [] and "Инструкция недоступна" in tg.last() and not b._guide_sent
+
+
+def test_guide_stale_file_id_reuploads(b, tg):
+    _guide(b, tg, TRADER)
+    b._guide_sent.clear()
+    docs = _guide(b, tg, TRADER, fail_fid=True)
+    assert len(docs) == 1 and isinstance(docs[0][1], bytes)
+    b._guide_sent.clear()
+    assert [d[1] for d in _guide(b, tg, TRADER)] == ["fid-guide-trader-ru.pdf"]   # новый file_id запомнен
+
+
+def test_guide_new_pdf_after_update_uploaded_again(b, tg, monkeypatch, tmp_path):
+    src = tmp_path / "guide-trader-ru.pdf"
+    src.write_bytes(b"%PDF old\n%%EOF\n")
+    monkeypatch.setattr("optbot.bot.GUIDE_DIR", tmp_path)
+    _guide(b, tg, TRADER)
+    src.write_bytes(b"%PDF new\n%%EOF\n")
+    os.utime(src, (1, 1))   # другой mtime — как после git pull
+    b._guide_sent.clear()
+    assert [d[1] for d in _guide(b, tg, TRADER)] == [b"%PDF new\n%%EOF\n"]
+
+
+def test_guide_missing_file(b, tg, monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr("optbot.bot.GUIDE_DIR", tmp_path)
+    assert _guide(b, tg, TRADER) == []
+    assert "Инструкция недоступна" in tg.last() and "guide-trader-ru.pdf" in caplog.text
+
+
+def test_guide_in_command_menu_and_help(b):
+    assert any(n == "guide" for n, _, _ in b.COMMANDS) and "/guide" in HELP

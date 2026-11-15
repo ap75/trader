@@ -27,13 +27,28 @@ systemctl --user status options-bot            # active (running)
 journalctl --user -u options-bot -f            # лог; действия трейдеров — строки optbot.trade
 ```
 
-Код с компьютера:
-`rsync -av --exclude .venv --exclude data --include .env.example --exclude '.env*' --exclude .git --exclude __pycache__ ./ ap@SERVER:trader/`
+Код — из GitHub:
+```
+git clone git@github.com:ap75/trader.git ~/trader      # первый раз
+cd ~/trader && git pull                                # обновление
+```
 
-**Обновление:** rsync, при изменении зависимостей `.venv/bin/pip install -r requirements.txt`, затем
+**Альтернатива — rsync с компьютера** (если на сервере нет доступа к GitHub). Из корня проекта на компьютере:
+```
+rsync -av --exclude .venv --exclude data --include .env.example --exclude '.env*' --exclude .git \
+      --exclude __pycache__ ./ ap@SERVER:trader/
+```
+Не трогает на сервере `.env`, `data/`, `.venv` и `.git`. Способы не смешивать: если сервер обновляется через
+`git pull`, rsync поверх него оставит рабочую копию с правками относительно последнего коммита — следующий
+`git pull` споткнётся. Отправляется ровно то, что лежит в папке на компьютере, включая незакоммиченные правки —
+перед rsync проверьте `git status`. Ключ `--delete` не добавлять: он удалит на сервере файлы, которых нет локально.
+
+**Обновление:** `git pull` (или rsync), при изменении зависимостей `.venv/bin/pip install -r requirements.txt`, затем
 `systemctl --user restart options-bot` — не ближе минуты к :00/:15/:30/:45, иначе сборщик пропустит срез
 (восполнить: `.venv/bin/python -m optbot.collector --once`). Автоперезапуск по `.path` не нужен; если всё же
 делать — следить за файлом-триггером, не за папкой проекта (бот сам пишет в `data/`).
+
+**После переезда** бот на компьютере не запускать (один токен — один экземпляр); рабочая база — на сервере.
 
 Накопленную базу можно перенести: при остановленном локальном боте
 `sqlite3 data/market-demo.db ".backup /tmp/market-demo.db"`, затем `scp` в `~/trader/data/`. Рост — около 1 МБ в сутки.

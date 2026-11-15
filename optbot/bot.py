@@ -26,6 +26,10 @@
 Исполнения: приватный WebSocket Bybit (optbot.ws) — сообщение о каждой сделке по опционам
 (включая сделанные вне бота) во все разрешённые группы и трейдерам в личку.
 
+Инструкции: /guide [ru|uk] — PDF из docs/ под права спросившего (трейдера или зрителя; администратора —
+никогда), язык по Telegram или аргументу. Одну и ту же — в чат не чаще GUIDE_COOLDOWN сек (в группе повтор
+молча); file_id Telegram запоминается до смены файла (mtime и размер).
+
 Лимиты Telegram: AIORateLimiter (≈30 сообщений/с всего, 20/мин на группу, повтор после RetryAfter);
 обновления цепочки и навигация по кнопкам редактируют сообщение, а не шлют новое;
 отказы неразрешённым пользователям — молча.
@@ -42,11 +46,12 @@ import sys
 import time
 from dataclasses import dataclass
 from decimal import InvalidOperation
+from pathlib import Path
 from typing import Callable
 
 from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     AIORateLimiter, Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, TypeHandler, filters,
@@ -55,7 +60,7 @@ from telegram.ext import (
 from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
 from .collector import Collector, seconds_to_next_slot
 from .journal import Journal, fmt_report, parse_period
-from .config import Settings, settings
+from .config import ROOT, Settings, settings
 from .ws import ExecutionWatcher
 from .fmt import (
     env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_order_preview, fmt_orders,
@@ -74,6 +79,25 @@ GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 # GroupAnonymousBot (анонимный админ), Channel_Bot (пост от канала), Telegram (авто-форвард из канала)
 SERVICE_USER_IDS = {1087968824, 136817688, 777000}
 
+# PDF-инструкции (docs/guides.py). Инструкцию администратора бот не отдаёт — только трейдера и зрителя.
+GUIDE_DIR = Path(ROOT) / "docs"
+GUIDE_LANGS = ("ru", "uk")
+GUIDE_COOLDOWN = 60  # сек: та же инструкция в тот же чат не чаще — защита от флуда документами
+GUIDE_CAPTIONS = {"trader": {"ru": "Инструкция трейдера", "uk": "Інструкція трейдера"},
+                  "viewer": {"ru": "Инструкция для просмотра", "uk": "Інструкція для перегляду"}}
+
+
+def _read_stable(path: Path) -> tuple[tuple, bytes]:
+    """((mtime, размер), содержимое); ValueError, если файл меняется во время чтения (git pull пишет его)."""
+    st = path.stat()
+    data = path.read_bytes()
+    st2 = path.stat()
+    ver = (st.st_mtime_ns, st.st_size)
+    # git пишет файл частями: размер и время могут совпасть на недописанном — конец PDF обязателен
+    if (st2.st_mtime_ns, st2.st_size) != ver or len(data) != st.st_size or b"%%EOF" not in data[-1024:]:
+        raise ValueError(f"{path.name} неполный или меняется во время чтения")
+    return ver, data
+
 HELP = """Просмотр:
 /exp [BASE] — экспирации (кнопками)
 /chain BASE [EXP] [N] — цепочка
@@ -84,6 +108,7 @@ HELP = """Просмотр:
 /journal [ПЕРИОД] [csv] — журнал сделок и PnL*
    ПЕРИОД: сегодня | вчера | 7d | 2026-11-01 | 2026-11-01..2026-11-15
 /id — ваш user id и chat id
+/guide [ru|uk] — инструкция (PDF)
 
 Торговля (только трейдеры):
 /buy SYMBOL QTY PRICE|ivNN|mkt
@@ -192,6 +217,8 @@ class OptionsBot:
         self._dm_failed: set[int] = set()
         # orderId -> [блокировка, сколько держат/ждут]: изменения/отмены одного ордера идут строго по очереди
         self._order_locks: dict[str, list] = {}
+        self._guide_ids: dict[str, tuple[tuple, str]] = {}  # файл -> ((mtime, размер), file_id): без повторной загрузки
+        self._guide_sent: dict[tuple[int | None, str], float] = {}  # (чат, файл) -> когда отправлена
 
     # ---------- доступ ----------
     def who(self, update: Update) -> Who:
@@ -327,6 +354,69 @@ class OptionsBot:
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
         note = "\n* в группах скрыты" if self.cfg.sensitive_commands_dm_only else ""
         await self.reply(update, f"{env_banner(self.cfg.env)}\n\n{HELP}{note}")
+
+    @guarded("view")
+    async def cmd_guide(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
+        """PDF-инструкция под права: трейдеру — трейдера, остальным — зрителя. Язык — аргумент или язык Telegram."""
+        args = [a.lower() for a in context.args]
+        if len(args) > 1 or args and args[0] not in GUIDE_LANGS:
+            raise ValueError("Формат: /guide [ru|uk]")
+        code = (getattr(update.effective_user, "language_code", None) or "").lower()
+        lang = args[0] if args else "uk" if code.startswith("uk") else "ru"
+        role = "trader" if w.can_trade else "viewer"
+        name = f"guide-{role}-{lang}.pdf"
+        path = GUIDE_DIR / name
+        sent_key, now = (w.chat_id, name), time.monotonic()
+        if now - self._guide_sent.get(sent_key, -GUIDE_COOLDOWN) < GUIDE_COOLDOWN:
+            if not w.is_group:  # в группе повтор молча: ответ на каждый повтор — тоже флуд
+                await self.reply(update, "Эта инструкция только что отправлена — см. выше")
+            return
+        self._guide_sent = {k: t for k, t in self._guide_sent.items() if now - t < GUIDE_COOLDOWN}
+        self._guide_sent[sent_key] = now  # до отправки: параллельный повтор не пройдёт
+        # do_quote=False: в той же теме группы, и удалённая команда не мешает отправке
+        send = functools.partial(update.effective_message.reply_document, filename=name,
+                                 caption=GUIDE_CAPTIONS[role][lang], do_quote=False)
+        try:
+            ver, doc = await self._guide_doc(path)
+            try:
+                msg = await send(document=doc)
+            except BadRequest:
+                if not isinstance(doc, str):
+                    raise
+                # запомненный file_id отклонён (текст ошибки не разбираем) — один раз загрузить файл заново;
+                # если и загрузка не прошла, дело в чате, а не в file_id — запись вернуть
+                cached = self._guide_ids.pop(name, None)
+                try:
+                    ver, doc = await self._guide_doc(path)
+                    msg = await send(document=doc)
+                except Exception:
+                    if cached:
+                        self._guide_ids.setdefault(name, cached)
+                    raise
+        except TimedOut:  # файл мог и дойти: повтор не раньше чем через минуту, ошибку в чат не пишем
+            log.warning("Инструкция %s: таймаут отправки в %s — могла дойти", name, w.chat_id)
+            return
+        except Exception as e:
+            self._guide_sent.pop(sent_key, None)  # точно не отправлено — повтор разрешён
+            if isinstance(e, (OSError, BadRequest, ValueError)):  # BadRequest — подкласс NetworkError: раньше
+                log.error("Инструкция %s не отправлена: %s", name, e)
+                raise ValueError("Инструкция недоступна — сообщите администратору") from None
+            if isinstance(e, (Forbidden, NetworkError)):  # сбой Telegram; ответ в чат может и не дойти
+                log.warning("Инструкция %s в %s не отправлена: %s", name, w.chat_id, e)
+                raise ValueError("Не удалось отправить инструкцию — повторите позже") from None
+            raise
+        fid = getattr(getattr(msg, "document", None), "file_id", None)
+        if fid:
+            self._guide_ids[name] = (ver, fid)
+
+    async def _guide_doc(self, path: Path) -> tuple[tuple, str | bytes]:
+        """(версия, документ): file_id, если этот PDF уже загружали (те же mtime и размер), иначе содержимое."""
+        cached = self._guide_ids.get(path.name)
+        if cached:
+            st = await self.call(path.stat)
+            if cached[0] == (st.st_mtime_ns, st.st_size):
+                return cached
+        return await self.call(_read_stable, path)
 
     # ---------- рынок ----------
     def _bases_kb(self) -> InlineKeyboardMarkup:
@@ -888,6 +978,7 @@ class OptionsBot:
     COMMANDS = [
         ("help", "cmd_help", "справка"),
         ("id", "cmd_id", "ваш user id и chat id"),
+        ("guide", "cmd_guide", "инструкция (PDF)"),
         ("exp", "cmd_exp", "экспирации"),
         ("chain", "cmd_chain", "цепочка опционов"),
         ("t", "cmd_ticker", "котировка инструмента"),

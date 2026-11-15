@@ -20,6 +20,11 @@
 ## Безопасность
 
 - `BYBIT_ENV=demo` сейчас. Переход на mainnet — только с явного согласия пользователя.
+- Бот работает **на сервере** (`~/trader`, служба `options-bot`, `systemctl --user`). Локально `optbot.bot` не запускать:
+  один токен — один экземпляр (Telegram `Conflict`). Рабочая БД — на сервере; локальная `data/` устарела,
+  `collector`/`journal` локально дают старые данные — запускать на сервере.
+- Обновление сервера: `git pull`; изменились зависимости — `.venv/bin/pip install -r requirements.txt`; затем
+  `systemctl --user restart options-bot` не ближе минуты к :00/:15/:30/:45 (иначе пропуск среза сборщика).
 - Реальные ордера в проверках — далеко от рынка и сразу отменять (на demo пользователь разрешал мелкие сделки).
 - `.env` (ключи, токен) не коммитить, не показывать и не передавать во внешние сервисы.
 
@@ -28,11 +33,11 @@
 ```
 .venv/bin/pip install -r requirements-dev.txt   # зависимости и pytest
 .venv/bin/pytest                                # тесты (--cov=optbot — покрытие)
-.venv/bin/python -m optbot.bot                  # бот
+.venv/bin/python -m optbot.bot                  # бот (только на сервере — см. «Безопасность»)
 .venv/bin/python -m optbot.cli --help           # CLI
 .venv/bin/python smoke_order.py                 # ордер далеко от рынка -> отмена (только demo/testnet)
-.venv/bin/python -m optbot.collector --once|--stats      # сборщик: срез вручную | что накоплено
-.venv/bin/python -m optbot.journal --sync | --report 7d [--csv f]   # журнал сделок
+.venv/bin/python -m optbot.collector --once|--stats      # сборщик: срез вручную | что накоплено (на сервере)
+.venv/bin/python -m optbot.journal --sync | --report 7d [--csv f]   # журнал сделок (на сервере)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
 ```
