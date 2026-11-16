@@ -208,18 +208,14 @@ class Collector:
             return None
 
 
-def track_symbols(path: str, symbols: list[str], until_ms: int, reason: str = "") -> None:
-    """Поставить ноги на слежение (используется сигналами, этап 4)."""
-    conn = db.connect(path)
-    try:
-        with conn:
-            conn.executemany(
-                "INSERT INTO tracked_symbols (symbol, added_ms, until_ms, reason) VALUES (?,?,?,?) "
-                "ON CONFLICT(symbol) DO UPDATE SET until_ms = MAX(until_ms, excluded.until_ms), "
-                "reason = CASE WHEN excluded.until_ms > until_ms THEN excluded.reason ELSE reason END",
-                [(s, int(time.time() * 1000), until_ms, reason) for s in symbols])
-    finally:
-        conn.close()
+def track(conn: sqlite3.Connection, symbols: list[str], until_ms: int, reason: str = "",
+          now_ms: int | None = None) -> None:
+    """Поставить ноги на слежение в открытой транзакции (журнал сигналов пишет сигнал и слежение вместе)."""
+    conn.executemany(
+        "INSERT INTO tracked_symbols (symbol, added_ms, until_ms, reason) VALUES (?,?,?,?) "
+        "ON CONFLICT(symbol) DO UPDATE SET until_ms = MAX(until_ms, excluded.until_ms), "
+        "reason = CASE WHEN excluded.until_ms > until_ms THEN excluded.reason ELSE reason END",
+        [(s, now_ms if now_ms is not None else int(time.time() * 1000), until_ms, reason) for s in symbols])
 
 
 def stats(path: str) -> str:

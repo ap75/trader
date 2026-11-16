@@ -442,9 +442,11 @@ def classify_iv(m: Metrics, sc: SignalSettings) -> tuple[str | None, list[str]]:
     return "normal", why
 
 
-def choose(m: Metrics, sc: SignalSettings) -> tuple[str | None, list[str]]:
-    """-> (стратегия или None, пояснения)."""
-    regime, why = classify_iv(m, sc)
+def choose(m: Metrics, sc: SignalSettings,
+           cls: tuple[str | None, list[str]] | None = None) -> tuple[str | None, list[str]]:
+    """-> (стратегия или None, пояснения). cls — уже посчитанный classify_iv (чтобы не считать дважды)."""
+    regime, why = cls if cls is not None else classify_iv(m, sc)
+    why = list(why)
     if regime is None:  # причина — последней строкой (её карточка показывает как «Сигнала нет: …»)
         return None, why
     if regime == "normal":  # тренд ничего не изменит — не прятать причину за «тренд не определён»
@@ -473,7 +475,9 @@ class Signal:
     reasons: list[str]
     no_signal: str | None = None       # почему не выдан (если strategy is None или не собрался)
     rejected: list[str] = field(default_factory=list)  # экспирации, где не собралось, с причинами
+    regime: str | None = None          # high | low | normal | None — режим IV (для статистики, этап 4)
     expiry: str | None = None
+    expiry_ms: int | None = None
     dte: float | None = None
     forward: float | None = None
     exp_iv: float | None = None
@@ -482,6 +486,9 @@ class Signal:
     qty: float | None = None
     legs: list[Leg] = field(default_factory=list)
     profile: Profile | None = None
+    id: int | None = None              # номер в журнале сигналов (sigjournal), если записан
+    journal_first_ms: int | None = None  # повторный показ: когда записан первый (цены журнала — оттуда)
+    journal_net: float | None = None     # повторный показ: премия в журнале (от первого показа)
 
     @property
     def net(self) -> float:
@@ -560,8 +567,9 @@ class SignalEngine:
             if m.iv7 is not None:
                 m.pctl = percentile([v for _, v in hist], m.iv7)
 
-        strategy, why = choose(m, sc)
-        sig = Signal(metrics=m, strategy=strategy, reasons=why)
+        cls = classify_iv(m, sc)
+        strategy, why = choose(m, sc, cls)
+        sig = Signal(metrics=m, strategy=strategy, reasons=why, regime=cls[0])
         if strategy is None:
             sig.no_signal = why[-1]
             return sig
@@ -595,6 +603,7 @@ class SignalEngine:
                 sig.rejected.append(f"{e}: {err}")
                 continue
             sig.expiry, sig.dte, sig.forward, sig.exp_iv = e, x["dte"], x["underlying"], x["atm_iv"]
+            sig.expiry_ms = exp_ms[e]
             sig.em, sig.straddle, sig.qty, sig.legs = em, x["straddle_mark"], qty, legs
             sig.profile = profile(legs)
             return sig
@@ -612,7 +621,13 @@ def fmt_signal(sig: Signal, env: str) -> str:
     t = m.trend
     lines = [env_banner(env), f"📊 {m.base} — сигнал на {utc(m.ts_ms)} UTC"]
     if sig.strategy and sig.legs:
-        lines.append(f"{STRATEGIES[sig.strategy]} · {sig.expiry} ({sig.dte:.1f} дн.)")
+        num_ = f"#{sig.id} " if sig.id else ""
+        lines.append(f"{num_}{STRATEGIES[sig.strategy]} · {sig.expiry} ({sig.dte:.1f} дн.)")
+        # повтор — запись старше этого расчёта или с другими ценами (свой же показ из кэша — не повтор)
+        if sig.id and sig.journal_first_ms and (
+                sig.journal_first_ms < m.ts_ms
+                or (sig.journal_net is not None and abs(sig.journal_net - sig.net) > 1e-9)):
+            lines.append(f"Повтор #{sig.id}: в журнале — цены первого показа {utc(sig.journal_first_ms)} UTC")
     elif sig.strategy:
         lines.append(f"Подходит: {STRATEGIES[sig.strategy]} — но не собрать: {sig.no_signal}")
     else:

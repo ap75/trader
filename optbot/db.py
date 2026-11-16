@@ -165,6 +165,68 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # 3: журнал сигналов (этап 4)
+    [
+        """
+        CREATE TABLE signals (                 -- выданные /signals рекомендации, та же сделка (ноги) — одна строка
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             INTEGER NOT NULL,   -- первая выдача (цены входа — на этот момент)
+            last_shown_ms  INTEGER NOT NULL,
+            shown          INTEGER NOT NULL DEFAULT 1,
+            base           TEXT    NOT NULL,
+            strategy       TEXT    NOT NULL,
+            regime         TEXT,               -- high | low — режим IV
+            trend          TEXT,               -- up | down | flat
+            expiry         TEXT    NOT NULL,
+            expiry_ms      INTEGER NOT NULL,
+            legs_key       TEXT    NOT NULL,   -- символы и стороны ног: признак «та же сделка»
+            legs           TEXT    NOT NULL,   -- JSON: symbol, kind, strike, side, qty, bid, ask, mark, price, mid, delta, iv
+            qty            REAL    NOT NULL,
+            net            REAL,               -- премия на позицию по исполнимым ценам: > 0 кредит, < 0 дебет
+            net_mid        REAL,
+            max_profit     REAL,               -- NULL — без ограничения
+            max_loss       REAL,
+            breakevens     TEXT,               -- JSON
+            forward        REAL,
+            em             REAL,               -- ожидаемое движение до экспирации
+            metrics        TEXT,               -- JSON: iv7, rv7, rv14, pctl, history_days, enough_history, trend
+            reasons        TEXT,
+            cfg_hash       TEXT,               -- версия порогов SIG_*
+            cfg            TEXT,               -- сами пороги (JSON)
+            source         TEXT,               -- bot | cli
+            user_id        INTEGER,
+            user_name      TEXT,
+            chat_id        INTEGER,
+            settled_ms     INTEGER,            -- когда посчитан итог (NULL — ждёт экспирации)
+            delivery_price REAL,
+            pnl            REAL,               -- итог на экспирации, USDT на позицию, без комиссий
+            pnl_mid        REAL,               -- то же при входе по mid
+            r_mult         REAL,               -- pnl / max_loss
+            max_dd         REAL,               -- худший PnL до экспирации при закрытии по исполнимой стороне (≤ 0)
+            max_dd_mark    REAL,               -- то же по mark
+            half_ms        INTEGER,            -- когда впервые достигнута половина макс. прибыли (исполнимо)
+            marks_n        INTEGER,             -- срезов котировок ног в расчёте пути
+            announced_ms   INTEGER             -- когда сводка итога ушла в группы (NULL — ещё нет)
+        )
+        """,
+        """
+        CREATE INDEX signals_ts ON signals (ts)
+        """,
+        """
+        CREATE INDEX signals_open ON signals (settled_ms, legs_key)
+        """,
+        """
+        CREATE INDEX signals_unannounced ON signals (id) WHERE settled_ms IS NOT NULL AND announced_ms IS NULL
+        """,
+        """
+        CREATE TABLE signal_views (           -- кто видел сигнал: показ тому же человеку чаще VIEW_TTL — не новый
+            signal_id INTEGER NOT NULL,
+            viewer    TEXT    NOT NULL,       -- user id или источник (cli)
+            ts        INTEGER NOT NULL,       -- последний засчитанный показ
+            PRIMARY KEY (signal_id, viewer)
+        )
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе

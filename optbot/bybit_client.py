@@ -323,16 +323,15 @@ class OptionsClient:
         bases = [base.upper()] if base else self.cfg.base_coins
         out = []
         for b in bases:
-            res = self._call(self.http.get_positions, category=CATEGORY, baseCoin=b, limit=200)
-            out += [p for p in res.get("list", []) if _d(p.get("size")) != 0]
+            rows = self._paged(self.http.get_positions, category=CATEGORY, baseCoin=b, limit=200)  # все страницы
+            out += [p for p in rows if _d(p.get("size")) != 0]
         return out
 
     def open_orders(self, base: str | None = None) -> list[dict]:
         bases = [base.upper()] if base else self.cfg.base_coins
         out = []
         for b in bases:
-            res = self._call(self.http.get_open_orders, category=CATEGORY, baseCoin=b, limit=50)
-            out += res.get("list", [])
+            out += self._paged(self.http.get_open_orders, category=CATEGORY, baseCoin=b, limit=50)  # все страницы
         return out
 
     def _active_order(self, symbol: str, order_id: str) -> dict | None:
@@ -633,7 +632,8 @@ class OptionsClient:
             if not cursor or not rows:
                 return out
             params["cursor"] = cursor
-        raise BybitError(f"Больше {self.MAX_PAGES} страниц ответа — сузьте окно времени")
+        raise BybitError(f"Больше {self.MAX_PAGES} страниц ответа"
+                         + (" — сузьте окно времени" if "startTime" in params else " — проверьте на бирже"))
 
     def executions(self, start_ms: int, end_ms: int) -> list[dict]:
         """execution/list: окно ≤ 7 дней (иначе 10001)."""

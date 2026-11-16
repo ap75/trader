@@ -809,3 +809,126 @@ def test_signals_access_and_errors(b, tg):
 def test_signals_in_menu_and_help():
     assert "signals" in [n for n, _, _ in OptionsBot.COMMANDS]
     assert "/signals" in HELP
+
+
+# ---------- длинные списки ----------
+def _ids(text):
+    import re
+    return re.findall(r"id ([0-9a-f-]{36})", text)
+
+
+def _press(b, tg, label, uid=TRADER, chat="dm"):
+    """Нажать кнопку листания по подписи (в последнем сообщении)."""
+    nav = {("◀" if b.tokens[x[3:]]["dir"] == "b" else "▶"): x for x in tg.buttons() if x.startswith("pg:")}
+    u = tg.upd(uid, chat, data=nav[label])
+    run(b.on_callback(u, tg.ctx()))
+    return u
+
+
+def test_orders_all_pages_and_paging(b, tg, fake):
+    fake.page_size = 7                       # Bybit отдаёт страницами — клиент дочитывает все
+    for i in range(45):
+        fake.add_order(BTC_PUT, price=str(20 + i))
+    assert len(b.c.open_orders("BTC")) == 45
+    run(b.cmd_orders(tg.upd(TRADER), tg.ctx("BTC")))
+    assert "Строки 1–20 из 45" in tg.last()
+    seen = _ids(tg.last())
+    btns = tg.buttons()
+    assert len(btns) == 41 and btns[-1].startswith("pg:")      # 20 × (изменить, отменить) + «Далее»
+    _press(b, tg, "▶")
+    assert tg.out[-1][0] == "edit" and "Строки 21–40 из 45" in tg.last()
+    seen += _ids(tg.last())
+    assert len([x for x in tg.buttons() if x.startswith("pg:")]) == 2   # и «Назад», и «Далее»
+    cx = [x for x in tg.buttons() if x.startswith("cx:")][0]  # кнопки строк второй страницы — рабочие
+    run(b.on_callback(tg.upd(TRADER, data=cx), tg.ctx()))
+    assert len(b.c.open_orders("BTC")) == 44
+    _press(b, tg, "▶")                                       # с той же (изменённой) страницы дальше
+    assert "Строки 40–44 из 44" in tg.last()                   # отменённый был выше — ничего не пропущено
+    seen += _ids(tg.last())
+    assert len(set(seen)) == 45                               # все строки побывали на экране, без повторов
+    _press(b, tg, "◀")
+    assert "Строки 20–39 из 44" in tg.last()                   # 20 строк перед первой показанной
+
+
+def test_paging_does_not_skip_rows_when_list_shrinks(b, tg, fake):
+    for i in range(25):
+        fake.add_order(BTC_PUT, price=str(20 + i))
+    run(b.cmd_orders(tg.upd(TRADER), tg.ctx("BTC")))
+    first = _ids(tg.last())
+    all_ids = sorted(o["orderId"] for o in fake.orders)
+    fake.orders = [o for o in fake.orders if o["orderId"] != first[0]]   # ордер со страницы 1 исполнился
+    _press(b, tg, "▶")
+    second = _ids(tg.last())
+    assert set(first) | set(second) == set(all_ids)            # ни одна строка не проскочила мимо экрана
+    assert "Строки 20–24 из 24" in tg.last()
+
+
+def test_paging_stale_and_viewer(b, tg, fake):
+    for i in range(25):
+        fake.add_order(BTC_PUT, price=str(20 + i))
+    run(b.cmd_orders(tg.upd(VIEWER), tg.ctx("BTC")))
+    assert [x for x in tg.buttons()] and all(x.startswith("pg:") for x in tg.buttons())  # зрителю — листание
+    _press(b, tg, "▶", uid=VIEWER)
+    assert "Строки 21–25 из 25" in tg.last()
+    n = len(tg.out)
+    for bad in ("pg:nope", "pg:", "pg:deadbeef"):
+        u = tg.upd(VIEWER, data=bad)
+        run(b.on_callback(u, tg.ctx()))
+        u.callback_query.answer.assert_awaited_with("Кнопка устарела — повторите команду")
+    tok = next(x for x in tg.buttons() if x.startswith("pg:"))[3:]
+    b.tokens[tok]["_t"] -= 10 ** 6                              # просрочена
+    u = tg.upd(VIEWER, data=f"pg:{tok}")
+    run(b.on_callback(u, tg.ctx()))
+    u.callback_query.answer.assert_awaited_with("Кнопка устарела — повторите команду")
+    assert len(tg.out) == n
+
+
+def test_paging_in_group_respects_dm_only(b, tg, fake):
+    for i in range(25):
+        fake.add_order(BTC_PUT, price=str(20 + i))
+    run(b.cmd_orders(tg.upd(TRADER), tg.ctx("BTC")))
+    n = len(tg.out)
+    u = _press(b, tg, "▶", chat="g")
+    u.callback_query.answer.assert_awaited_with("Только в личке с ботом")
+    assert len(tg.out) == n
+
+
+def test_positions_paging_and_short_list(b, tg, fake):
+    fake.page_size = 3
+    fake.positions = [{"symbol": f"BTC-27NOV26-{60000 + 500 * i}-P-USDT", "side": "Buy", "size": "0.01",
+                       "avgPrice": "100", "markPrice": "90", "unrealisedPnl": "-0.1", "delta": "-0.1", "gamma": "0",
+                       "vega": "0", "theta": "0"} for i in range(22)]
+    run(b.cmd_pos(tg.upd(VIEWER), tg.ctx("BTC")))
+    assert "Строки 1–20 из 22" in tg.last() and len(tg.buttons()) == 1
+    run(b.cmd_pos(tg.upd(TRADER), tg.ctx("BTC")))
+    _press(b, tg, "▶")
+    assert "Строки 21–22 из 22" in tg.last() and len(tg.buttons()) == 2 * 2 + 1
+    fake.positions = fake.positions[:2]
+    run(b.cmd_pos(tg.upd(VIEWER), tg.ctx("BTC")))
+    assert "Строки" not in tg.last()
+
+
+def test_paging_after_list_shrinks_to_one_page(b, tg, fake):
+    """Было 25, на странице 1 — 20; исполнилось 10 из них. «Далее» показывает хвост и «Назад» к остальным."""
+    for i in range(25):
+        fake.add_order(BTC_PUT, price=str(20 + i))
+    run(b.cmd_orders(tg.upd(TRADER), tg.ctx("BTC")))
+    first = _ids(tg.last())
+    fake.orders = [o for o in fake.orders if o["orderId"] not in first[:10]]
+    _press(b, tg, "▶")
+    assert "Строки 11–15 из 15" in tg.last()
+    _press(b, tg, "◀")
+    assert "Строки" not in tg.last() and len(_ids(tg.last())) == 15   # весь список на одной странице
+
+
+def test_paging_keeps_requester_view(make_bot, cfg, tg, fake):
+    """Трейдер запросил /orders в группе, зритель листает — кнопки трейдера в общем сообщении остаются."""
+    bb = make_bot(with_cfg(cfg, sensitive_commands_dm_only=False))
+    for i in range(25):
+        fake.add_order(BTC_PUT, price=str(20 + i))
+    run(bb.cmd_orders(tg.upd(TRADER, "g"), tg.ctx("BTC")))
+    _press(bb, tg, "▶", uid=VIEWER, chat="g")
+    assert "Строки 21–25 из 25" in tg.last() and any(x.startswith("cx:") for x in tg.buttons())
+    run(bb.cmd_orders(tg.upd(VIEWER, "g"), tg.ctx("BTC")))
+    _press(bb, tg, "▶", uid=TRADER, chat="g")
+    assert not any(x.startswith(("cx:", "am:")) for x in tg.buttons())

@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Iterator
 from . import db
 from .bybit_client import ACTIVE_STATUSES, parse_option_symbol, option_intrinsic
 from .config import Settings, settings
-from .fmt import DAY_MS, HOUR_MS, short_symbol, utc
+from .fmt import DAY_MS, HOUR_MS, csv_safe, short_symbol, utc
 from .linkid import new_link_id, parse_link_id, user_hash
 
 if TYPE_CHECKING:
@@ -178,6 +178,31 @@ class SyncResult:
         err = f", ошибки: {'; '.join(self.errors)}" if self.errors else ""
         return (f"новых исполнений {len(self.new_executions)}, ордеров {self.orders}, "
                 f"поставок {len(self.new_deliveries)}, цен поставки {self.prices} за {self.seconds:.1f} с{err}")
+
+
+def load_delivery_prices(conn, base: str | None = None, lo_ms: int | None = None,
+                         hi_ms: int | None = None) -> dict[str, list[tuple[int, float]]]:
+    """delivery_prices -> {base: [(delivery_time, price)]}; base и окно [lo_ms, hi_ms] — сузить выборку."""
+    q, a = "SELECT base, delivery_time, price FROM delivery_prices WHERE 1=1", []
+    if base:
+        q += " AND base = ?"
+        a.append(base.upper())
+    if lo_ms is not None:
+        q += " AND delivery_time >= ?"
+        a.append(lo_ms)
+    if hi_ms is not None:
+        q += " AND delivery_time <= ?"
+        a.append(hi_ms)
+    out: dict[str, list[tuple[int, float]]] = {}
+    for r in conn.execute(q, a):
+        out.setdefault(r["base"], []).append((r["delivery_time"], r["price"]))
+    return out
+
+
+def nearest_price(prices: list[tuple[int, float]], t: int) -> float | None:
+    """Цена поставки ближайшая к t в пределах ±1 ч (одно правило для журнала сделок и журнала сигналов)."""
+    near = [(abs(dt - t), px) for dt, px in prices if abs(dt - t) <= HOUR_MS]
+    return min(near)[1] if near else None
 
 
 class Journal:
@@ -351,6 +376,7 @@ class Journal:
         return new
 
     def record_delivery_prices(self, base: str, rows: list[dict]) -> int:
+        """Цены поставки из market/new-delivery-price в delivery_prices (журнал выключен — 0)."""
         if not self.enabled:
             return 0
         n = 0
@@ -455,9 +481,7 @@ class Journal:
                               "WHERE exec_time < ? ORDER BY exec_time, exec_id", (end_ms,)).fetchall()
             dels = c.execute("SELECT symbol, delivery_time, side, position, strike, entry_price, delivery_price, fee "
                              "FROM deliveries WHERE delivery_time < ? ORDER BY delivery_time", (end_ms,)).fetchall()
-            prices: dict[str, list[tuple[int, float]]] = {}
-            for r in c.execute("SELECT base, delivery_time, price FROM delivery_prices"):
-                prices.setdefault(r["base"], []).append((r["delivery_time"], r["price"]))
+            prices = load_delivery_prices(c)
         record_px = {r["symbol"]: r["delivery_price"] for r in dels if r["delivery_price"] is not None}
         record_entry = {r["symbol"]: r["entry_price"] for r in dels if r["entry_price"]}
 
@@ -465,8 +489,7 @@ class Journal:
             """Цена поставки: из записи о поставке, иначе из market/new-delivery-price (±1 ч)."""
             if sym in record_px:
                 return record_px[sym]
-            near = [(abs(dt - t), px) for dt, px in prices.get(sym.split("-")[0], []) if abs(dt - t) <= HOUR_MS]
-            return min(near)[1] if near else None
+            return nearest_price(prices.get(sym.split("-")[0], []), t)
 
         delivered_by_exec = {r["symbol"] for r in execs if r["exec_type"] in DELIVERY_TYPES}
         events = [(r["exec_time"], 0, "exec", r) for r in execs]
@@ -539,28 +562,23 @@ class Journal:
         rep.open_positions = {s: (q, a) for s, (q, a) in state.items() if abs(q) > EPS}
         return rep
 
-    @staticmethod
-    def _csv_safe(row: list) -> list:
-        """Защита от формул в Excel: строка, начинающаяся с = + - @ (имя в Telegram и т.п.), — с апострофом."""
-        return ["'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v for v in row]
-
     def csv_bytes(self, start_ms: int, end_ms: int) -> bytes:
         """Исполнения и поставки за период — CSV (UTF-8 с BOM, чтобы Excel открыл кириллицу)."""
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(self._csv_safe(["time_utc", "kind", "symbol", "side", "qty", "price", "value", "fee", "exec_type", "source",
+        w.writerow(csv_safe(["time_utc", "kind", "symbol", "side", "qty", "price", "value", "fee", "exec_type", "source",
                     "user", "order_id", "exec_id", "link_id"]))
         with self._db() as c:
             for r in c.execute(
                     "SELECT e.*, l.user_name, l.source AS link_source FROM executions e "
                     "LEFT JOIN order_links l ON l.link_id = e.link_id "
                     "WHERE exec_time >= ? AND exec_time < ? ORDER BY exec_time", (start_ms, end_ms)):
-                w.writerow(self._csv_safe([utc(r["exec_time"], seconds=True), "execution", r["symbol"], r["side"], r["qty"], r["price"],
+                w.writerow(csv_safe([utc(r["exec_time"], seconds=True), "execution", r["symbol"], r["side"], r["qty"], r["price"],
                             r["value"], r["fee"], r["exec_type"], r["link_source"] or parse_link_id(r["link_id"])["source"],
                             r["user_name"] or "", r["order_id"], r["exec_id"], r["link_id"] or ""]))
             for r in c.execute("SELECT * FROM deliveries WHERE delivery_time >= ? AND delivery_time < ? "
                                "ORDER BY delivery_time", (start_ms, end_ms)):
-                w.writerow(self._csv_safe([utc(r["delivery_time"], seconds=True), "delivery", r["symbol"], r["side"], r["position"],
+                w.writerow(csv_safe([utc(r["delivery_time"], seconds=True), "delivery", r["symbol"], r["side"], r["position"],
                             r["delivery_price"], "", r["fee"], "", "", "", "", "", ""]))
         return ("﻿" + buf.getvalue()).encode()
 

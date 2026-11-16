@@ -139,6 +139,16 @@ HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
 
 
+def chunks(items: list, n: int) -> list[list]:
+    """[1..n], [n+1..2n], … — части списка (сообщения, страницы)."""
+    return [items[i:i + n] for i in range(0, len(items), n)]
+
+
+def csv_safe(row: list) -> list:
+    """Защита от формул в Excel: строка, начинающаяся с = + - @ (имя в Telegram и т.п.), — с апострофом."""
+    return ["'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v for v in row]
+
+
 def utc(ms: int, seconds: bool = False) -> str:
     """Миллисекунды -> 'ГГГГ-ММ-ДД ЧЧ:ММ[:СС]' в UTC."""
     return time.strftime("%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M", time.gmtime(ms / 1000))

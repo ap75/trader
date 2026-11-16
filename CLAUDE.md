@@ -39,6 +39,7 @@
 .venv/bin/python -m optbot.collector --once|--stats      # сборщик: срез вручную | что накоплено (на сервере)
 .venv/bin/python -m optbot.journal --sync | --report 7d [--csv f]   # журнал сделок (на сервере)
 .venv/bin/python -m optbot.cli signals BTC       # сигнал этапа 3 (pctl — по истории БД: на сервере)
+.venv/bin/python -m optbot.sigjournal --evaluate | --stats 30d [--base BTC] [--csv f]   # журнал сигналов (на сервере)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
 ```
@@ -57,6 +58,7 @@ cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служ
 ## Данные
 
 SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`) и журнал сделок (`journal.py`);
-сигналы (`signals.py`) читают `snapshots` для IV percentile. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
+сигналы (`signals.py`) читают `snapshots` для IV percentile; журнал сигналов (`sigjournal.py`) — таблица `signals`,
+путь сделки — по `leg_marks`, итог — по `delivery_prices`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

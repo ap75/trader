@@ -27,7 +27,9 @@
 (включая сделанные вне бота) во все разрешённые группы и трейдерам в личку.
 
 Сигналы: /signals [BASE] — рекомендация стратегии с ограниченным риском (optbot.signals), без кнопки
-«Выставить»; кнопка «Обновить» пересчитывает в том же сообщении (не чаще SIGNAL_CACHE_TTL сек на актив).
+«Выставить»; каждая выдача пишется в журнал сигналов (optbot.sigjournal), итоги после экспирации — задачей
+с периодом JOURNAL_SYNC_MIN со сводкой в группы, статистика — /signals_stats; кнопка «Обновить» пересчитывает
+в том же сообщении (не чаще SIGNAL_CACHE_TTL сек на актив).
 
 Инструкции: /guide [ru|uk] — PDF из docs/ под права спросившего (трейдера или зрителя; администратора —
 никогда), язык по Telegram или аргументу. Одну и ту же — в чат не чаще GUIDE_COOLDOWN сек (в группе повтор
@@ -41,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import functools
 import html
 import logging
@@ -63,11 +66,12 @@ from telegram.ext import (
 from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
 from .collector import Collector, seconds_to_next_slot
 from .journal import Journal, fmt_report, parse_period
-from .signals import SignalEngine, fmt_signal
+from .signals import Signal, SignalEngine, fmt_signal
+from .sigjournal import SETTLED_PER_MESSAGE, SignalJournal, compute_stats, fmt_settled, fmt_stats
 from .config import ROOT, Settings, settings
 from .ws import ExecutionWatcher
 from .fmt import (
-    env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_order_preview, fmt_orders,
+    chunks, env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_order_preview, fmt_orders,
     fmt_positions, fmt_ticker, parse_iv, px, short_symbol, to_dec,
 )
 
@@ -77,6 +81,8 @@ audit_log = logging.getLogger("optbot.trade")
 PENDING_TTL = 60  # сек на подтверждение
 CHAIN_N = 6       # страйков от ATM по умолчанию
 TOKEN_TTL = 1800  # сек жизни кнопок в /orders и /pos
+LIST_MAX = 20     # /orders и /pos: строк (и кнопок) на странице — длина сообщения Telegram ≤ 4096; дальше ◀ ▶
+ANNOUNCE_GIVEUP_MS = 86_400_000  # итог не доставлен никому столько после расчёта — больше не отправлять
 SIGNAL_CACHE_TTL = 30  # сек: /signals и «Обновить» по тому же активу чаще — без нового расчёта
 
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
@@ -108,6 +114,7 @@ HELP = """Просмотр:
 /chain BASE [EXP] [N] — цепочка
 /t SYMBOL — котировка и греки
 /signals [BASE] — сигнал: стратегия, ноги, риск
+/signals_stats [BASE] [ПЕРИОД] [csv] — как сработали сигналы (по умолчанию 30d)
 /bal /greeks [BASE] — счёт*
 /pos [BASE] — позиции (кнопки «Закрыть»)*
 /orders [BASE] — ордера (кнопки «Изменить», «Отменить»)*
@@ -136,10 +143,6 @@ def pre(text: str) -> str:
 
 def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in r] for r in rows])
-
-
-def chunks(items: list, n: int) -> list[list]:
-    return [items[i:i + n] for i in range(0, len(items), n)]
 
 
 @dataclass
@@ -213,10 +216,12 @@ class OptionsBot:
         self.collector = Collector(client, cfg)
         self.journal = Journal(cfg)
         self.signals = SignalEngine(client, cfg)
-        self._sig_cache: dict[str, tuple[float, object]] = {}  # актив -> (когда, Signal)
+        self.sigjournal = SignalJournal(cfg)
+        self._sig_cache: dict[str, tuple[float, Signal]] = {}  # актив -> (когда, Signal)
         self._sig_locks = {b: asyncio.Lock() for b in cfg.base_coins}  # актив -> блокировка расчёта
         self.pending: dict[str, Pending] = {}
         self.tokens: dict[str, dict] = {}            # короткие ключи для данных кнопок (лимит 64 байта)
+        self._last_sweep = 0.0                      # когда чистились устаревшие токены (не чаще раза в минуту)
         # (chat_id, id сообщения-вопроса) -> (токен меню amend, время); живут сутки, чтобы на поздний ответ
         # сказать «меню устарело», а не молчать
         self.awaiting: dict[tuple[int, int], tuple[str, float]] = {}
@@ -308,14 +313,21 @@ class OptionsBot:
             if not entry[1]:
                 self._order_locks.pop(order_id, None)
 
-    def _tok(self, **data) -> str:
+    def _tok_sweep(self) -> None:
         now = time.monotonic()
+        if now - self._last_sweep < 60:  # не на каждую кнопку: в /orders их до 42 на сообщение
+            return
+        self._last_sweep = now
         for k in [k for k, v in self.tokens.items() if now - v["_t"] > TOKEN_TTL]:
             del self.tokens[k]
         for k in [k for k, (_, ts) in self.awaiting.items() if now - ts > 86400]:
             del self.awaiting[k]
+
+    def _tok(self, **data) -> str:
+        """Короткий токен кнопки (устаревшие чистятся не чаще раза в минуту)."""
+        self._tok_sweep()
         t = secrets.token_hex(4)
-        self.tokens[t] = {**data, "_t": now}
+        self.tokens[t] = {**data, "_t": time.monotonic()}
         return t
 
     def _tok_get(self, t: str) -> dict:
@@ -476,7 +488,7 @@ class OptionsBot:
         await self.reply(update, fmt_ticker(await self.call(self.c.ticker, inst.symbol)))
 
     # ---------- сигналы ----------
-    async def _signal_view(self, base: str) -> tuple[str, InlineKeyboardMarkup, bool]:
+    async def _signal_view(self, base: str, w: Who) -> tuple[str, InlineKeyboardMarkup, bool]:
         """-> (карточка, кнопки, из кэша ли). Расчёт — запросы к Bybit (тикеры, свечи, справочник) и чтение
         истории. Повторы чаще SIGNAL_CACHE_TTL — из кэша; одновременные нажатия по одному активу ждут один расчёт,
         а не запускают свои (каждый пошёл бы в ту же медленную биржу)."""
@@ -489,6 +501,14 @@ class OptionsBot:
             else:
                 sig = await self.call(self.signals.compute, base)
                 self._sig_cache[base] = (time.monotonic(), sig)
+        # журнал сигналов (этап 4). Своя копия — номер записи не попадёт в чужую карточку через общий кэш.
+        # Вне блокировки актива: занятая БД не держит чужие нажатия; сбой записи не мешает показать карточку.
+        sig = dataclasses.replace(sig)
+        # Повтор тому же человеку shown не накручивает — журнал помнит, кто видел (signal_views)
+        try:
+            await self.call(self.sigjournal.record, sig, "bot", w.user_id, w.name, w.chat_id)
+        except Exception:
+            log.exception("Журнал сигналов: %s не записан", base)
         return pre(fmt_signal(sig, self.cfg.env)), kb([[("🔄 Обновить", f"sig:{base}")]]), cached
 
     @guarded("view")
@@ -497,8 +517,79 @@ class OptionsBot:
             await update.effective_message.reply_text(
                 "Сигнал по активу:", reply_markup=kb([[(b, f"sig:{b}") for b in self.cfg.base_coins]]))
             return
-        text, markup, _ = await self._signal_view(context.args[0])
+        text, markup, _ = await self._signal_view(context.args[0], w)
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    @guarded("view")
+    async def cmd_signals_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
+        if not self.cfg.journal_enabled:
+            raise ValueError("Журнал выключен (JOURNAL_ENABLED=false) — сигналы не записываются")
+        base, period, want_csv = None, [], False
+        for a in context.args:
+            if a.lower() == "csv":
+                want_csv = True
+            elif a.upper() in self.cfg.base_coins and base is None:
+                base = a.upper()
+            elif a.upper() in self.cfg.base_coins:
+                raise ValueError("Один актив: /signals_stats [BASE] [ПЕРИОД] [csv]")
+            elif not period and self._is_period(a):  # слова периода — у parse_period, не свой список
+                period = [a]
+            elif a.isalpha():
+                raise ValueError(f"Актив {a!r}: один из {', '.join(self.cfg.base_coins)}")
+            elif not period:
+                period = [a]
+            else:
+                raise ValueError("Формат: /signals_stats [BASE] [ПЕРИОД] [csv], например /signals_stats BTC 30d")
+        start, end, label = parse_period(period or ["30d"])
+        rows = await asyncio.to_thread(self.sigjournal.rows, start, end, base)
+        await self.reply(update, f"{env_banner(self.cfg.env)}\n\n{fmt_stats(compute_stats(rows, label, base))}")
+        if want_csv:
+            # имена запросивших — только трейдеру в личке: в группе файл увидят и зрители
+            data = await asyncio.to_thread(self.sigjournal.csv_bytes, start, end, base,
+                                           w.can_trade and not w.is_group, rows)
+            name = self._csv_name(f"signals-{self.cfg.env}-{(base or 'all').lower()}", label)
+            await update.effective_chat.send_document(document=data, filename=name)
+
+    async def _sigeval_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Итоги сигналов после экспирации; о посчитанных — сводка в группы (и трейдерам в личку)."""
+        try:
+            res = await asyncio.to_thread(self.sigjournal.evaluate, self.c)
+        except Exception:
+            log.exception("Журнал сигналов: итоги не посчитаны")
+            return
+        if res.settled or res.errors:
+            (log.warning if res.errors else log.info)("Журнал сигналов: %s", res)
+        try:  # и посчитанные вручную (`--evaluate`): сводку шлёт только бот
+            rows = await asyncio.to_thread(self.sigjournal.unannounced)
+            for chunk in chunks(rows, SETTLED_PER_MESSAGE):
+                text = fmt_settled(chunk)
+                # не доставлено никуда (Telegram недоступен) — не отмечаем: попробуем в следующий раз;
+                # отмечаем по сообщению — доставленные части не повторятся
+                if not self._targets():  # слать некуда (нет групп и личек) — не копить: отметить и не повторять
+                    log.info("Журнал сигналов: итогов %d — получателей нет", len(chunk))
+                elif not await self._broadcast(pre(f"{env_banner(self.cfg.env)}\n{text}"), "итогов сигналов"):
+                    # все получатели отказывают (бота убрали из группы) — не повторять вечно: через сутки бросить
+                    # бросаем только просроченные строки; свежие — повтор при следующем проходе
+                    stale = [r["id"] for r in chunk if time.time() * 1000 - r["settled_ms"] > ANNOUNCE_GIVEUP_MS]
+                    if stale:
+                        log.error("Журнал сигналов: итоги %s не доставлены за сутки — больше не отправляются", stale)
+                        await self._mark_announced(stale)
+                    log.warning("Журнал сигналов: сводка итогов никуда не доставлена — повтор при следующем проходе")
+                    return
+                await self._mark_announced([r["id"] for r in chunk])
+        except Exception:
+            log.exception("Журнал сигналов: сводка итогов не отправлена")
+
+    async def _mark_announced(self, ids: list[int]) -> None:
+        """Отметить отправленное; БД занята — ещё две попытки (иначе та же сводка уйдёт в группы снова)."""
+        for attempt in range(3):
+            try:
+                await asyncio.to_thread(self.sigjournal.mark_announced, ids)
+                return
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2)
 
     # ---------- счёт (чувствительное) ----------
     @staticmethod
@@ -511,13 +602,68 @@ class OptionsBot:
 
     @guarded("view", sensitive=True)
     async def cmd_pos(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
-        positions = await self.call(self.c.positions, self._base_arg(context))
+        await self.reply(update, *await self._list_view("pos", self._base_arg(context), w.can_trade))
+
+    @staticmethod
+    def _is_period(a: str) -> bool:
+        try:
+            parse_period([a])
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _csv_name(prefix: str, label: str) -> str:
+        return f"{prefix}-{label.replace('..', '_').replace(' ', '').replace('.', '')}.csv"
+
+    @staticmethod
+    def _list_key(what: str, it: dict) -> tuple:
+        """Устойчивый порядок строк /pos, /orders: листание — от последней показанной строки, а не по номеру
+        страницы, чтобы исполненный или новый ордер не сдвигал строки мимо экрана."""
+        if what == "pos":
+            return it["symbol"], it.get("side", "")
+        return it["symbol"], int(it.get("createdTime") or 0), it["orderId"]
+
+    async def _list_view(self, what: str, base: str | None, trade: bool,
+                         anchor: tuple[str, tuple] | None = None) -> tuple[str, InlineKeyboardMarkup | None]:
+        """/pos или /orders: LIST_MAX строк (с кнопками строк для трейдера) и ◀ ▶. anchor — ("a", ключ) —
+        строки после ключа, ("b", ключ) — перед ним. Каждый раз заново с биржи — текущее состояние."""
+        items = await self.call(self.c.positions if what == "pos" else self.c.open_orders, base)
+        keyed = sorted(((self._list_key(what, it), it) for it in items), key=lambda kv: kv[0])
+        keys, items = [k for k, _ in keyed], [it for _, it in keyed]
+        start = 0
+        if anchor and anchor[0] == "a":
+            start = sum(k <= anchor[1] for k in keys)
+        elif anchor and anchor[0] == "b":
+            start = max(0, sum(k < anchor[1] for k in keys) - LIST_MAX)
+        if start >= len(items):  # дальше ничего не осталось — последняя страница
+            start = max(0, len(items) - LIST_MAX)
+        chunk = items[start:start + LIST_MAX]
         rows = []
-        if w.can_trade:  # кнопки — только трейдерам
-            for p in positions:
-                t = self._tok(symbol=p["symbol"])
-                rows.append([(f"Закрыть {short_symbol(p['symbol'])} · рынок", f"cp:{t}:mkt"), ("· mid", f"cp:{t}:mid")])
-        await self.reply(update, fmt_positions(positions), kb(rows) if rows else None)
+        if trade:  # кнопки строк — только трейдерам
+            for it in chunk:
+                label = short_symbol(it["symbol"])
+                if what == "pos":
+                    t = self._tok(symbol=it["symbol"])
+                    rows.append([(f"Закрыть {label} · рынок", f"cp:{t}:mkt"), ("· mid", f"cp:{t}:mid")])
+                else:
+                    t = self._tok(symbol=it["symbol"], oid=it["orderId"])
+                    label = f"{label} {it['side']} {it['qty']}"
+                    if it.get("orderType") == "Limit":
+                        rows.append([(f"✏ {label}", f"am:{t}"), ("✖ Отменить", f"cx:{t}")])
+                    else:
+                        rows.append([(f"✖ Отменить {label}", f"cx:{t}")])
+        text = fmt_positions(chunk) if what == "pos" else fmt_orders(chunk)
+        # и когда список сократился до одной страницы, но показан хвост: выше есть строки — нужен «Назад»
+        if start > 0 or start + len(chunk) < len(items):
+            text += f"\n\nСтроки {start + 1}–{start + len(chunk)} из {len(items)}"
+            nav = []
+            if start > 0:
+                nav.append(("◀ Назад", f"pg:{self._tok(what=what, base=base, trade=trade, dir='b', key=keys[start])}"))
+            if start + len(chunk) < len(items):
+                nav.append(("Далее ▶", f"pg:{self._tok(what=what, base=base, trade=trade, dir='a', key=keys[start + len(chunk) - 1])}"))
+            rows.append(nav)
+        return text, kb(rows) if rows else None
 
     @guarded("view", sensitive=True)
     async def cmd_greeks(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
@@ -525,17 +671,7 @@ class OptionsBot:
 
     @guarded("view", sensitive=True)
     async def cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
-        orders = await self.call(self.c.open_orders, self._base_arg(context))
-        rows = []
-        if w.can_trade:  # кнопки — только трейдерам
-            for o in orders:
-                t = self._tok(symbol=o["symbol"], oid=o["orderId"])
-                label = f"{short_symbol(o['symbol'])} {o['side']} {o['qty']}"
-                if o.get("orderType") == "Limit":
-                    rows.append([(f"✏ {label}", f"am:{t}"), ("✖ Отменить", f"cx:{t}")])
-                else:
-                    rows.append([(f"✖ Отменить {label}", f"cx:{t}")])
-        await self.reply(update, fmt_orders(orders), kb(rows) if rows else None)
+        await self.reply(update, *await self._list_view("orders", self._base_arg(context), w.can_trade))
 
     # ---------- торговля ----------
     async def _ask_confirm(self, update: Update, context, w: Who, text: str, event: str,
@@ -857,11 +993,28 @@ class OptionsBot:
             await self._amend_pick(update, context, w, tok, choice)
             return
 
+        if kind == "pg":  # pg:TOKEN — соседняя страница /pos, /orders в том же сообщении
+            try:
+                pg = self._tok_get(rest)
+            except ValueError:
+                pg = None
+            if not pg or "what" not in pg:
+                await q.answer("Кнопка устарела — повторите команду")
+                return
+            if w.is_group and self.cfg.sensitive_commands_dm_only:  # как у самих команд: счёт — только в личке
+                await q.answer("Только в личке с ботом")
+                return
+            await q.answer()
+            # вид — как у того, кто запросил список (сообщение общее): кнопки трейдера не пропадут от листания
+            # зрителем, а зритель не добавит их в чужой список (нажать их он всё равно не сможет — нет прав)
+            text, markup = await self._list_view(pg["what"], pg["base"], pg["trade"], (pg["dir"], pg["key"]))
+            await self.edit(q, pre(text), markup)
+            return
         if kind == "sig":  # sig:BASE — сигнал (выбор актива или «Обновить») в том же сообщении
             # ответ на кнопку — после расчёта (подсказка зависит от результата), но обязательно, и при ошибке тоже
             toast = None
             try:
-                text, markup, cached = await self._signal_view(rest)
+                text, markup, cached = await self._signal_view(rest, w)
                 # тот же текст — Telegram не меняет сообщение; без подсказки «Обновить» выглядит сломанной
                 if not await self.edit(q, text, markup):
                     toast = (f"Без изменений: расчёт моложе {SIGNAL_CACHE_TTL} с" if cached
@@ -948,7 +1101,7 @@ class OptionsBot:
         await self.reply(update, f"{env_banner(self.cfg.env)}\n\n{fmt_report(rep)}")
         if want_csv:
             data = await asyncio.to_thread(self.journal.csv_bytes, start, end)
-            name = f"journal-{self.cfg.env}-{label.replace('..', '_').replace(' ', '').replace('.', '')}.csv"
+            name = self._csv_name(f"journal-{self.cfg.env}", label)
             await update.effective_chat.send_document(document=data, filename=name)
 
     # ---------- исполнения (WebSocket) ----------
@@ -1005,13 +1158,16 @@ class OptionsBot:
         if texts:
             await self._broadcast(pre(f"{env_banner(self.cfg.env)}\n" + "\n\n".join(texts)), "об исполнении")
 
+    def _targets(self) -> list[int]:
+        """Получатели уведомлений: разрешённые группы и лички трейдеров (кроме недоступных)."""
+        return sorted(self.cfg.tg_allowed_chat_ids) + sorted(self.cfg.tg_trader_ids - self._dm_failed)
+
     async def _broadcast(self, msg: str, what: str) -> int:
         """В разрешённые группы и в личку трейдерам (кроме тех, кому личка недоступна). -> сколько доставлено."""
         if not self._app:
             return 0
         sent = 0
-        targets = sorted(self.cfg.tg_allowed_chat_ids) + sorted(self.cfg.tg_trader_ids - self._dm_failed)
-        for chat_id in targets:
+        for chat_id in self._targets():
             try:
                 await self._app.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
                 sent += 1
@@ -1036,6 +1192,7 @@ class OptionsBot:
         ("chain", "cmd_chain", "цепочка опционов"),
         ("t", "cmd_ticker", "котировка инструмента"),
         ("signals", "cmd_signals", "сигнал: стратегия и риск"),
+        ("signals_stats", "cmd_signals_stats", "статистика сигналов"),
         ("bal", "cmd_bal", "баланс"),
         ("pos", "cmd_pos", "позиции"),
         ("orders", "cmd_orders", "открытые ордера"),
@@ -1060,7 +1217,7 @@ class OptionsBot:
                 log.exception("WebSocket исполнений не подключён — уведомлений об исполнениях не будет")
 
             if app.job_queue is None and (self.cfg.collector_enabled or self.cfg.journal_enabled):
-                log.warning("Сборщик и сверка журнала выключены: нет JobQueue — установите "
+                log.warning("Сборщик, сверка журнала и итоги сигналов выключены: нет JobQueue — установите "
                             "python-telegram-bot[job-queue] (pip install -r requirements.txt)")
                 return
             if self.cfg.journal_enabled:
@@ -1068,6 +1225,12 @@ class OptionsBot:
                 app.job_queue.run_repeating(self._sync_job, interval=self.cfg.journal_sync_min * 60, first=10,
                                             name="journal_sync")
                 log.info("Журнал: сверка через 10 с и далее каждые %d мин", self.cfg.journal_sync_min)
+                # итоги сигналов — с периодом сверки журнала (цена поставки — после 08:00 UTC)
+                app.job_queue.run_repeating(self._sigeval_job, interval=self.cfg.journal_sync_min * 60, first=120,
+                                            name="signals_eval")
+                if not self.cfg.collector_enabled:
+                    log.warning("Сборщик выключен: у сигналов будет только итог на экспирации — без просадки "
+                                "и «50% прибыли» (нет котировок ног)")
             if self.cfg.collector_enabled:
                 first = seconds_to_next_slot(time.time(), self.cfg.collector_interval_min)
                 app.job_queue.run_repeating(self._collect_job, interval=self.cfg.collector_interval_min * 60,

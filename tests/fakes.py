@@ -170,15 +170,16 @@ class FakeHTTP:
         self._rec("get_wallet_balance", locals())
         return ok({"list": [{"totalEquity": "1000", "totalAvailableBalance": "900", "coin": []}]})
 
-    def get_positions(self, category, baseCoin, limit=200):
+    def get_positions(self, category, baseCoin, limit=200, cursor=None):
         self._rec("get_positions", locals())
-        return ok({"list": [p for p in self.positions if p["symbol"].startswith(baseCoin + "-")]})
+        return self._page([p for p in self.positions if p["symbol"].startswith(baseCoin + "-")], limit, cursor)
 
     def get_coin_greeks(self, baseCoin=None):
         self._rec("get_coin_greeks", locals())
         return ok({"list": [g for g in self.greeks if baseCoin in (None, g["baseCoin"])]})
 
-    def get_open_orders(self, category, baseCoin=None, symbol=None, orderId=None, orderLinkId=None, limit=50):
+    def get_open_orders(self, category, baseCoin=None, symbol=None, orderId=None, orderLinkId=None, limit=50,
+                        cursor=None):
         self._rec("get_open_orders", locals())
         rows = self.orders
         if orderId:  # как на demo: при orderId символ игнорируется
@@ -190,7 +191,7 @@ class FakeHTTP:
                 rows = [o for o in rows if o["symbol"] == symbol]
             if orderLinkId:
                 rows = [o for o in rows if o["orderLinkId"] == orderLinkId]
-        return ok({"list": rows[:limit]})
+        return self._page(rows, limit, cursor)
 
     def get_order_history(self, category, symbol=None, orderLinkId=None, startTime=None, endTime=None, limit=50,
                           cursor=None, orderId=None):

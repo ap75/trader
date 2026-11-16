@@ -14,10 +14,9 @@ from optbot.bot import OptionsBot
 from optbot.bybit_client import spread_pct
 from optbot.collector import (
     Collector, expiry_metrics, iv_at_delta, main, seconds_to_next_slot, slot_start, stats,
-    track_symbols,
 )
 from tests.fakes import BTC_PUT, EXP, EXP_MS
-from tests.helpers import with_cfg
+from tests.helpers import track_symbols, with_cfg
 
 NOW = EXP_MS - 10 * 86_400_000 + 7 * 60_000  # за 10 дней до экспирации, 7 минут в слоте
 
@@ -406,9 +405,10 @@ def test_bot_schedules_collector(make_client, cfg_db, monkeypatch):
     asyncio.run(app.post_init(app))
     assert (b._collect_job, 900, pytest.approx(5.5), "collector") in jobs
     assert (b._sync_job, 3600, 10, "journal_sync") in jobs   # сверка журнала: при старте и каждый час
+    assert (b._sigeval_job, 3600, 120, "signals_eval") in jobs  # итоги сигналов — с тем же периодом
 
 
-def test_bot_collector_disabled(make_client, cfg_db, monkeypatch):
+def test_bot_collector_disabled(make_client, cfg_db, monkeypatch, caplog):
     cfg_off = with_cfg(cfg_db, collector_enabled=False)
     b = OptionsBot(make_client(cfg_off), cfg_off)
     app = b.build_app()
@@ -418,6 +418,19 @@ def test_bot_collector_disabled(make_client, cfg_db, monkeypatch):
     monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda *a: NS(start=lambda: None, stop=lambda: None))
     asyncio.run(app.post_init(app))
     assert [j for j in jobs if j and j[0] == b._collect_job] == []
+    assert "без просадки" in caplog.text           # итоги сигналов будут, путь — нет: предупредить
+
+
+def test_bot_journal_disabled_no_signal_eval(make_client, cfg_db, monkeypatch):
+    cfg_off = with_cfg(cfg_db, journal_enabled=False)
+    b = OptionsBot(make_client(cfg_off), cfg_off)
+    app = b.build_app()
+    jobs = []
+    monkeypatch.setattr(type(app.job_queue), "run_repeating", lambda self, *a, **k: jobs.append(a))
+    monkeypatch.setattr(type(app.bot), "set_my_commands", lambda self, *a, **k: asyncio.sleep(0))
+    monkeypatch.setattr("optbot.bot.ExecutionWatcher", lambda *a: NS(start=lambda: None, stop=lambda: None))
+    asyncio.run(app.post_init(app))
+    assert [j for j in jobs if j and j[0] == b._sigeval_job] == []
 
 
 def test_store_failure_reports_legs_missing(make_client, cfg_db, monkeypatch):

@@ -12,7 +12,8 @@
     python -m optbot.cli cancel BTC-27MAR26-70000-P <orderId>
     python -m optbot.cli cancel-all [BASE]
     python -m optbot.cli close BTC-27MAR26-70000-P [--price 120]
-    python -m optbot.cli signals BTC        сигнал (этап 3): стратегия, ноги, риск — без ордеров
+    python -m optbot.cli signals BTC        сигнал (этап 3): стратегия, ноги, риск — без ордеров; пишется в журнал
+                                            сигналов (статистика: python -m optbot.sigjournal --stats 30d)
 
 Любое действие с ордерами требует подтверждения y/N.
 """
@@ -26,6 +27,7 @@ from .bybit_client import BybitError, BybitNetworkError, OptionsClient, OrderReq
 from .config import settings
 from .journal import Journal
 from .signals import SignalEngine, fmt_signal
+from .sigjournal import SignalJournal
 from .fmt import (
     env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_orders,
     fmt_order_preview, fmt_positions, fmt_ticker, parse_iv, to_dec,
@@ -144,7 +146,12 @@ def run(args: argparse.Namespace, c: OptionsClient) -> None:
     elif cmd == "ticker":
         print(fmt_ticker(c.ticker(c.resolve_symbol(args.symbol).symbol)))
     elif cmd == "signals":
-        print(fmt_signal(SignalEngine(c, c.cfg).compute(args.base), c.cfg.env))
+        sig = SignalEngine(c, c.cfg).compute(args.base)
+        try:  # тоже выдача — в журнал сигналов; сбой записи не мешает показать сигнал
+            SignalJournal(c.cfg).record(sig, "cli", user_name="CLI")  # номер — в sig.id
+        except Exception as e:
+            print(f"Журнал сигналов: не записан ({e})", file=sys.stderr)
+        print(fmt_signal(sig, c.cfg.env))
     elif cmd == "balance":
         print(fmt_balance(c.balance()))
     elif cmd == "positions":
