@@ -38,6 +38,7 @@
 .venv/bin/python smoke_order.py                 # ордер далеко от рынка -> отмена (только demo/testnet)
 .venv/bin/python -m optbot.collector --once|--stats      # сборщик: срез вручную | что накоплено (на сервере)
 .venv/bin/python -m optbot.journal --sync | --report 7d [--csv f]   # журнал сделок (на сервере)
+.venv/bin/python -m optbot.cli signals BTC       # сигнал этапа 3 (pctl — по истории БД: на сервере)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
 ```
@@ -51,9 +52,11 @@ cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служ
 - `asset/delivery-record`: окно ≤ 30 дней.
 - `execution/list`, `order/history` для option без `baseCoin` отдают все базовые активы (не только BTC).
 - `order/history` фильтрует окно startTime/endTime по **времени создания** ордера; по `orderId` — без окна.
+- `market/kline` (linear): от новых к старым, первая свеча — текущая незакрытая (`perp_closes` её отбрасывает).
 
 ## Данные
 
-SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`) и журнал сделок (`journal.py`).
+SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`) и журнал сделок (`journal.py`);
+сигналы (`signals.py`) читают `snapshots` для IV percentile. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

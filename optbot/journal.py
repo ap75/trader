@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterator
 
 from . import db
-from .bybit_client import ACTIVE_STATUSES, parse_option_symbol
+from .bybit_client import ACTIVE_STATUSES, parse_option_symbol, option_intrinsic
 from .config import Settings, settings
 from .fmt import DAY_MS, HOUR_MS, short_symbol, utc
 from .linkid import new_link_id, parse_link_id, user_hash
@@ -76,8 +76,7 @@ def intrinsic(symbol: str, delivery_price: float, strike: float | None = None) -
     parsed = parse_option_symbol(symbol)
     if parsed is None:
         return None
-    k = strike if strike is not None else float(parsed[2])
-    return max(delivery_price - k, 0.0) if parsed[3] == "C" else max(k - delivery_price, 0.0)
+    return option_intrinsic(parsed[3], strike if strike is not None else float(parsed[2]), delivery_price)
 
 
 # ---------- период ----------

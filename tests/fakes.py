@@ -1,6 +1,7 @@
 """Подставной pybit HTTP: те же имена методов и формат ответов, что у Bybit V5 (сверено на demo)."""
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from decimal import Decimal
@@ -12,6 +13,7 @@ from optbot.fmt import DAY_MS  # noqa: E402
 
 EXP = "27NOV26"
 EXP_MS = int(datetime(2026, 11, 27, 8, tzinfo=timezone.utc).timestamp() * 1000)
+NOW = EXP_MS - 4 * DAY_MS  # для сигналов: до 27NOV26 — 4 дня (в окне 2–7)
 BTC_PUT = f"BTC-{EXP}-60000-P-USDT"
 BTC_CALL = f"BTC-{EXP}-70000-C-USDT"
 ETH_CALL = f"ETH-{EXP}-2000-C-USDT"
@@ -21,6 +23,15 @@ SPECS = {  # base: (страйки, tickSize, qtyStep, minQty, maxQty)
     "ETH": ([1800, 2000, 2200], "0.1", "0.1", "0.1", "1000"),
     "SOL": ([60, 70, 80], "0.01", "1", "1", "10000"),
 }
+
+
+def kline_rows(closes: list[float], interval_min: int, now_ms: int) -> list[list[str]]:
+    """Свечи как у Bybit: от новых к старым, первая — текущая незакрытая (её close — последний в closes)."""
+    step = interval_min * 60_000
+    cur = now_ms // step * step
+    n = len(closes)
+    return [[str(cur - (n - 1 - i) * step), str(c), str(c), str(c), str(c), "1", "1"]
+            for i, c in reversed(list(enumerate(closes)))]
 
 
 def ok(result: dict) -> dict:
@@ -49,6 +60,7 @@ class FakeHTTP:
                         "openInterest": "5",
                     }
         self.perp: dict[str, str] = {}         # symbol перпетуала -> markPrice
+        self.klines: dict[tuple[str, str], list] = {}  # (symbol, interval) -> строки kline, от новых к старым
         self.books: dict[str, dict] = {}       # symbol -> {"a": [[px, sz]], "b": [...]}; иначе из тикера
         self.positions: list[dict] = []
         self.orders: list[dict] = []           # активные
@@ -135,6 +147,15 @@ class FakeHTTP:
             return ok({"list": [self.tickers[symbol]] if symbol in self.tickers else []})
         return ok({"list": [t for s, t in self.tickers.items() if s.startswith(baseCoin + "-")]})
 
+    def get_kline(self, category, symbol, interval, limit=200, **kw):
+        self._rec("get_kline", locals())
+        rows = self.klines.get((symbol, str(interval)))
+        if rows is None:  # по умолчанию — без тренда: колебания ±0.5% вокруг 65000
+            step = int(interval) * 60_000
+            cur = int(time.time() * 1000) // step * step
+            rows = kline_rows([65000 * (1.005 if i % 2 else 1) for i in range(1000)], int(interval), cur + 1)
+        return ok({"symbol": symbol, "category": category, "list": rows[:limit]})
+
     def get_orderbook(self, category, symbol, limit=25):
         self._rec("get_orderbook", locals())
         if symbol in self.books:
@@ -220,3 +241,52 @@ class FakeHTTP:
         gone = [o for o in self.orders if not baseCoin or o["symbol"].startswith(baseCoin + "-")]
         self.orders = [o for o in self.orders if o not in gone]
         return ok({"list": [{"orderId": o["orderId"]} for o in gone]})
+
+
+# ---------- подставная цепочка по Блэку–Шоулзу ----------
+def _n(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def bs(F, K, t, iv, kind):
+    d1 = (math.log(F / K) + iv * iv * t / 2) / (iv * math.sqrt(t))
+    d2 = d1 - iv * math.sqrt(t)
+    if kind == "C":
+        return F * _n(d1) - K * _n(d2), _n(d1)
+    return K * _n(-d2) - F * _n(-d1), _n(d1) - 1
+
+
+def set_chain(fake, base="BTC", F=65000.0, iv=0.5, step=500, n=20, spread=0.04, oi="50", exp=EXP,
+              exp_ms=EXP_MS, now=NOW, min_qty="0.01"):
+    """Заменяет опционы актива цепочкой с ценами и дельтами по Блэку–Шоулзу."""
+    fake.instruments = [i for i in fake.instruments if i["baseCoin"] != base]
+    fake.tickers = {s: t for s, t in fake.tickers.items() if not s.startswith(base + "-")}
+    t = (exp_ms - now) / DAY_MS / 365
+    atm = round(F / step) * step
+    for k in range(atm - n * step, atm + n * step + 1, step):
+        for cp in ("C", "P"):
+            sym = f"{base}-{exp}-{k}-{cp}-USDT"
+            price, delta = bs(F, k, t, iv, cp)
+            price = max(price, step * 0.002)
+            fake.instruments.append({
+                "symbol": sym, "status": "Trading", "settleCoin": "USDT", "baseCoin": base,
+                "optionsType": "Call" if cp == "C" else "Put", "deliveryTime": str(exp_ms),
+                "priceFilter": {"tickSize": "5"},
+                "lotSizeFilter": {"qtyStep": min_qty, "minOrderQty": min_qty, "maxOrderQty": "100"}})
+            fake.tickers[sym] = {
+                "symbol": sym, "markPrice": f"{price:.2f}", "bid1Price": f"{price * (1 - spread / 2):.2f}",
+                "ask1Price": f"{price * (1 + spread / 2):.2f}", "markIv": str(iv), "delta": f"{delta:.4f}",
+                "gamma": "0.00001", "vega": "10", "theta": "-20", "underlyingPrice": str(F),
+                "indexPrice": str(F - 10), "openInterest": oi}
+
+
+def set_klines(fake, base="BTC", rv=0.4, trend_per_bar=0.0, now=NOW):
+    """1h: колебания с годовой RV ≈ rv; 4h: рост/падение trend_per_bar за свечу (0 — колебания без тренда)."""
+    a = rv / math.sqrt(365 * 24)
+    h1 = [65000 * (1 + a if i % 2 else 1) for i in range(400)]
+    if trend_per_bar:
+        h4 = [65000 * (1 + trend_per_bar) ** i for i in range(200)]
+    else:
+        h4 = [65000 * (1.002 if i % 2 else 1) for i in range(200)]
+    fake.klines[(f"{base}USDT", "60")] = kline_rows(h1, 60, now)
+    fake.klines[(f"{base}USDT", "240")] = kline_rows(h4, 240, now)

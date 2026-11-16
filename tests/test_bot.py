@@ -711,3 +711,101 @@ def test_guide_missing_file(b, tg, monkeypatch, tmp_path, caplog):
 
 def test_guide_in_command_menu_and_help(b):
     assert any(n == "guide" for n, _, _ in b.COMMANDS) and "/guide" in HELP
+
+
+# ---------- сигналы ----------
+def _sig_market(fake):
+    from tests.fakes import NOW, set_chain, set_klines
+    set_chain(fake, iv=0.6)
+    set_klines(fake, rv=0.4)
+    return NOW
+
+
+def test_signals_without_base_shows_buttons(b, tg):
+    run(b.cmd_signals(tg.upd(VIEWER), tg.ctx()))
+    assert tg.buttons() == ["sig:BTC", "sig:ETH", "sig:SOL"]
+
+
+def test_signals_card_and_refresh(b, tg, fake, monkeypatch):
+    now = _sig_market(fake)
+    monkeypatch.setattr("optbot.signals.time", NS(time=lambda: now / 1000, monotonic=time.monotonic))
+    run(b.cmd_signals(tg.upd(VIEWER, "g"), tg.ctx("btc")))   # просмотр, в группе — не чувствительное
+    assert "Железный кондор" in tg.last("reply") and tg.buttons() == ["sig:BTC"]
+    run(b.on_callback(tg.upd(VIEWER, data="sig:BTC"), tg.ctx()))
+    assert "Железный кондор" in tg.last("edit")
+    assert fake.called("place_order") == []
+
+
+def test_signals_refresh_cached(b, tg, fake, monkeypatch):
+    now = _sig_market(fake)
+    monkeypatch.setattr("optbot.signals.time", NS(time=lambda: now / 1000, monotonic=time.monotonic))
+    run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("BTC")))
+    n = len(fake.called("get_tickers"))
+    u = tg.upd(VIEWER, data="sig:BTC")                     # другое сообщение (меню) — карточка его меняет
+    run(b.on_callback(u, tg.ctx()))
+    assert len(fake.called("get_tickers")) == n            # в пределах SIGNAL_CACHE_TTL — без запросов
+    assert u.callback_query.answer.await_args.args == (None,)  # сообщение изменилось — «без изменений» не врём
+    u = tg.upd(VIEWER, data="sig:BTC")                     # «Обновить» на той же карточке: текст тот же
+    u.callback_query.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
+    run(b.on_callback(u, tg.ctx()))
+    assert "Без изменений" in u.callback_query.answer.await_args.args[0]
+    monkeypatch.setattr(botmod, "SIGNAL_CACHE_TTL", 0)
+    run(b.on_callback(tg.upd(VIEWER, data="sig:BTC"), tg.ctx()))
+    assert len(fake.called("get_tickers")) > n
+
+
+def test_signals_concurrent_presses_share_one_compute(b, tg, fake, monkeypatch):
+    now = _sig_market(fake)
+    monkeypatch.setattr("optbot.signals.time", NS(time=lambda: now / 1000, monotonic=time.monotonic))
+
+    async def go():
+        await asyncio.gather(*[b.on_callback(tg.upd(VIEWER, data="sig:BTC"), tg.ctx()) for _ in range(3)])
+    run(go())
+    assert len(fake.called("get_tickers")) == 1
+
+
+def test_signals_same_card_after_cache_says_so(b, tg, fake, monkeypatch):
+    now = _sig_market(fake)
+    monkeypatch.setattr("optbot.signals.time", NS(time=lambda: now / 1000, monotonic=time.monotonic))
+    monkeypatch.setattr(botmod, "SIGNAL_CACHE_TTL", 0)
+    u = tg.upd(VIEWER, data="sig:BTC")
+    u.callback_query.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
+    run(b.on_callback(u, tg.ctx()))
+    assert "рынок тот же" in u.callback_query.answer.await_args.args[0]
+
+
+def test_signals_late_answer_still_edits(b, tg, fake, monkeypatch):
+    now = _sig_market(fake)
+    monkeypatch.setattr("optbot.signals.time", NS(time=lambda: now / 1000, monotonic=time.monotonic))
+    u = tg.upd(VIEWER, data="sig:BTC")
+    u.callback_query.answer = AsyncMock(side_effect=BadRequest("Query is too old"))
+    run(b.on_callback(u, tg.ctx()))
+    assert "Железный кондор" in tg.last("edit")
+
+
+def test_signals_unknown_base_no_lock(b, tg):
+    run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("XXX")))
+    assert "BASE_COINS" in tg.last() and set(b._sig_locks) == {"BTC", "ETH", "SOL"}
+
+
+def test_signals_button_answered_on_error(b, tg, fake):
+    fake.fail["get_tickers"] = __import__("requests").exceptions.ConnectionError("down")
+    u = tg.upd(VIEWER, data="sig:BTC")
+    run(b.on_callback(u, tg.ctx()))
+    assert "Не удалось" in u.callback_query.answer.await_args.args[0]  # кнопка не крутится до таймаута
+    assert "Ошибка" in tg.last("reply")
+
+
+def test_signals_access_and_errors(b, tg):
+    run(b.cmd_signals(tg.upd(STRANGER), tg.ctx("BTC")))
+    assert tg.out == []
+    u = tg.upd(STRANGER, data="sig:BTC")
+    run(b.on_callback(u, tg.ctx()))
+    u.callback_query.answer.assert_awaited_with("Нет прав")
+    run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("DOGE")))
+    assert "BASE_COINS" in tg.last()
+
+
+def test_signals_in_menu_and_help():
+    assert "signals" in [n for n, _, _ in OptionsBot.COMMANDS]
+    assert "/signals" in HELP

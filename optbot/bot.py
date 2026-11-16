@@ -26,6 +26,9 @@
 Исполнения: приватный WebSocket Bybit (optbot.ws) — сообщение о каждой сделке по опционам
 (включая сделанные вне бота) во все разрешённые группы и трейдерам в личку.
 
+Сигналы: /signals [BASE] — рекомендация стратегии с ограниченным риском (optbot.signals), без кнопки
+«Выставить»; кнопка «Обновить» пересчитывает в том же сообщении (не чаще SIGNAL_CACHE_TTL сек на актив).
+
 Инструкции: /guide [ru|uk] — PDF из docs/ под права спросившего (трейдера или зрителя; администратора —
 никогда), язык по Telegram или аргументу. Одну и ту же — в чат не чаще GUIDE_COOLDOWN сек (в группе повтор
 молча); file_id Telegram запоминается до смены файла (mtime и размер).
@@ -60,6 +63,7 @@ from telegram.ext import (
 from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
 from .collector import Collector, seconds_to_next_slot
 from .journal import Journal, fmt_report, parse_period
+from .signals import SignalEngine, fmt_signal
 from .config import ROOT, Settings, settings
 from .ws import ExecutionWatcher
 from .fmt import (
@@ -73,6 +77,7 @@ audit_log = logging.getLogger("optbot.trade")
 PENDING_TTL = 60  # сек на подтверждение
 CHAIN_N = 6       # страйков от ATM по умолчанию
 TOKEN_TTL = 1800  # сек жизни кнопок в /orders и /pos
+SIGNAL_CACHE_TTL = 30  # сек: /signals и «Обновить» по тому же активу чаще — без нового расчёта
 
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 # Служебные аккаунты Telegram, от имени которых приходят сообщения «от чата»:
@@ -102,6 +107,7 @@ HELP = """Просмотр:
 /exp [BASE] — экспирации (кнопками)
 /chain BASE [EXP] [N] — цепочка
 /t SYMBOL — котировка и греки
+/signals [BASE] — сигнал: стратегия, ноги, риск
 /bal /greeks [BASE] — счёт*
 /pos [BASE] — позиции (кнопки «Закрыть»)*
 /orders [BASE] — ордера (кнопки «Изменить», «Отменить»)*
@@ -206,6 +212,9 @@ class OptionsBot:
         self.cfg = cfg
         self.collector = Collector(client, cfg)
         self.journal = Journal(cfg)
+        self.signals = SignalEngine(client, cfg)
+        self._sig_cache: dict[str, tuple[float, object]] = {}  # актив -> (когда, Signal)
+        self._sig_locks = {b: asyncio.Lock() for b in cfg.base_coins}  # актив -> блокировка расчёта
         self.pending: dict[str, Pending] = {}
         self.tokens: dict[str, dict] = {}            # короткие ключи для данных кнопок (лимит 64 байта)
         # (chat_id, id сообщения-вопроса) -> (токен меню amend, время); живут сутки, чтобы на поздний ответ
@@ -326,12 +335,15 @@ class OptionsBot:
         )
 
     @staticmethod
-    async def edit(q, text_html: str, markup=None):
+    async def edit(q, text_html: str, markup=None) -> bool:
+        """-> изменилось ли сообщение (False — тот же текст, Telegram «not modified»)."""
         try:
             await q.edit_message_text(text_html, parse_mode=ParseMode.HTML, reply_markup=markup)
         except BadRequest as e:
             if "not modified" not in str(e).lower():
                 raise
+            return False
+        return True
 
     # ---------- общие ----------
     @guarded("any")
@@ -462,6 +474,31 @@ class OptionsBot:
             raise ValueError("Укажите символ: /t BTC-17NOV26-60000-P")
         inst = await self.call(self.c.resolve_symbol, " ".join(context.args))
         await self.reply(update, fmt_ticker(await self.call(self.c.ticker, inst.symbol)))
+
+    # ---------- сигналы ----------
+    async def _signal_view(self, base: str) -> tuple[str, InlineKeyboardMarkup, bool]:
+        """-> (карточка, кнопки, из кэша ли). Расчёт — запросы к Bybit (тикеры, свечи, справочник) и чтение
+        истории. Повторы чаще SIGNAL_CACHE_TTL — из кэша; одновременные нажатия по одному активу ждут один расчёт,
+        а не запускают свои (каждый пошёл бы в ту же медленную биржу)."""
+        base = self.signals.check_base(base)
+        async with self._sig_locks[base]:
+            hit = self._sig_cache.get(base)
+            cached = bool(hit and time.monotonic() - hit[0] < SIGNAL_CACHE_TTL)
+            if cached:
+                sig = hit[1]
+            else:
+                sig = await self.call(self.signals.compute, base)
+                self._sig_cache[base] = (time.monotonic(), sig)
+        return pre(fmt_signal(sig, self.cfg.env)), kb([[("🔄 Обновить", f"sig:{base}")]]), cached
+
+    @guarded("view")
+    async def cmd_signals(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
+        if not context.args:
+            await update.effective_message.reply_text(
+                "Сигнал по активу:", reply_markup=kb([[(b, f"sig:{b}") for b in self.cfg.base_coins]]))
+            return
+        text, markup, _ = await self._signal_view(context.args[0])
+        await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
     # ---------- счёт (чувствительное) ----------
     @staticmethod
@@ -820,6 +857,22 @@ class OptionsBot:
             await self._amend_pick(update, context, w, tok, choice)
             return
 
+        if kind == "sig":  # sig:BASE — сигнал (выбор актива или «Обновить») в том же сообщении
+            # ответ на кнопку — после расчёта (подсказка зависит от результата), но обязательно, и при ошибке тоже
+            toast = None
+            try:
+                text, markup, cached = await self._signal_view(rest)
+                # тот же текст — Telegram не меняет сообщение; без подсказки «Обновить» выглядит сломанной
+                if not await self.edit(q, text, markup):
+                    toast = (f"Без изменений: расчёт моложе {SIGNAL_CACHE_TTL} с" if cached
+                             else "Без изменений: рынок тот же")
+            except Exception:
+                toast = "Не удалось — см. сообщение ниже"
+                raise
+            finally:
+                with contextlib.suppress(TelegramError):  # долгий расчёт: «query is too old» не мешает
+                    await q.answer(toast)
+            return
         await q.answer()
         if kind == "exp":  # выбор актива / возврат из цепочки -> список экспираций (правка того же сообщения)
             base = rest.upper()
@@ -982,6 +1035,7 @@ class OptionsBot:
         ("exp", "cmd_exp", "экспирации"),
         ("chain", "cmd_chain", "цепочка опционов"),
         ("t", "cmd_ticker", "котировка инструмента"),
+        ("signals", "cmd_signals", "сигнал: стратегия и риск"),
         ("bal", "cmd_bal", "баланс"),
         ("pos", "cmd_pos", "позиции"),
         ("orders", "cmd_orders", "открытые ордера"),

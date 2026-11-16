@@ -33,21 +33,97 @@ def _minutes_divisor(name: str, default: int) -> int:
     return n if 1 <= n <= 60 and 60 % n == 0 else 0
 
 
-def _int_in(name: str, default: int, lo: int, hi: int) -> int:
-    """Целое в [lo, hi]; неверное — значение по умолчанию с предупреждением (настройка не критична)."""
+def _num_in(name: str, default, lo, hi, cast=float):
+    """Число в [lo, hi]; неверное — значение по умолчанию с предупреждением (настройка не критична)."""
     v = (os.getenv(name) or "").strip()
     try:
-        n = int(v) if v else default
-        if lo <= n <= hi:
-            return n
+        x = cast(v.replace(",", ".")) if v else default
+        if lo <= x <= hi:
+            return x
     except ValueError:
         pass
-    logging.getLogger("optbot.config").warning("%s=%r: нужно целое %d…%d — использую %d", name, v, lo, hi, default)
+    kind = "целое" if cast is int else "число"
+    logging.getLogger("optbot.config").warning("%s=%r: нужно %s %s…%s — использую %s", name, v, kind, lo, hi, default)
     return default
+
+
+def _int_in(name: str, default: int, lo: int, hi: int) -> int:
+    return _num_in(name, default, lo, hi, int)
+
+
+def _float_in(name: str, default: float, lo: float, hi: float) -> float:
+    return _num_in(name, default, lo, hi, float)
 
 
 def _list(name: str, default: str = "") -> list[str]:
     return [x.strip().upper() for x in os.getenv(name, default).split(",") if x.strip()]
+
+
+def _pair_bad(a, b, k, strict: bool) -> bool:
+    """Пара несогласована: strict — нужно a·k < b, иначе a·k ≤ b."""
+    return a * k >= b if strict else a * k > b
+
+
+_SIG_PAIRS = {"dte_min": 2, "dte_max": 7, "ema_fast": 12, "ema_slow": 48, "pctl_low": 30, "pctl_high": 70,
+              "debit_short_delta": 0.25, "debit_long_delta": 0.45, "min_history_days": 14, "lookback_days": 60}
+# ↑ значения по умолчанию связанных порогов — единственный источник: поля ниже берут их отсюда
+
+
+@dataclass(frozen=True)
+class SignalSettings:
+    """Пороги сигналов (этап 3, optbot.signals). Проценты — в процентах (70 = 70%), доли — долями."""
+    target_days: float = _float_in("SIG_TARGET_DAYS", 7, 1, 30)        # срок IV постоянной дюрации
+    dte_min: float = _float_in("SIG_DTE_MIN", _SIG_PAIRS["dte_min"], 0.5, 30)              # окно экспирации, дней
+    dte_max: float = _float_in("SIG_DTE_MAX", _SIG_PAIRS["dte_max"], 1, 60)
+    min_history_days: float = _float_in("SIG_MIN_HISTORY_DAYS", _SIG_PAIRS["min_history_days"], 1, 365)  # меньше — «мало истории»
+    lookback_days: int = _int_in("SIG_LOOKBACK_DAYS", _SIG_PAIRS["lookback_days"], 7, 730)      # окно истории для IV percentile
+    pctl_high: float = _float_in("SIG_PCTL_HIGH", _SIG_PAIRS["pctl_high"], 50, 100)         # IV высокая: pctl ≥
+    pctl_low: float = _float_in("SIG_PCTL_LOW", _SIG_PAIRS["pctl_low"], 0, 50)             # IV низкая: pctl ≤
+    iv_rv_high: float = _float_in("SIG_IV_RV_HIGH", 1.15, 1, 3)        # IV высокая: IV7 > RV7 × k
+    ema_fast: int = _int_in("SIG_EMA_FAST", _SIG_PAIRS["ema_fast"], 2, 299)                # EMA на 4h-свечах
+    ema_slow: int = _int_in("SIG_EMA_SLOW", _SIG_PAIRS["ema_slow"], 3, 300)   # ×3 свечей ≤ лимита kline 1000
+    trend_pct: float = _float_in("SIG_TREND_PCT", 1.0, 0, 20)          # тренд: |EMAfast/EMAslow − 1| ≥ N%
+    short_delta: float = _float_in("SIG_SHORT_DELTA", 0.20, 0.05, 0.45)  # короткие ноги кондора / кредит-спреда
+    debit_long_delta: float = _float_in("SIG_DEBIT_LONG_DELTA", _SIG_PAIRS["debit_long_delta"], 0.2, 0.7)
+    debit_short_delta: float = _float_in("SIG_DEBIT_SHORT_DELTA", _SIG_PAIRS["debit_short_delta"], 0.05, 0.45)
+    wing_em: float = _float_in("SIG_WING_EM", 0.5, 0.1, 3)             # ширина крыла, доля ожидаемого движения
+    max_leg_spread_pct: float = _float_in("SIG_MAX_LEG_SPREAD_PCT", 20, 1, 100)  # спред ноги, % от mid
+    min_oi_usd: float = _float_in("SIG_MIN_OI_USD", 20000, 0, 1e9)     # OI ноги × форвард, USDT
+    min_credit_ratio: float = _float_in("SIG_MIN_CREDIT_RATIO", 0.10, 0, 0.9)  # кредит ≥ доли ширины спреда
+    max_debit_ratio: float = _float_in("SIG_MAX_DEBIT_RATIO", 0.60, 0.1, 1)    # дебет ≤ доли ширины спреда
+
+    def __post_init__(self):
+        # перепутанные пары — обе по умолчанию (сигналы не должны молча работать на несогласованных порогах)
+        # (меньшее, большее, во сколько раз большее должно превышать меньшее, как сказать в логе)
+        for lo, hi, k, strict, how in (("dte_min", "dte_max", 1, False, "не больше"),
+                                       ("ema_fast", "ema_slow", 1, True, "меньше"),
+                                       ("pctl_low", "pctl_high", 1, True, "меньше"),
+                                       ("debit_short_delta", "debit_long_delta", 1, True, "меньше"),
+                               # история считается по часам со срезами: окно с запасом на пропуски сбора
+                                       ("min_history_days", "lookback_days", 1.25, False, "не больше 80% от")):
+            a, b = getattr(self, lo), getattr(self, hi)
+            bad = _pair_bad(a, b, k, strict)
+            if bad:
+                # сбросить только то, что задано в .env (другое — уже значение по умолчанию); оба/ни одного — оба
+                env_lo, env_hi = (bool((os.getenv(f"SIG_{x.upper()}") or "").strip()) for x in (lo, hi))
+                reset = [lo] if env_lo and not env_hi else [hi] if env_hi and not env_lo else [lo, hi]
+                if len(reset) == 1:  # сброс одного должен давать согласованную пару, иначе — оба
+                    na = _SIG_PAIRS[lo] if reset == [lo] else a
+                    nb = _SIG_PAIRS[hi] if reset == [hi] else b
+                    if _pair_bad(na, nb, k, strict):
+                        reset = [lo, hi]
+                logging.getLogger("optbot.config").warning(
+                    "SIG_%s=%s должно быть %s SIG_%s=%s — использую %s", lo.upper(), a, how, hi.upper(), b,
+                    ", ".join(f"SIG_{x.upper()}={_SIG_PAIRS[x]}" for x in reset))
+                for x in reset:
+                    object.__setattr__(self, x, _SIG_PAIRS[x])
+        if not self.dte_min <= self.target_days <= self.dte_max:  # не сброс: может быть намеренно
+            logging.getLogger("optbot.config").warning(
+                "SIG_TARGET_DAYS=%g вне окна экспираций SIG_DTE_MIN…SIG_DTE_MAX (%g…%g): IV считается на другой срок, "
+                "чем у сделок", self.target_days, self.dte_min, self.dte_max)
+
+
+_SIG_DEFAULT = SignalSettings()
 
 
 @dataclass(frozen=True)
@@ -102,6 +178,9 @@ class Settings:
     journal_backfill_days: int = _int_in("JOURNAL_BACKFILL_DAYS", 30, 1, 730)  # глубина первой выгрузки
     # секрет для хеша пользователя в orderLinkId; пусто — производный от BYBIT_API_SECRET
     journal_secret: str = os.getenv("JOURNAL_SECRET", "").strip()
+
+    # Сигналы (этап 3): пороги SIG_*
+    sig: SignalSettings = _SIG_DEFAULT  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
 
     # Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

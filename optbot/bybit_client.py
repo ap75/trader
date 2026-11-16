@@ -123,6 +123,11 @@ def parse_option_symbol(sym: str) -> tuple[str, str, Decimal, str] | None:
     return parts[0], parts[1], strike, parts[3]
 
 
+def option_intrinsic(kind: str, strike: float, s: float) -> float:
+    """Внутренняя стоимость при цене s за 1 контракт: kind 'C' | 'P'. Общая для журнала и сигналов."""
+    return max(s - strike, 0.0) if kind == "C" else max(strike - s, 0.0)
+
+
 def group_by_strike(rows: list[dict]) -> dict[Decimal, dict[str, dict]]:
     """Тикеры одной экспирации -> {страйк: {'C': тикер колла, 'P': тикер пута}}. Нестандартные символы пропускаются."""
     out: dict[Decimal, dict[str, dict]] = {}
@@ -279,6 +284,15 @@ class OptionsClient:
         """Тикер линейного перпетуала BASEUSDT (markPrice, indexPrice, lastPrice)."""
         rows = self._call(self.http.get_tickers, category="linear", symbol=f"{base.upper()}USDT").get("list", [])
         return rows[0] if rows else None
+
+    def perp_closes(self, base: str, interval_min: int, limit: int) -> list[tuple[int, float]]:
+        """Закрытия ЗАВЕРШЁННЫХ свечей перпетуала BASEUSDT: [(начало свечи, close)], от старых к новым.
+        Bybit отдаёт от новых к старым, первая — текущая незакрытая (её close меняется): отбрасывается всегда,
+        а не по своим часам (часы сервера могут спешить)."""
+        res = self._call(self.http.get_kline, category="linear", symbol=f"{base.upper()}USDT",
+                         interval=str(interval_min), limit=min(limit + 1, 1000))
+        rows = sorted((int(k[0]), float(k[4])) for k in res.get("list", []))[:-1]
+        return [(t, c) for t, c in rows if c > 0][-limit:]
 
     def chain(self, base: str, expiry_code: str, strikes_around_atm: int = 6) -> dict:
         """Цепочка опционов: строки по страйкам вокруг ATM, с котировками и греками."""

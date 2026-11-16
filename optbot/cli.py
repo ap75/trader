@@ -12,6 +12,7 @@
     python -m optbot.cli cancel BTC-27MAR26-70000-P <orderId>
     python -m optbot.cli cancel-all [BASE]
     python -m optbot.cli close BTC-27MAR26-70000-P [--price 120]
+    python -m optbot.cli signals BTC        сигнал (этап 3): стратегия, ноги, риск — без ордеров
 
 Любое действие с ордерами требует подтверждения y/N.
 """
@@ -24,6 +25,7 @@ from decimal import Decimal, InvalidOperation
 from .bybit_client import BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError
 from .config import settings
 from .journal import Journal
+from .signals import SignalEngine, fmt_signal
 from .fmt import (
     env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_orders,
     fmt_order_preview, fmt_positions, fmt_ticker, parse_iv, to_dec,
@@ -92,6 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("ticker", help="котировка и греки инструмента")
     s.add_argument("symbol")
 
+    s = sub.add_parser("signals", help="сигнал: стратегия, ноги, риск (без ордеров; история — из БД сборщика)")
+    s.add_argument("base")
+
     sub.add_parser("balance", help="баланс UTA")
     for name, hlp in (("positions", "открытые позиции"), ("orders", "открытые ордера"),
                       ("greeks", "греки портфеля")):
@@ -138,6 +143,8 @@ def run(args: argparse.Namespace, c: OptionsClient) -> None:
         print(fmt_chain(c.chain(args.base, args.expiry, args.n), wide=args.wide))
     elif cmd == "ticker":
         print(fmt_ticker(c.ticker(c.resolve_symbol(args.symbol).symbol)))
+    elif cmd == "signals":
+        print(fmt_signal(SignalEngine(c, c.cfg).compute(args.base), c.cfg.env))
     elif cmd == "balance":
         print(fmt_balance(c.balance()))
     elif cmd == "positions":
