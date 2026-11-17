@@ -7,6 +7,7 @@
 - группы из TELEGRAM_ALLOWED_CHAT_IDS; из любой другой группы бот молча выходит (id группы пишется в лог).
 
 Права — всегда по пользователю (from_user.id), не по чату:
+- администраторы (TELEGRAM_ADMIN_IDS) — всё, что трейдеру, и функции только для администратора (в личку);
 - трейдеры (TELEGRAM_TRADER_IDS) — торговля и просмотр;
 - зрители (TELEGRAM_VIEWER_IDS) — просмотр;
 - ALLOW_ALL_GROUP_MEMBERS_VIEW=true — просмотр всем участникам разрешённых групп;
@@ -31,6 +32,14 @@
 с периодом JOURNAL_SYNC_MIN со сводкой в группы, статистика — /signals_stats; кнопка «Обновить» пересчитывает
 в том же сообщении (не чаще SIGNAL_CACHE_TTL сек на актив).
 
+Автосигналы — только администраторам в личку (в группы не идут), в журнал с source=auto:
+- сводка по всем активам раз в сутки в AUTO_SIGNALS_DAILY_UTC;
+- смена рекомендации по активу (нет → есть, есть → другая, есть → нет; другие страйки той же стратегии —
+  не смена) — проверка после каждого среза сборщика, смена должна продержаться AUTO_CHANGE_CONFIRM проверок
+  подряд, сообщение не чаще раза в AUTO_SIGNALS_CHANGE_HOURS часов на актив; в журнал — только доставленное.
+  Точка отсчёта — первые AUTO_CHANGE_CONFIRM одинаковых проверок после старта (о смене за время простоя
+  не сообщается); сводка — снимок, состояние смены не меняет.
+
 Инструкции: /guide [ru|uk] — PDF из docs/ под права спросившего (трейдера или зрителя; администратора —
 никогда), язык по Telegram или аргументу. Одну и ту же — в чат не чаще GUIDE_COOLDOWN сек (в группе повтор
 молча); file_id Telegram запоминается до смены файла (mtime и размер).
@@ -51,6 +60,7 @@ import secrets
 import sys
 import time
 from dataclasses import dataclass
+from datetime import time as dtime, timezone
 from decimal import InvalidOperation
 from pathlib import Path
 from typing import Callable
@@ -66,7 +76,7 @@ from telegram.ext import (
 from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
 from .collector import Collector, seconds_to_next_slot
 from .journal import Journal, fmt_report, parse_period
-from .signals import Signal, SignalEngine, fmt_signal
+from .signals import Signal, SignalEngine, fmt_signal, fmt_signal_brief, signal_key, strategy_name
 from .sigjournal import SETTLED_PER_MESSAGE, SignalJournal, compute_stats, fmt_settled, fmt_stats
 from .config import ROOT, Settings, settings
 from .ws import ExecutionWatcher
@@ -84,6 +94,9 @@ TOKEN_TTL = 1800  # сек жизни кнопок в /orders и /pos
 LIST_MAX = 20     # /orders и /pos: строк (и кнопок) на странице — длина сообщения Telegram ≤ 4096; дальше ◀ ▶
 ANNOUNCE_GIVEUP_MS = 86_400_000  # итог не доставлен никому столько после расчёта — больше не отправлять
 SIGNAL_CACHE_TTL = 30  # сек: /signals и «Обновить» по тому же активу чаще — без нового расчёта
+TG_MAX_TEXT = 4096       # длина сообщения Telegram (после разметки)
+AUTO_RETRY_S = 3600     # сообщение о смене никому не дошло — следующая попытка не раньше
+AUTO_CHANGE_CONFIRM = 2  # проверок подряд: столько должна продержаться смена рекомендации до сообщения
 
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 # Служебные аккаунты Telegram, от имени которых приходят сообщения «от чата»:
@@ -120,7 +133,7 @@ HELP = """Просмотр:
 /orders [BASE] — ордера (кнопки «Изменить», «Отменить»)*
 /journal [ПЕРИОД] [csv] — журнал сделок и PnL*
    ПЕРИОД: сегодня | вчера | 7d | 2026-11-01 | 2026-11-01..2026-11-15
-/id — ваш user id и chat id
+/id — ваш user id и chat id (и роль)
 /guide [ru|uk] — инструкция (PDF)
 
 Торговля (только трейдеры):
@@ -131,6 +144,9 @@ HELP = """Просмотр:
    (проще — кнопкой «Изменить» в /orders)
 /cancel SYMBOL ORDER_ID
 /cancelall [BASE]
+
+Администратору (TELEGRAM_ADMIN_IDS) — всё, что трейдеру, и автосигналы в личку:
+   сводка раз в сутки и сообщение при смене рекомендации
 
 SYMBOL: BTC-17NOV26-60000-P (суффикс -USDT не обязателен)
 Примеры: /buy BTC-17NOV26-60000-P 0.01 150
@@ -156,10 +172,34 @@ class Who:
     anon: bool        # сообщение от имени чата (sender_chat) / служебный аккаунт
     can_view: bool
     can_trade: bool
+    is_admin: bool = False
 
     @property
     def where(self) -> str:
         return f"группе «{self.chat_title}»" if self.is_group else "личке"
+
+
+@dataclass
+class AutoState:
+    """Автосигналы по активу: подтверждённая рекомендация и кандидат на смену. Точка отсчёта (ready) — тоже
+    после AUTO_CHANGE_CONFIRM одинаковых проверок подряд: один сбойный срез после старта её не задаёт."""
+    reported: str | None = None     # signal_key подтверждённого (точка отсчёта или сообщённая смена)
+    ready: bool = False             # точка отсчёта установлена (до этого — только набор серии, без сообщений)
+    reported_at: float = 0.0        # когда было последнее сообщение О СМЕНЕ (пауза AUTO_SIGNALS_CHANGE_HOURS)
+    pending: str | None = None      # новое значение, которое ждёт подтверждения
+    streak: int = 0                 # сколько проверок подряд оно держится
+    retry_at: float = 0.0           # сообщение о смене не доставлено — следующая попытка не раньше
+
+    def break_streak(self) -> None:
+        """Проверка пропущена или кандидат исчез: «подряд» начинается заново."""
+        self.pending, self.streak = None, 0
+
+    def report(self, key: str | None, now: float | None = None) -> None:
+        """Подтверждено (точка отсчёта, now=None) или сообщено о смене (now — начало паузы): кандидат и ожидание
+        повтора сбрасываются."""
+        self.reported, self.ready, self.pending, self.streak, self.retry_at = key, True, None, 0, 0.0
+        if now is not None:
+            self.reported_at = now
 
 
 @dataclass
@@ -233,6 +273,11 @@ class OptionsBot:
         self._order_locks: dict[str, list] = {}
         self._guide_ids: dict[str, tuple[tuple, str]] = {}  # файл -> ((mtime, размер), file_id): без повторной загрузки
         self._guide_sent: dict[tuple[int | None, str], float] = {}  # (чат, файл) -> когда отправлена
+        self._auto: dict[str, AutoState] = {}  # автосигналы: актив -> что сообщено администраторам
+        # сводка и проверка смены — по очереди (одновременно: оба увидели бы старое состояние и написали дважды)
+        self._auto_lock = asyncio.Lock()
+        self._auto_task: asyncio.Task | None = None  # проверка смены, запущенная сборщиком
+        self._auto_gen = 0  # растёт при пропуске проверки: опоздавшая проверка своих итогов не применяет
 
     # ---------- доступ ----------
     def who(self, update: Update) -> Who:
@@ -242,7 +287,8 @@ class OptionsBot:
         anon = u is None or from_chat or u.id in SERVICE_USER_IDS
         uid = u.id if u else None
         is_group = chat is not None and chat.type in GROUP_TYPES
-        can_trade = not anon and uid in self.cfg.tg_trader_ids
+        is_admin = not anon and uid in self.cfg.tg_admin_ids
+        can_trade = is_admin or (not anon and uid in self.cfg.tg_trader_ids)
         can_view = (
             can_trade
             or (not anon and uid in self.cfg.tg_viewer_ids)
@@ -257,6 +303,7 @@ class OptionsBot:
             anon=anon,
             can_view=can_view,
             can_trade=can_trade,
+            is_admin=is_admin,
         )
 
     async def gate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -360,7 +407,8 @@ class OptionsBot:
     # ---------- общие ----------
     @guarded("any")
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
-        role = "трейдер" if w.can_trade else "просмотр" if w.can_view else "нет доступа"
+        role = ("администратор" if w.is_admin else "трейдер" if w.can_trade else "просмотр" if w.can_view
+                else "нет доступа")
         lines = [f"user id: {w.user_id}", f"chat id: {w.chat_id}", f"права: {role}"]
         sc = update.effective_message.sender_chat
         if sc:
@@ -488,27 +536,36 @@ class OptionsBot:
         await self.reply(update, fmt_ticker(await self.call(self.c.ticker, inst.symbol)))
 
     # ---------- сигналы ----------
-    async def _signal_view(self, base: str, w: Who) -> tuple[str, InlineKeyboardMarkup, bool]:
-        """-> (карточка, кнопки, из кэша ли). Расчёт — запросы к Bybit (тикеры, свечи, справочник) и чтение
-        истории. Повторы чаще SIGNAL_CACHE_TTL — из кэша; одновременные нажатия по одному активу ждут один расчёт,
-        а не запускают свои (каждый пошёл бы в ту же медленную биржу)."""
+    async def _signal(self, base: str, fresh: bool = False) -> tuple[Signal, bool]:
+        """-> (своя копия сигнала, из кэша ли). Расчёт — запросы к Bybit (тикеры, свечи, справочник) и чтение
+        истории. Повторы чаще SIGNAL_CACHE_TTL — из кэша; одновременные запросы по одному активу ждут один расчёт,
+        а не запускают свои (каждый пошёл бы в ту же медленную биржу). Копия — номер записи журнала не попадёт
+        в чужую карточку через общий кэш. fresh — мимо кэша (результат кладётся в кэш)."""
         base = self.signals.check_base(base)
         async with self._sig_locks[base]:
             hit = self._sig_cache.get(base)
-            cached = bool(hit and time.monotonic() - hit[0] < SIGNAL_CACHE_TTL)
+            cached = bool(not fresh and hit and time.monotonic() - hit[0] < SIGNAL_CACHE_TTL)
             if cached:
                 sig = hit[1]
             else:
                 sig = await self.call(self.signals.compute, base)
                 self._sig_cache[base] = (time.monotonic(), sig)
-        # журнал сигналов (этап 4). Своя копия — номер записи не попадёт в чужую карточку через общий кэш.
-        # Вне блокировки актива: занятая БД не держит чужие нажатия; сбой записи не мешает показать карточку.
-        sig = dataclasses.replace(sig)
-        # Повтор тому же человеку shown не накручивает — журнал помнит, кто видел (signal_views)
+        return dataclasses.replace(sig), cached
+
+    async def _record_signal(self, sig: Signal, source: str, user_id: int | None, name: str,
+                             chat_id: int | None) -> None:
+        """Журнал сигналов (этап 4). Вне блокировки актива: занятая БД не держит чужие нажатия; сбой записи
+        не мешает показать карточку. Повтор тому же человеку shown не накручивает (signal_views)."""
         try:
-            await self.call(self.sigjournal.record, sig, "bot", w.user_id, w.name, w.chat_id)
+            await self.call(self.sigjournal.record, sig, source, user_id, name, chat_id)
         except Exception:
-            log.exception("Журнал сигналов: %s не записан", base)
+            log.exception("Журнал сигналов: %s не записан", sig.metrics.base)
+
+    async def _signal_view(self, base: str, w: Who) -> tuple[str, InlineKeyboardMarkup, bool]:
+        """-> (карточка, кнопки, из кэша ли)."""
+        sig, cached = await self._signal(base)
+        await self._record_signal(sig, "bot", w.user_id, w.name, w.chat_id)
+        base = sig.metrics.base
         return pre(fmt_signal(sig, self.cfg.env)), kb([[("🔄 Обновить", f"sig:{base}")]]), cached
 
     @guarded("view")
@@ -579,6 +636,163 @@ class OptionsBot:
                 await self._mark_announced([r["id"] for r in chunk])
         except Exception:
             log.exception("Журнал сигналов: сводка итогов не отправлена")
+
+    # ---------- автосигналы администраторам ----------
+    async def _send_admins(self, msg: str) -> list[int]:
+        """Администраторам в личку (в группы — никогда), без кнопок. -> кому доставлено."""
+        if not self._app:
+            return []
+        got = []
+        for uid in sorted(self.cfg.tg_admin_ids):
+            try:
+                await self._app.bot.send_message(uid, msg, parse_mode=ParseMode.HTML)
+                got.append(uid)
+            except TelegramError as e:  # не начинал диалог с ботом / заблокировал — в лог, попробуем в следующий раз
+                log.warning("Автосигнал администратору %s не доставлен: %s", uid, e)
+        return got
+
+    @staticmethod
+    def _pack(head: str, parts: list[str]) -> list[str]:
+        """Части сводки -> сообщения <pre> не длиннее TG_MAX_TEXT; первое — с заголовком."""
+        limit = TG_MAX_TEXT - 100  # запас на <pre> и экранирование
+        msgs, cur = [], head
+        for p in parts:
+            if len(p) > limit:  # одна часть длиннее лимита — обрезать с пометкой (не терять остальное)
+                p = p[: limit - 30] + "\n… (обрезано, см. /signals)"
+            if cur != head and len(pre(f"{cur}\n\n{p}")) > TG_MAX_TEXT:  # заголовок один не отправляем
+                msgs.append(cur)
+                cur = p
+            else:
+                cur = f"{cur}\n\n{p}"
+        msgs.append(cur)
+        return [pre(m) for m in msgs]
+
+    async def _record_auto(self, sig: Signal, uids: list[int]) -> None:
+        """В журнал — как показ тем, кому доставлено (тот же человек потом в /signals — не новый показ).
+        Недоставленное — не показ (иначе /signals_stats считал бы то, чего никто не видел); поэтому запись —
+        после отправки, и номера записи в автосообщениях нет."""
+        for uid in uids:
+            await self._record_signal(sig, "auto", uid, "auto", uid)
+
+    async def _auto_signals(self, bases: list[str] | None = None) -> dict[str, Signal | Exception]:
+        """Свежий расчёт по активам параллельно (мимо кэша: проверка идёт по новому срезу сборщика)."""
+        bases = self.cfg.base_coins if bases is None else bases
+        res = await asyncio.gather(*(self._signal(b, fresh=True) for b in bases), return_exceptions=True)
+        return {b: (r if isinstance(r, Exception) else r[0]) for b, r in zip(bases, res)}
+
+    async def _auto_daily_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Сводка по всем активам: сигнал (стратегия, ноги, риск) или почему его нет."""
+        async with self._auto_lock:
+            now = time.time()
+            sigs = await self._auto_signals()
+            parts = []
+            for base, sig in sigs.items():
+                if not isinstance(sig, Exception):
+                    try:
+                        parts.append(fmt_signal_brief(sig))
+                        continue
+                    except Exception as e:  # один актив не ломает сводку по остальным
+                        sigs[base] = sig = e
+                log.error("Автосигналы: %s не посчитан", base, exc_info=sig)
+                parts.append(f"{base}: не посчитан — ошибка, см. лог")
+            head = f"{env_banner(self.cfg.env)}\n🤖 Сигналы на {time.strftime('%Y-%m-%d %H:%M', time.gmtime(now))} UTC"
+            parts.append("Подробно — /signals BASE. Не торговый совет: решение за трейдером.")
+            got = None
+            for msg in self._pack(head, parts):  # много активов / длинные причины — несколькими сообщениями
+                sent = await self._send_admins(msg)
+                got = sent if got is None else [u for u in got if u in sent]  # получил ВСЮ сводку
+                if not got:  # часть никому не дошла — остальные части без неё бессмысленны
+                    break
+            if not got:
+                log.warning("Автосигналы: сводка никому не доставлена")
+                return
+            # сводка — снимок, а не подтверждение: состояние смены не трогает (один сбойный замер в 09:05
+            # иначе стал бы точкой отсчёта и дал ложное «нет → есть» через две проверки)
+            for sig in sigs.values():
+                if not isinstance(sig, Exception):
+                    await self._record_auto(sig, got)
+
+    def _break_streaks(self, bases) -> None:
+        for b in bases:
+            if st := self._auto.get(b):
+                st.break_streak()
+
+    def _kick_auto_change(self, bases: list[str]) -> None:
+        """Проверка смены после среза — отдельной задачей: медленная биржа не задерживает сборщик (его пропущенный
+        слот — потерянный срез). Предыдущая ещё идёт — новую не начинаем."""
+        if self._auto_task and not self._auto_task.done():
+            log.warning("Автосигналы: прошлая проверка смены ещё идёт — эта пропущена")
+            self._auto_gen += 1  # идущая проверка посчитана по старому срезу: её результат серию не продолжит
+            self._break_streaks(self.cfg.base_coins)  # пропущенная проверка рвёт серию «подряд»
+            return
+        self._auto_task = asyncio.get_running_loop().create_task(self._auto_change_job(None, bases))
+
+    async def _auto_change_job(self, context: ContextTypes.DEFAULT_TYPE | None,
+                               bases: list[str] | None = None) -> None:
+        """Сообщение, когда рекомендация по активу сменилась и продержалась AUTO_CHANGE_CONFIRM проверок подряд, —
+        не чаще раза в AUTO_SIGNALS_CHANGE_HOURS. Смена внутри паузы не теряется: после паузы сообщается, если текущее
+        всё ещё отличается от сообщённого. Ошибки не выходят наружу (задача без ожидающего)."""
+        try:
+            async with self._auto_lock:
+                await self._auto_change_check(self.cfg.base_coins if bases is None else bases)
+        except Exception:
+            log.exception("Автосигналы: проверка смены не выполнена")
+
+    async def _auto_change_check(self, bases: list[str]) -> None:
+        # без свежего среза — пропуск, а пропуск рвёт серию «подряд»
+        self._break_streaks([b for b in self.cfg.base_coins if b not in bases])
+        gen = self._auto_gen
+        sigs = await self._auto_signals(bases)
+        if gen != self._auto_gen:  # пока считали, следующий слот пропустил проверку и сбросил серии
+            log.warning("Автосигналы: проверка смены опоздала на слот — итоги не применены")
+            return
+        for base, sig in sigs.items():
+            try:  # сбой по одному активу не мешает проверить остальные
+                await self._auto_change_base(base, sig)
+            except Exception:
+                log.exception("Автосигналы: смена по %s не проверена", base)
+                self._break_streaks([base])
+
+    async def _auto_change_base(self, base: str, sig: Signal | Exception) -> None:
+        st = self._auto.get(base)
+        if isinstance(sig, Exception):
+            log.warning("Автосигналы: %s не посчитан — смена не проверена", base, exc_info=sig)
+            self._break_streaks([base])  # пропуск рвёт серию: «подряд» — значит без пропусков
+            return
+        key, now = signal_key(sig), time.time()
+        if st is None:
+            st = self._auto[base] = AutoState()
+        if st.ready and key == st.reported:  # вернулось к сообщённому — кандидата и ожидания повтора больше нет
+            st.break_streak()
+            st.retry_at = 0.0
+            return
+        # смена должна продержаться AUTO_CHANGE_CONFIRM проверок подряд: один срез с широким спредом
+        # или без котировки не даёт «есть → нет → есть»
+        if st.streak == 0 or key != st.pending:  # нет кандидата (streak 0; pending None — ещё и «сигнала нет»)
+            st.pending, st.streak, st.retry_at = key, 0, 0.0  # или другой — повтор прошлого не держит его
+        st.streak += 1
+        if not st.ready:  # после старта: точка отсчёта — то, что продержалось AUTO_CHANGE_CONFIRM проверок, без сообщения
+            if st.streak >= AUTO_CHANGE_CONFIRM:
+                st.report(key)
+            return
+        hold = self.cfg.auto_signals_change_hours * 3600
+        if st.streak < AUTO_CHANGE_CONFIRM or now - st.reported_at < hold or now < st.retry_at:
+            return
+        prev = st.reported
+        # без «Обновить»: обновление заменило бы сообщение карточкой и стёрло «что на что сменилось»
+        head = f"🔔 {base}: рекомендация сменилась — {strategy_name(prev)} → {strategy_name(key)}\n"
+        tail = f"\n\nСвежий расчёт — /signals {base}"
+        text = pre(fmt_signal(sig, self.cfg.env, head=head) + tail)
+        if len(text) > TG_MAX_TEXT:  # длинная карточка (много причин и отказов) — краткая, иначе не уйдёт никогда
+            text = pre(f"{env_banner(self.cfg.env)}\n{head}\n{fmt_signal_brief(sig)}{tail}")
+        got = await self._send_admins(text)
+        if got:  # дошло хоть кому-то — сообщено (остальные увидят в сводке)
+            st.report(key, now)
+            await self._record_auto(sig, got)
+        else:  # личка закрыта или сеть: не долбить каждые 15 мин — повтор через AUTO_RETRY_S
+            st.retry_at = now + AUTO_RETRY_S
+            log.warning("Автосигналы: смена по %s никому не доставлена — повтор через %d мин", base,
+                        AUTO_RETRY_S // 60)
 
     async def _mark_announced(self, ids: list[int]) -> None:
         """Отметить отправленное; БД занята — ещё две попытки (иначе та же сводка уйдёт в группы снова)."""
@@ -1050,13 +1264,23 @@ class OptionsBot:
 
     # ---------- сборщик рыночных данных ----------
     async def _collect_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Задача JobQueue: срез в БД. Ошибки не роняют бота — следующий проход по расписанию."""
+        """Задача JobQueue: срез в БД. Ошибки не роняют бота — следующий проход по расписанию. Затем — проверка
+        смены автосигналов отдельной задачей (по свежему срезу; срез не удался — без проверки)."""
         try:
             res = await asyncio.to_thread(self.collector.collect)
         except Exception:
             log.exception("Сборщик: проход не выполнен")
-            return
+            self._break_streaks(self.cfg.base_coins)  # среза нет — история IV старая: смену не проверяем,
+            return                                    # а пропуск рвёт серию «подряд»
         (log.warning if res.errors else log.info)("Сборщик: %s", res)
+        if self._auto_change_on():
+            # только активы со срезом в этом слоте (записан сейчас или уже был — повторный запуск); по активу
+            # с ошибкой сбора история IV старая — его смену не проверяем
+            fresh = [b for b in self.cfg.base_coins if b not in res.failed_bases]
+            if res.snapshots or res.skipped:
+                self._kick_auto_change(fresh)
+            else:
+                self._break_streaks(self.cfg.base_coins)
 
     # ---------- журнал сделок ----------
     async def _sync_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1159,8 +1383,9 @@ class OptionsBot:
             await self._broadcast(pre(f"{env_banner(self.cfg.env)}\n" + "\n\n".join(texts)), "об исполнении")
 
     def _targets(self) -> list[int]:
-        """Получатели уведомлений: разрешённые группы и лички трейдеров (кроме недоступных)."""
-        return sorted(self.cfg.tg_allowed_chat_ids) + sorted(self.cfg.tg_trader_ids - self._dm_failed)
+        """Получатели уведомлений: разрешённые группы и лички трейдеров и администраторов (кроме недоступных)."""
+        dms = (self.cfg.tg_trader_ids | self.cfg.tg_admin_ids) - self._dm_failed
+        return sorted(self.cfg.tg_allowed_chat_ids) + sorted(dms)
 
     async def _broadcast(self, msg: str, what: str) -> int:
         """В разрешённые группы и в личку трейдерам (кроме тех, кому личка недоступна). -> сколько доставлено."""
@@ -1206,6 +1431,30 @@ class OptionsBot:
         ("cancelall", "cmd_cancelall", "отменить все ордера"),
     ]
 
+    def _auto_daily_on(self) -> bool:
+        return bool(self.cfg.tg_admin_ids) and self.cfg.auto_signals_daily_utc is not None
+
+    def _auto_change_on(self) -> bool:
+        return bool(self.cfg.tg_admin_ids) and self.cfg.auto_signals_change_hours > 0
+
+    def _schedule_auto(self, jq) -> None:
+        """Автосигналы администраторам: сводка раз в сутки; проверка смены — после среза сборщика (или таймером)."""
+        c = self.cfg
+        if self._auto_daily_on():
+            h, m = c.auto_signals_daily_utc
+            jq.run_daily(self._auto_daily_job, time=dtime(h, m, tzinfo=timezone.utc), name="auto_signals_daily")
+            log.info("Автосигналы: сводка администраторам (%d) ежедневно в %02d:%02d UTC", len(c.tg_admin_ids), h, m)
+        if self._auto_change_on():
+            if c.collector_enabled:
+                how = "после каждого среза сборщика"  # вызов — из _collect_job
+            else:  # без сборщика — своим таймером с тем же периодом (история IV не обновляется)
+                jq.run_repeating(self._auto_change_job, interval=c.collector_interval_min * 60,
+                                 first=seconds_to_next_slot(time.time(), c.collector_interval_min),
+                                 name="auto_signals_change")
+                how = f"каждые {c.collector_interval_min} мин (сборщик выключен)"
+            log.info("Автосигналы: смена рекомендации — проверка %s, сообщение не чаще раза в %g ч",
+                     how, c.auto_signals_change_hours)
+
     def build_app(self) -> Application:
         async def post_init(app: Application):
             await app.bot.set_my_commands([BotCommand(n, d) for n, _, d in self.COMMANDS])
@@ -1216,10 +1465,12 @@ class OptionsBot:
             except Exception:
                 log.exception("WebSocket исполнений не подключён — уведомлений об исполнениях не будет")
 
-            if app.job_queue is None and (self.cfg.collector_enabled or self.cfg.journal_enabled):
-                log.warning("Сборщик, сверка журнала и итоги сигналов выключены: нет JobQueue — установите "
-                            "python-telegram-bot[job-queue] (pip install -r requirements.txt)")
+            if app.job_queue is None and (self.cfg.collector_enabled or self.cfg.journal_enabled or self._auto_daily_on() or self._auto_change_on()):
+                log.warning("Сборщик, сверка журнала, итоги сигналов и автосигналы выключены: нет JobQueue — "
+                            "установите python-telegram-bot[job-queue] (pip install -r requirements.txt)")
                 return
+            if app.job_queue is not None:
+                self._schedule_auto(app.job_queue)
             if self.cfg.journal_enabled:
                 # при старте (догрузить пропущенное, пока бот был выключен) и далее по расписанию
                 app.job_queue.run_repeating(self._sync_job, interval=self.cfg.journal_sync_min * 60, first=10,
@@ -1239,6 +1490,10 @@ class OptionsBot:
                          self.cfg.collector_interval_min, first, self.cfg.db_file)
 
         async def post_shutdown(app: Application):
+            if self._auto_task and not self._auto_task.done():  # не слать в остановленный Telegram
+                self._auto_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._auto_task
             if self.watcher:
                 await asyncio.to_thread(self.watcher.stop)
 
@@ -1265,13 +1520,16 @@ def check_config(cfg: Settings) -> list[str]:
     errors = []
     if not cfg.tg_token:
         errors.append("TELEGRAM_BOT_TOKEN не задан")
-    if not (cfg.tg_trader_ids or cfg.tg_viewer_ids or
+    if not (cfg.tg_admin_ids or cfg.tg_trader_ids or cfg.tg_viewer_ids or
             (cfg.allow_all_group_members_view and cfg.tg_allowed_chat_ids)):
-        errors.append("Никому нет доступа: заполните TELEGRAM_TRADER_IDS / TELEGRAM_VIEWER_IDS")
+        errors.append("Никому нет доступа: заполните TELEGRAM_ADMIN_IDS / TELEGRAM_TRADER_IDS / TELEGRAM_VIEWER_IDS")
+    neg = {i for i in cfg.tg_admin_ids if i <= 0}
+    if neg:  # автосигналы и функции администратора — только в личку: группе их слать нельзя
+        errors.append(f"TELEGRAM_ADMIN_IDS: id пользователей положительные, а не {sorted(neg)}")
     bad = {i for i in cfg.tg_allowed_chat_ids if i > 0}
     if bad:
         errors.append(f"TELEGRAM_ALLOWED_CHAT_IDS: id групп отрицательные, а не {sorted(bad)}")
-    svc = (cfg.tg_trader_ids | cfg.tg_viewer_ids) & SERVICE_USER_IDS
+    svc = (cfg.tg_admin_ids | cfg.tg_trader_ids | cfg.tg_viewer_ids) & SERVICE_USER_IDS
     if svc:
         errors.append(f"В списках пользователей служебные id Telegram: {sorted(svc)}")
     return errors
@@ -1289,9 +1547,9 @@ def main() -> int:
     if settings.allow_all_group_members_view and not settings.tg_allowed_chat_ids:
         log.warning("ALLOW_ALL_GROUP_MEMBERS_VIEW=true, но TELEGRAM_ALLOWED_CHAT_IDS пуст — флаг ни на что не влияет")
 
-    log.info("Старт: env=%s, активы=%s, трейдеров=%d, зрителей=%d, групп=%d, "
+    log.info("Старт: env=%s, активы=%s, администраторов=%d, трейдеров=%d, зрителей=%d, групп=%d, "
              "просмотр всем в группах=%s, счёт только в личке=%s",
-             settings.env, ",".join(settings.base_coins), len(settings.tg_trader_ids),
+             settings.env, ",".join(settings.base_coins), len(settings.tg_admin_ids), len(settings.tg_trader_ids),
              len(settings.tg_viewer_ids), len(settings.tg_allowed_chat_ids),
              settings.allow_all_group_members_view, settings.sensitive_commands_dm_only)
     app = OptionsBot(OptionsClient(settings), settings).build_app()

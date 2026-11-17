@@ -522,8 +522,8 @@ class Journal:
                 # поставка закрывает позицию по внутренней стоимости (execPrice поставки не используем:
                 # его смысл не сверен — это может быть цена базового актива)
                 px = delivery_px(sym, t) if kind == "exec" else (r["delivery_price"] or delivery_px(sym, t))
-                # q — закрываемая позиция со знаком. Смысл side у поставки не сверен с биржей, поэтому
-                # опираемся на позицию по журналу; side — только если позиции в истории нет
+                # q — закрываемая позиция со знаком: по журналу; side — только если позиции в истории нет.
+                # У delivery-record side — сторона ЗАКРЫТИЯ (сверено на demo 17NOV26: длинная позиция → Sell)
                 q = st[0]
                 if kind == "exec" and abs(q) > EPS:
                     q = min(r["qty"] or 0.0, abs(q)) * (1 if q > 0 else -1)
@@ -532,7 +532,7 @@ class Journal:
                     st[:] = [q, record_entry.get(sym, 0.0)]
                     no_entry = sym not in record_entry
                 elif abs(q) < EPS and r["position"]:  # позиции нет в нашей истории (старше выгрузки)
-                    q = r["position"] * (1 if r["side"] == "Buy" else -1)
+                    q = r["position"] * (-1 if r["side"] == "Buy" else 1)
                     st[:] = [q, r["entry_price"] or 0.0]
                     no_entry = not r["entry_price"]
                 pay = intrinsic(sym, px, r["strike"] if kind == "delivery" else None) if px is not None else None

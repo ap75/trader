@@ -143,6 +143,7 @@ def test_collect_error_in_one_base_does_not_stop_others(make_client, cfg_db, fak
     fake.get_tickers = flaky
     res = Collector(make_client(cfg_db), cfg_db).collect(NOW)
     assert res.snapshots == 2 and len(res.errors) == 1 and "ETH" in res.errors[0]
+    assert res.failed_bases == {"ETH"}
 
 
 def test_collect_without_perp(make_client, cfg_db, fake):

@@ -235,9 +235,19 @@ def test_report_delivery_not_double_counted_with_delivery_exec(j):
 
 
 def test_report_delivery_of_position_older_than_history(j):
-    j.record_deliveries([{"symbol": BTC_PUT, "deliveryTime": str(EXP_MS), "side": "Sell", "position": "0.01",
+    # side у delivery-record — сторона закрытия: шорт закрывается покупкой
+    j.record_deliveries([{"symbol": BTC_PUT, "deliveryTime": str(EXP_MS), "side": "Buy", "position": "0.01",
                           "entryPrice": "200", "deliveryPrice": "65000"}])  # пут истёк пустым — шорт заработал
     assert j.report(NOW, EXP_MS + 1, "x").realized == pytest.approx(2)
+
+
+def test_report_delivery_real_demo_record_long_older_than_history(j):
+    """Запись с demo (17NOV26): купленный колл 0.01 @30 истёк вне денег — side Sell, fee 0, deliveryRpl −0.318."""
+    j.record_deliveries([{"symbol": BTC_CALL, "deliveryTime": str(EXP_MS), "side": "Sell", "position": "0.01",
+                          "entryPrice": "30", "strike": "70000", "fee": "0", "deliveryPrice": "64655.90430778",
+                          "deliveryRpl": "-0.318"}])
+    rep = j.report(NOW, EXP_MS + 1, "x")
+    assert rep.realized == pytest.approx(-0.30) and rep.open_positions == {} and rep.fees == 0
 
 
 def test_report_unknown_delivery_price(j):

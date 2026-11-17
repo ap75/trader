@@ -55,6 +55,26 @@ def _float_in(name: str, default: float, lo: float, hi: float) -> float:
     return _num_in(name, default, lo, hi, float)
 
 
+def _parse_hhmm(x: str) -> tuple[int, int] | None:
+    h, sep, m = x.partition(":")
+    digits = all(part.isascii() and part.isdecimal() for part in (h, m))  # «²» — isdigit, но int() его не берёт
+    ok = sep and digits and len(m) == 2 and int(h) < 24 and int(m) < 60
+    return (int(h), int(m)) if ok else None
+
+
+def _hhmm(name: str, default: str) -> tuple[int, int] | None:
+    """Время суток UTC «ЧЧ:ММ»; off/no/false/0 — выключено (None); неверное — по умолчанию с предупреждением."""
+    v = (os.getenv(name) or "").strip().lower()
+    if v in ("off", "no", "false", "0", "-"):
+        return None
+    t = _parse_hhmm(v or default)
+    if t is None:
+        logging.getLogger("optbot.config").warning("%s=%r: нужно ЧЧ:ММ (UTC) или off — использую %s",
+                                                   name, v, default)
+        t = _parse_hhmm(default)
+    return t
+
+
 def _list(name: str, default: str = "") -> list[str]:
     return [x.strip().upper() for x in os.getenv(name, default).split(",") if x.strip()]
 
@@ -189,6 +209,12 @@ class Settings:
     # Права — по пользователю (from_user.id), в личке и в разрешённых группах
     tg_trader_ids: set[int] = field(default_factory=lambda: _ids("TELEGRAM_TRADER_IDS"))  # торговля + просмотр
     tg_viewer_ids: set[int] = field(default_factory=lambda: _ids("TELEGRAM_VIEWER_IDS"))  # только просмотр
+    # администраторы (владелец бота): всё, что трейдеру, и функции «только для администратора» — в личку
+    tg_admin_ids: set[int] = field(default_factory=lambda: _ids("TELEGRAM_ADMIN_IDS"))
+    # Автосигналы администраторам в личку (в группы не идут); без TELEGRAM_ADMIN_IDS — не работают
+    auto_signals_daily_utc: tuple[int, int] | None = _hhmm("AUTO_SIGNALS_DAILY_UTC", "09:05")  # сводка; None — нет
+    # сообщение о смене рекомендации по активу — не чаще раза в N часов; 0 — не присылать
+    auto_signals_change_hours: float = _float_in("AUTO_SIGNALS_CHANGE_HOURS", 4, 0, 168)
     # Просмотр (не торговля) для всех участников разрешённых групп
     allow_all_group_members_view: bool = _bool("ALLOW_ALL_GROUP_MEMBERS_VIEW", False)
     # Баланс/позиции/ордера/греки — только в личке

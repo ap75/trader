@@ -616,10 +616,11 @@ def _usd(x: float) -> str:
     return "без ограничения" if math.isinf(x) else f"{money(x)} USDT"
 
 
-def fmt_signal(sig: Signal, env: str) -> str:
+def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
+    """head — строки сразу под баннером окружения (например, «рекомендация сменилась»)."""
     m = sig.metrics
     t = m.trend
-    lines = [env_banner(env), f"📊 {m.base} — сигнал на {utc(m.ts_ms)} UTC"]
+    lines = [env_banner(env), *([head] if head else []), f"📊 {m.base} — сигнал на {utc(m.ts_ms)} UTC"]
     if sig.strategy and sig.legs:
         num_ = f"#{sig.id} " if sig.id else ""
         lines.append(f"{num_}{STRATEGIES[sig.strategy]} · {sig.expiry} ({sig.dte:.1f} дн.)")
@@ -672,3 +673,28 @@ def fmt_signal(sig: Signal, env: str) -> str:
     lines.append("\nЦены — по исполнимой стороне (покупка ask, продажа bid), без комиссий. "
                  "Не торговый совет: решение за трейдером.")
     return "\n".join(lines)
+
+
+def signal_key(sig: Signal) -> str | None:
+    """Что рекомендовано: стратегия, если сделка собралась; иначе None («сигнала нет»)."""
+    return sig.strategy if sig.strategy and sig.legs else None
+
+
+def strategy_name(key: str | None) -> str:
+    return STRATEGIES[key] if key else "сигнала нет"
+
+
+def fmt_signal_brief(sig: Signal) -> str:
+    """Несколько строк для сводки по активам: стратегия, ноги, премия и риск — или почему сигнала нет."""
+    base = sig.metrics.base
+    if not signal_key(sig):
+        if sig.strategy:
+            return f"{base}: подходит {STRATEGIES[sig.strategy]}, но не собрать — {sig.no_signal}"
+        return f"{base}: сигнала нет — {sig.no_signal}"
+    legs = [f"  {'BUY ' if l.side > 0 else 'SELL'} {short_symbol(l.symbol).removeprefix(base + '-'):<16} {px(l.price):>7}"
+            for l in sig.legs]
+    net, p = sig.net, sig.profile
+    profit = "прибыль без ограничения" if math.isinf(p.max_profit) else f"прибыль до {_usd(p.max_profit)}"
+    return "\n".join([f"{base}: {STRATEGIES[sig.strategy]} · {sig.expiry} ({sig.dte:.1f} дн.), кол-во {num(sig.qty)}",
+                      *legs,
+                      f"  {'Кредит' if net > 0 else 'Дебет'} {_usd(abs(net))} · {profit} · риск {_usd(p.max_loss)}"])

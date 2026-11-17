@@ -101,6 +101,7 @@ class RunResult:
     legs_missing: list[str] = field(default_factory=list)  # на слежении, но котировки нет
     legs: int = 0
     errors: list[str] = field(default_factory=list)
+    failed_bases: set[str] = field(default_factory=set)  # активы без среза в этом проходе (ошибка загрузки/записи)
     seconds: float = 0.0
 
     def __str__(self) -> str:
@@ -135,6 +136,7 @@ class Collector:
                     log.warning("Сборщик: %s — %s", base, err,
                                 exc_info=None if isinstance(err, BybitError) else err)
                     res.errors.append(f"{base}: {err}")
+                    res.failed_bases.add(base)
                     continue
                 try:
                     self._store_base(conn, base, rows, expiries, perp, res, now_ms, tracked)
@@ -142,6 +144,7 @@ class Collector:
                 except Exception as e:
                     log.warning("Сборщик: запись %s — %s", base, e, exc_info=e)
                     res.errors.append(f"{base}: {e}")
+                    res.failed_bases.add(base)
             res.legs_missing = sorted(tracked - stored)
             if res.legs_missing:  # актив убран из BASE_COINS, сбой загрузки или инструмент снят с торгов
                 log.warning("Сборщик: нет котировок ног на слежении: %s", ", ".join(res.legs_missing))

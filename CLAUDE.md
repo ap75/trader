@@ -54,6 +54,11 @@ cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служ
 - `execution/list`, `order/history` для option без `baseCoin` отдают все базовые активы (не только BTC).
 - `order/history` фильтрует окно startTime/endTime по **времени создания** ордера; по `orderId` — без окна.
 - `market/kline` (linear): от новых к старым, первая свеча — текущая незакрытая (`perp_closes` её отбрасывает).
+- Поставка опционов: в `execution/list` её нет (execType=Delivery не приходит) — только `asset/delivery-record`;
+  там `side` — сторона **закрытия** (длинная позиция → Sell), `position` без знака; вне денег `fee` = 0.
+- Комиссия опциона за сделку: min(feeRate·индекс·кол-во, 7% премии) — у дешёвых OTM-ног срабатывает потолок.
+- Маржа: в `REGULAR_MARGIN` покрытие короткой ноги длинной не учитывается (IM как у непокрытой);
+  в `PORTFOLIO_MARGIN` `positionIM` пустой — IM только `totalInitialMargin` счёта. Demo сейчас — REGULAR_MARGIN.
 
 ## Данные
 
