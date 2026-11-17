@@ -38,8 +38,21 @@ class BybitNetworkError(BybitError):
     """Сеть/таймаут/HTTP-ошибка: неизвестно, дошёл ли запрос до биржи (ордер мог быть выставлен)."""
 
 
+class BybitLocalError(BybitError):
+    """Непредвиденная ошибка вокруг запроса (нет ключей, неверные параметры — или ответ не разобран).
+    До отправки — точно не на бирже; после отправки (OrderRequest.sent) — исход неизвестен."""
+
+
 class RiskError(ValueError):
     """Ордер отклонён локальными ограничениями безопасности."""
+
+
+SIDE_SIGN = {"Buy": Decimal(1), "Sell": Decimal(-1)}  # знак стороны для позиции и дельты
+
+
+class PortfolioRiskError(RiskError):
+    """Отказ по состоянию счёта (позиции, ордера, дельта, маржа, премия за сутки): текст содержит данные счёта —
+    в группах при SENSITIVE_COMMANDS_DM_ONLY не показывать."""
 
 
 @dataclass
@@ -82,6 +95,13 @@ class OrderRequest:
     sent: bool = False           # запрос на биржу ушёл (до этого сбой сети = ничего не изменилось)
     link_id: str | None = None   # orderLinkId — задаётся при отправке; по нему ищем ордер после сбоя сети
     ticker: dict | None = None   # тикер, полученный в prepare_order (для превью без повторного запроса)
+    premium: Decimal | None = None  # оценка премии ордера (заполняет prepare_order)
+    # тикер, только что полученный вызывающим (многоногая сделка: доли секунды назад) — prepare_order
+    # не запрашивает его снова; обычные ордера его не задают и проверяются по свежему
+    quote: dict | None = None
+    # лимиты портфеля проверены для всей многоногой сделки (check_strategy) — по ноге не проверять:
+    # иначе покупка, увеличивающая дельту, упрётся в лимит, хотя стратегия целиком в нём
+    portfolio_checked: bool = False
     # Заполняет prepare_order: строки для превью (оценка исполнения, состояние лимитов)
     info: list[str] = field(default_factory=list)
 
@@ -189,8 +209,8 @@ class OptionsClient:
             # таймаут/обрыв, HTTP 5xx, нечитаемый ответ (pybit оборачивает в FailedRequestError):
             # запрос мог дойти до биржи
             raise BybitNetworkError(f"{type(e).__name__}: {e}") from e
-        except Exception as e:  # локальная ошибка до отправки (нет ключей, неверные параметры)
-            raise BybitError(f"Ошибка запроса/конфигурации: {type(e).__name__}: {e}") from e
+        except Exception as e:  # локальная ошибка (нет ключей, неверные параметры, ответ не разобран)
+            raise BybitLocalError(f"Ошибка запроса/конфигурации: {type(e).__name__}: {e}") from e
 
     # ---------- справочник инструментов ----------
     def load_instruments(self, base: str, force: bool = False) -> list[Instrument]:
@@ -319,6 +339,25 @@ class OptionsClient:
         res = self._call(self.http.get_wallet_balance, accountType="UNIFIED")
         return res["list"][0] if res.get("list") else {}
 
+    def margin_mode(self) -> str:
+        """REGULAR_MARGIN | PORTFOLIO_MARGIN | ISOLATED_MARGIN (/v5/account/info)."""
+        return self._call(self.http.get_account_info).get("marginMode", "")
+
+    @staticmethod
+    def short_im_regular(req: "OrderRequest") -> Decimal:
+        """IM короткой ноги в REGULAR_MARGIN (сверено на demo): (mark + max(10%·индекс − OTM, 5%·индекс))·кол-во;
+        покрытие длинной ногой не учитывается."""
+        t = req.ticker or {}
+        mark, idx = _d(t.get("markPrice")), _d(t.get("indexPrice")) or _d(t.get("underlyingPrice"))
+        p = parse_option_symbol(req.symbol)
+        if p is None:
+            raise RiskError(f"{req.symbol}: не опцион — маржу оценить нельзя")
+        k, kind = p[2], p[3]
+        if idx <= 0 or mark <= 0:  # без индекса формула дала бы ~0 и пропустила бы нехватку маржи
+            raise PortfolioRiskError(f"{req.symbol}: нет индекса/mark в котировке — маржу оценить нельзя")
+        otm = max(k - idx, Decimal(0)) if kind == "C" else max(idx - k, Decimal(0))
+        return (mark + max(idx * Decimal("0.10") - otm, idx * Decimal("0.05"))) * req.qty
+
     def positions(self, base: str | None = None) -> list[dict]:
         bases = [base.upper()] if base else self.cfg.base_coins
         out = []
@@ -388,7 +427,7 @@ class OptionsClient:
         if limit > 0 and req.qty > limit and not req.reduce_only:
             raise RiskError(f"Превышен лимит MAX_QTY_{inst.base}={limit}")
 
-        t = self.ticker(inst.symbol)
+        t = req.quote if req.quote is not None else self.ticker(inst.symbol)
         req.ticker = t
         mark = _d(t.get("markPrice"))
         bid, ask = _d(t.get("bid1Price")), _d(t.get("ask1Price"))
@@ -422,9 +461,67 @@ class OptionsClient:
                 f"{self.cfg.max_order_premium_usdt}"
             )
 
-        if not req.reduce_only:
+        req.premium = premium
+        if not req.reduce_only and not req.portfolio_checked:
             self._check_portfolio(req, inst, t, premium, orders_cache)
         return req
+
+    def check_strategy(self, reqs: list[OrderRequest]) -> list[str]:
+        """Лимиты портфеля для многоногой сделки целиком (ноги — после prepare_order): позиция по символу,
+        дельта по активу (сумма ног), премия за сутки (сумма ног). Плюс: в символах ног не должно быть позиций
+        и открытых ордеров — иначе продажа ноги закроет чужую длинную, а откат reduce-only не пройдёт.
+        -> строки для превью."""
+        bases = sorted({self.resolve_symbol(r.symbol).base for r in reqs})
+        syms = {r.symbol for r in reqs}
+        orders = self.open_orders()
+        busy = sorted({p["symbol"] for b in bases for p in self.positions(b)
+                       if p["symbol"] in syms and _d(p.get("size")) != 0}
+                      | {o["symbol"] for o in orders if o["symbol"] in syms})
+        if busy:
+            raise PortfolioRiskError(f"По {', '.join(busy)} уже есть позиция или ордер — по сигналу не выставляю "
+                            "(откат reduce-only может не пройти). Закройте/отмените или выставьте вручную")
+        info = []
+        for b in bases:
+            legs = [r for r in reqs if r.symbol.startswith(b + "-")]
+            lim = self.cfg.max_position.get(b, Decimal(0))
+            if lim > 0:
+                for s in sorted({r.symbol for r in legs}):
+                    after = sum((SIDE_SIGN[r.side] * r.qty for r in legs if r.symbol == s), Decimal(0))
+                    if abs(after) > lim:
+                        raise PortfolioRiskError(f"Позиция {s} станет {after:+} — больше MAX_POSITION_{b}={lim}")
+            lim = self.cfg.max_net_delta.get(b, Decimal(0))
+            if lim > 0:
+                g = next((x for x in self.greeks(b) if x.get("baseCoin") == b), {})
+                before = _d(g.get("totalDelta"))
+                after = before + sum((SIDE_SIGN[r.side] * r.qty * _d((r.ticker or {}).get("delta")) for r in legs),
+                                     Decimal(0))
+                if abs(after) > lim and abs(after) > abs(before):
+                    raise PortfolioRiskError(f"Дельта опционов {b} станет {after:+.4f} (сделка целиком) — больше "
+                                    f"MAX_NET_DELTA_{b}={lim}")
+                info.append(f"Δ {b} после: {after:+.4f} (лимит {lim})")
+        # маржа: покупки идут первыми — нехватку на коротких лучше узнать до них, а не после (откат с потерей)
+        shorts = [r for r in reqs if r.side == "Sell"]
+        if shorts:
+            mode = self.margin_mode()
+            if mode == "REGULAR_MARGIN":
+                need = sum((self.short_im_regular(r) for r in shorts), Decimal(0)) + sum(
+                    (r.premium or Decimal(0) for r in reqs if r.side == "Buy"), Decimal(0))
+                avail = _d(self.balance().get("totalAvailableBalance"))
+                if need > avail:
+                    raise PortfolioRiskError(f"Маржи не хватит: нужно ~{need:.2f} USDT (короткие ноги в REGULAR_MARGIN — "
+                                    f"как непокрытые, плюс покупки), доступно {avail:.2f}")
+                info.append(f"маржа: ~{need:.2f} из доступных {avail:.2f}")
+            else:
+                info.append(f"маржа ({mode or '?'}) — считает биржа, заранее не проверена")
+        lim = self.cfg.max_daily_premium_usdt
+        if lim > 0:
+            used = self.daily_premium_used(open_orders=orders)
+            add = sum((r.premium or Decimal(0) for r in reqs), Decimal(0))
+            if used + add > lim:
+                raise PortfolioRiskError(f"Премия за сутки UTC: {used:.2f} + {add:.2f} (все ноги) > "
+                                f"MAX_DAILY_PREMIUM_USDT={lim}")
+            info.append(f"премия за сутки: {used + add:.2f} из {lim}")
+        return info
 
     def _check_limit_price(self, req: OrderRequest, mark: Decimal, bid: Decimal, ask: Decimal):
         """Опечатка в лимитной цене. Проверяется сама цена — неисполненный остаток будет стоять по ней.
@@ -616,7 +713,16 @@ class OptionsClient:
             else:
                 params["price"] = str(req.price)
         req.sent = True
-        return self._call(self.http.place_order, **params)
+        return self._sent_call(self.http.place_order, **params)
+
+    def _sent_call(self, fn, **params) -> dict:
+        """Запрос, изменяющий ордер: неразобранный ответ (BybitLocalError) — как сбой связи, исход неизвестен.
+        Все вызывающие (ручные ордера, изменение, многоногая сделка) тогда ищут ордер по orderLinkId / orderId,
+        а не считают «точно не на бирже»."""
+        try:
+            return self._call(fn, **params)
+        except BybitLocalError as e:
+            raise BybitNetworkError(f"ответ не разобран, исход неизвестен: {e}") from e
 
     # ---------- история (журнал сделок) ----------
     MAX_PAGES = 200  # защита от бесконечной пагинации
@@ -735,6 +841,9 @@ class OptionsClient:
     def cancel_order(self, symbol: str, order_id: str) -> dict:
         return self._call(self.http.cancel_order, category=CATEGORY, symbol=symbol, orderId=order_id)
 
+    def cancel_by_link(self, symbol: str, link_id: str) -> dict:
+        return self._call(self.http.cancel_order, category=CATEGORY, symbol=symbol, orderLinkId=link_id)
+
     def amend_request(self, symbol: str, order_id: str, qty: Decimal | None = None,
                       price: Decimal | None = None, iv: Decimal | None = None) -> tuple[OrderRequest, dict]:
         """Готовит изменение открытого ордера: новый запрос (проверенный лимитами) + исходный ордер.
@@ -789,7 +898,7 @@ class OptionsClient:
         else:
             params["price"] = str(req.price)
         req.sent = True
-        return self._call(self.http.amend_order, **params)
+        return self._sent_call(self.http.amend_order, **params)
 
     def cancel_all(self, base: str | None = None) -> dict:
         params = dict(category=CATEGORY)

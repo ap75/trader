@@ -318,6 +318,59 @@ class SignalJournal:
              ps.half_ms, ps.n, s["id"])).rowcount == 1
 
     # ---------- статистика ----------
+    def get(self, signal_id: int) -> dict | None:
+        """Запись сигнала по номеру (кнопка «Выставить»): ноги — списком словарей."""
+        conn = self._db(SHOW_DB_TIMEOUT_S)
+        try:
+            r = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+        finally:
+            conn.close()
+        if r is None:
+            return None
+        d = dict(r)
+        d["legs"] = json.loads(d["legs"])
+        return d
+
+    def executions(self, signal_id: int) -> list[dict]:
+        """Прошлые исполнения сигнала кнопкой «Выставить» (превью предупреждает о повторе)."""
+        conn = self._db(SHOW_DB_TIMEOUT_S)
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT ts, user_name, status, qty FROM signal_executions WHERE signal_id = ? ORDER BY ts",
+                (signal_id,))]
+        finally:
+            conn.close()
+
+    def record_execution(self, signal_id: int, res, user_id: int | None, user_name: str, chat_id: int | None,
+                         now_ms: int | None = None) -> int:
+        """Исполнение кнопкой «Выставить»: статус, расчётная и фактическая премия, ноги (multileg.ExecResult)."""
+        def clean(d: dict) -> dict:  # NaN/Infinity -> null на любом уровне (allow_nan=False не уронит запись)
+            return {k: _clean(x) for k, x in d.items()}
+
+        def _clean(x):
+            if isinstance(x, dict):
+                return clean(x)
+            if isinstance(x, list):
+                return [_clean(t) for t in x]
+            return _inf_none(x)
+
+        def legs(fs):
+            return _json([clean(dict(leg=f.leg, symbol=f.symbol, side=f.side, qty=float(f.qty), filled=float(f.filled),
+                                     avg=float(f.avg), plan=f.plan_price, attempts=f.attempts, error=f.error,
+                                     gap_ms=f.gap_ms, tries=f.tries)) for f in fs])
+        conn = self._db()
+        try:
+            with conn:
+                cur = conn.execute(
+                    "INSERT INTO signal_executions (signal_id, ts, user_id, user_name, chat_id, status, planned_qty, "
+                    "qty, planned_net, actual_net, cash, legs, unwind, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (signal_id, now_ms if now_ms is not None else int(time.time() * 1000), user_id, user_name,
+                     chat_id, res.status, float(res.planned_qty), float(res.qty), res.planned_net, res.actual_net,
+                     res.cash, legs(res.legs), legs(res.unwind), res.note))
+                return cur.lastrowid
+        finally:
+            conn.close()
+
     def rows(self, start_ms: int, end_ms: int, base: str | None = None) -> list[dict]:
         conn = self._db()
         try:

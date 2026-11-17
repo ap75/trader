@@ -27,8 +27,9 @@
 Исполнения: приватный WebSocket Bybit (optbot.ws) — сообщение о каждой сделке по опционам
 (включая сделанные вне бота) во все разрешённые группы и трейдерам в личку.
 
-Сигналы: /signals [BASE] — рекомендация стратегии с ограниченным риском (optbot.signals), без кнопки
-«Выставить»; каждая выдача пишется в журнал сигналов (optbot.sigjournal), итоги после экспирации — задачей
+Сигналы: /signals [BASE] — рекомендация стратегии с ограниченным риском (optbot.signals); кнопка
+«Выставить» (трейдер) — превью ног и подтверждение, исполнение — optbot.multileg (сначала покупки, IOC от ask/bid,
+неполное — срочно администратору); каждая выдача пишется в журнал сигналов (optbot.sigjournal), итоги после экспирации — задачей
 с периодом JOURNAL_SYNC_MIN со сводкой в группы, статистика — /signals_stats; кнопка «Обновить» пересчитывает
 в том же сообщении (не чаще SIGNAL_CACHE_TTL сек на актив).
 
@@ -73,10 +74,12 @@ from telegram.ext import (
     ContextTypes, MessageHandler, TypeHandler, filters,
 )
 
-from .bybit_client import LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest, RiskError, _d
+from .bybit_client import (LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest,
+                           PortfolioRiskError, RiskError, _d)
 from .collector import Collector, seconds_to_next_slot
 from .journal import Journal, fmt_report, parse_period
-from .signals import Signal, SignalEngine, fmt_signal, fmt_signal_brief, signal_key, strategy_name
+from .multileg import MultiLegExecutor, SymbolGuard, fmt_result, leg_side, precheck, quote_mid
+from .signals import STRATEGIES, Signal, SignalEngine, fmt_signal, fmt_signal_brief, signal_key, strategy_name
 from .sigjournal import SETTLED_PER_MESSAGE, SignalJournal, compute_stats, fmt_settled, fmt_stats
 from .config import ROOT, Settings, settings
 from .ws import ExecutionWatcher
@@ -93,6 +96,8 @@ CHAIN_N = 6       # страйков от ATM по умолчанию
 TOKEN_TTL = 1800  # сек жизни кнопок в /orders и /pos
 LIST_MAX = 20     # /orders и /pos: строк (и кнопок) на странице — длина сообщения Telegram ≤ 4096; дальше ◀ ▶
 ANNOUNCE_GIVEUP_MS = 86_400_000  # итог не доставлен никому столько после расчёта — больше не отправлять
+EXEC_CARD_MAX_AGE_S = 1800   # «Выставить» на карточке старше 30 мин — отказ: страйки подбирались под другой рынок
+EXEC_MIN_LEFT_MS = 3_600_000  # «Выставить»: до экспирации меньше часа — не выставлять (ликвидность, поставка)
 SIGNAL_CACHE_TTL = 30  # сек: /signals и «Обновить» по тому же активу чаще — без нового расчёта
 TG_MAX_TEXT = 4096       # длина сообщения Telegram (после разметки)
 AUTO_RETRY_S = 3600     # сообщение о смене никому не дошло — следующая попытка не раньше
@@ -126,7 +131,7 @@ HELP = """Просмотр:
 /exp [BASE] — экспирации (кнопками)
 /chain BASE [EXP] [N] — цепочка
 /t SYMBOL — котировка и греки
-/signals [BASE] — сигнал: стратегия, ноги, риск
+/signals [BASE] — сигнал: стратегия, ноги, риск (кнопка «Выставить» — трейдеру)
 /signals_stats [BASE] [ПЕРИОД] [csv] — как сработали сигналы (по умолчанию 30d)
 /bal /greeks [BASE] — счёт*
 /pos [BASE] — позиции (кнопки «Закрыть»)*
@@ -212,6 +217,23 @@ class Pending:
     created: float
     lookup: Callable[[], str] | None = None  # после сбоя сети: узнать, что на самом деле на бирже
     order_id: str | None = None       # действие над существующим ордером — выполняется под его блокировкой
+    release: Callable[[], None] | None = None  # после выяснения статуса: освободить символ (ManualHold)
+
+
+class ManualHold:
+    """Символ ручного ордера, оставленный занятым после сбоя связи на отправке: ордер мог дойти до биржи,
+    пока статус не выяснен — сделка по сигналу с этим символом не начнётся (иначе ордер смешается с её ногой)."""
+
+    def __init__(self, guard: SymbolGuard):
+        self.guard, self.symbol = guard, None
+
+    def keep(self, symbol: str) -> None:
+        self.symbol = symbol
+
+    def release(self) -> None:
+        if self.symbol is not None:
+            self.guard.release_manual(self.symbol)
+            self.symbol = None
 
 
 def guarded(level: str, sensitive: bool = False):
@@ -278,6 +300,12 @@ class OptionsBot:
         self._auto_lock = asyncio.Lock()
         self._auto_task: asyncio.Task | None = None  # проверка смены, запущенная сборщиком
         self._auto_gen = 0  # растёт при пропуске проверки: опоздавшая проверка своих итогов не применяет
+        # одна сделка по сигналу за раз (два подтверждения не пройдут «символ свободен» одновременно, общий
+        # страйк двух сигналов не перемешает ноги) и не по символам, где летит ручной ордер — и наоборот
+        self._guard = SymbolGuard()
+        # (чат, id сигнала) -> (когда последний раз показан в этом чате, в т.ч. «Обновить»; цены ног на карточке):
+        # превью сравнивает с тем, что видели в этом чате, а не с первой выдачей в журнале (могла быть дни назад)
+        self._card_shown: dict[tuple[int, int], tuple[float, dict, float | None]] = {}  # + макс. риск карточки
 
     # ---------- доступ ----------
     def who(self, update: Update) -> Who:
@@ -566,7 +594,15 @@ class OptionsBot:
         sig, cached = await self._signal(base)
         await self._record_signal(sig, "bot", w.user_id, w.name, w.chat_id)
         base = sig.metrics.base
-        return pre(fmt_signal(sig, self.cfg.env)), kb([[("🔄 Обновить", f"sig:{base}")]]), cached
+        row = [("🔄 Обновить", f"sig:{base}")]
+        if sig.id and sig.legs:  # в журнале — можно выставить (права проверяются при нажатии)
+            row.append(("📝 Выставить", f"ex:{sig.id}"))
+            # «Обновить» с тем же итогом Telegram не правит (edit_date старый) — свежесть помним сами
+            now = time.time()
+            self._card_shown = {k: v for k, v in self._card_shown.items() if now - v[0] <= EXEC_CARD_MAX_AGE_S}
+            prices = {(l.symbol, leg_side(l.side)): l.price for l in sig.legs}
+            self._card_shown[(w.chat_id, sig.id)] = (now, prices, sig.profile.max_loss if sig.profile else None)
+        return pre(fmt_signal(sig, self.cfg.env)), kb([row]), cached
 
     @guarded("view")
     async def cmd_signals(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
@@ -890,9 +926,10 @@ class OptionsBot:
     # ---------- торговля ----------
     async def _ask_confirm(self, update: Update, context, w: Who, text: str, event: str,
                            action: Callable[[], dict], done: Callable[[dict], str], q=None,
-                           lookup: Callable[[], str] | None = None, order_id: str | None = None):
+                           lookup: Callable[[], str] | None = None, order_id: str | None = None,
+                           release: Callable[[], None] | None = None):
         pid = secrets.token_hex(6)
-        self.pending[pid] = Pending(text, action, done, event, w, time.monotonic(), lookup, order_id)
+        self.pending[pid] = Pending(text, action, done, event, w, time.monotonic(), lookup, order_id, release)
         self.audit(f"{event}.request", w, pid=pid, order=text.replace("\n", " | "))
         who_line = f"\nИнициатор: {w.name}" if w.is_group else ""
         body = pre(f"{env_banner(self.cfg.env)}\n{text}{who_line}\n\n"
@@ -936,6 +973,7 @@ class OptionsBot:
 
     async def _confirm_order(self, update: Update, context, w: Who, req: OrderRequest, event: str):
         req = await self.call(self.c.prepare_order, req)
+        hold = ManualHold(self._guard)
 
         def lookup() -> str:
             return self.c.order_status_after_failure(req)
@@ -945,7 +983,9 @@ class OptionsBot:
             if not req.link_id:
                 req.link_id = self.journal.register_order(w.user_id, w.name, w.chat_id)
             try:
-                return self.c.place_order(req)
+                # идёт сделка по сигналу с этим символом: ручной ордер смешался бы с её ногами (и откатом).
+                # Пометка «ручной в отправке» — атомарно с проверкой: сделка по символу не начнётся, пока он летит
+                return self._guarded_send(req.symbol, lambda: self.c.place_order(req), req, hold)
             except Exception as e:
                 if not req.sent or (isinstance(e, BybitError) and not isinstance(e, BybitNetworkError)):
                     self.journal.forget_order(req.link_id)  # точно не на бирже — не оставлять «призрак»
@@ -956,7 +996,7 @@ class OptionsBot:
             update, context, w, fmt_order_preview(req, req.ticker), event,
             action=place,
             done=lambda r: f"✅ Ордер принят\n{req.describe()}\norderId {r.get('orderId')}",
-            lookup=lookup,
+            lookup=lookup, release=hold.release,
         )
 
     @guarded("trade")
@@ -987,6 +1027,23 @@ class OptionsBot:
         qty = to_dec(a[3]) if len(a) == 4 else None
         await self._confirm_amend(update, context, w, a[0], a[1], qty, spec.get("price"), spec.get("iv"))
 
+    def _guarded_send(self, symbol: str, send: Callable[[], dict], req: OrderRequest | None = None,
+                      hold: ManualHold | None = None) -> dict:
+        """Ручной ордер/изменение по символу: не во время сделки по сигналу с ним (и она не начнётся, пока летит).
+        Сбой связи после отправки — символ остаётся занятым до выяснения статуса (hold.release)."""
+        self._guard.claim_manual(symbol)
+        kept = False
+        try:
+            return send()
+        except BybitNetworkError:
+            if hold is not None and req is not None and req.sent:
+                hold.keep(symbol)
+                kept = True
+            raise
+        finally:
+            if not kept:
+                self._guard.release_manual(symbol)
+
     async def _confirm_amend(self, update: Update, context, w: Who, symbol: str, order_id: str,
                              qty, price, iv, q=None):
         req, orig = await self.call(self.c.amend_request, symbol, order_id, qty, price, iv)
@@ -995,11 +1052,12 @@ class OptionsBot:
         def lookup() -> str:
             return self.c.amend_status_after_failure(oid, req)
 
+        hold = ManualHold(self._guard)
         await self._ask_confirm(
             update, context, w, fmt_amend_preview(req, orig, req.ticker), "amend",
-            action=lambda: self.c.amend_order(oid, req),
+            action=lambda: self._guarded_send(req.symbol, lambda: self.c.amend_order(oid, req), req, hold),
             done=lambda r: f"✅ Ордер изменён\n{req.describe()}\norderId {r.get('orderId')}",
-            q=q, lookup=lookup, order_id=oid,
+            q=q, lookup=lookup, order_id=oid, release=hold.release,
         )
 
     async def _amend_menu(self, update: Update, w: Who, symbol: str, order_id: str):
@@ -1077,9 +1135,7 @@ class OptionsBot:
         d = self._tok_get(tok)
         price = None
         if how == "mid":
-            t = await self.call(self.c.ticker, d["symbol"])
-            bid, ask = _d(t.get("bid1Price")), _d(t.get("ask1Price"))
-            price = (bid + ask) / 2 if bid and ask else _d(t.get("markPrice"))
+            price = quote_mid(await self.call(self.c.ticker, d["symbol"]))[2]
         req = await self.call(self.c.close_position_request, d["symbol"], price)
         await self._confirm_order(update, context, w, req, "close")
 
@@ -1147,6 +1203,15 @@ class OptionsBot:
         self.audit(f"{p.event}.confirm", w, pid=pid)
         await q.answer("Отправляю…")
         await self.edit(q, pre(f"{p.text}\n\n⏳ Отправка…"))
+        if p.event == "signal_exec":
+            # многоногая сделка — до минуты: фоновой задачей, иначе бот (обновления — по одному) не отвечает никому,
+            # в т.ч. на срочную отмену/закрытие. Пересечения по символам — SymbolGuard
+            context.application.create_task(self._run_confirmed(q, context, w, pid, p))
+            return
+        await self._run_confirmed(q, context, w, pid, p)
+
+    async def _run_confirmed(self, q, context, w: Who, pid: str, p: Pending):
+        """Выполнить подтверждённое действие и показать итог (в том же сообщении)."""
         try:
             # блокировка — только на проверку и отправку: выяснение статуса после сбоя (до 1–2 мин)
             # не должно задерживать, например, срочную отмену этого ордера другим трейдером
@@ -1154,23 +1219,27 @@ class OptionsBot:
                 res = await self.call(p.action)
         except BybitNetworkError as e:
             # запрос мог дойти до биржи — не говорим «ошибка», выясняем фактическое состояние
-            self.audit(f"{p.event}.unknown", w, pid=pid, err=str(e))
-            try:  # промежуточное сообщение не должно мешать выяснению статуса
-                await self.edit(q, pre(f"{p.text}\n\n⚠️ Сбой связи с биржей: {e}\n"
-                                       f"⏳ Выясняю статус (обычно ~{int(sum(LOOKUP_DELAYS))} с, при плохой связи "
-                                       "до 1–2 мин)… Не повторяйте команду."))
-            except TelegramError:
-                log.warning("Не удалось показать «Выясняю статус…»", exc_info=True)
-            status = "не удалось выяснить"
-            if p.lookup:
-                try:
-                    status = await self.call(p.lookup)
-                except Exception as e2:
-                    status = f"не удалось выяснить ({e2})"
-            self.audit(f"{p.event}.lookup", w, pid=pid, status=status)
-            await self.edit(q, pre(f"{p.text}\n\n⚠️ Сбой связи с биржей: {e}\nСтатус: {status}\n"
-                                   "Не повторяйте, пока не проверите /orders и /pos."))
-            return
+            try:
+                self.audit(f"{p.event}.unknown", w, pid=pid, err=str(e))
+                try:  # промежуточное сообщение не должно мешать выяснению статуса
+                    await self.edit(q, pre(f"{p.text}\n\n⚠️ Сбой связи с биржей: {e}\n"
+                                           f"⏳ Выясняю статус (обычно ~{int(sum(LOOKUP_DELAYS))} с, при плохой связи "
+                                           "до 1–2 мин)… Не повторяйте команду."))
+                except TelegramError:
+                    log.warning("Не удалось показать «Выясняю статус…»", exc_info=True)
+                status = "не удалось выяснить"
+                if p.lookup:
+                    try:
+                        status = await self.call(p.lookup)
+                    except Exception as e2:
+                        status = f"не удалось выяснить ({e2})"
+                self.audit(f"{p.event}.lookup", w, pid=pid, status=status)
+                await self.edit(q, pre(f"{p.text}\n\n⚠️ Сбой связи с биржей: {e}\nСтатус: {status}\n"
+                                       "Не повторяйте, пока не проверите /orders и /pos."))
+                return
+            finally:
+                if p.release:  # статус выяснен (или не удалось) — символ снова свободен
+                    p.release()
         except (BybitError, RiskError, ValueError) as e:
             self.audit(f"{p.event}.error", w, pid=pid, err=str(e))
             await self.edit(q, pre(f"{p.text}\n\n⛔ Ошибка: {e}"))
@@ -1184,14 +1253,21 @@ class OptionsBot:
         result = p.done(res)
         self.audit(f"{p.event}.done", w, pid=pid, order_id=res.get("orderId"),
                    link_id=res.get("orderLinkId"), n=len(res.get("list", [])) or None)
-        await self.edit(q, pre(f"{p.text}\n\n{result}"))
+        try:
+            await self.edit(q, pre(f"{p.text}\n\n{result}"))
+        except TelegramError:  # сообщение удалено / сбой Telegram — итог отдельным сообщением
+            log.warning("Не удалось показать итог %s", p.event, exc_info=True)
+            try:
+                await context.bot.send_message(w.chat_id, pre(result), parse_mode=ParseMode.HTML)
+            except TelegramError:
+                log.warning("Итог %s не доставлен", p.event, exc_info=True)
         self.notify_bg(context, result, w)
 
     @guarded("any")
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
         q = update.callback_query
         kind, _, rest = (q.data or "").partition(":")
-        need_trade = kind in ("ok", "no", "cx", "am", "ap", "cp")
+        need_trade = kind in ("ok", "no", "cx", "am", "ap", "cp", "ex")
         if not (w.can_trade if need_trade else w.can_view):
             log.warning("Отказ: кнопка %s user=%s chat=%s", kind, w.user_id, w.chat_id)
             if need_trade:
@@ -1261,6 +1337,122 @@ class OptionsBot:
         elif kind == "cp":  # cp:TOKEN:mkt|mid — закрыть позицию из /pos
             tok, _, how = rest.partition(":")
             await self._close_button(update, context, w, tok, how)
+        elif kind == "ex":  # ex:SIGNAL_ID — «Выставить» из карточки сигнала
+            await self._exec_signal(update, context, w, int(rest))
+
+    # ---------- «Выставить» сигнал (этап 5) ----------
+    async def _exec_signal(self, update: Update, context, w: Who, sid: int):
+        """Превью многоногой сделки по записи журнала (ноги и кол-во — как в сигнале; цены — свежие) и
+        подтверждение. Исполнение — MultiLegExecutor: сначала покупки, потом продажи, IOC от ask/bid."""
+        msg = update.callback_query.message
+        shown = getattr(msg, "edit_date", None) or getattr(msg, "date", None)  # «Обновить» правит то же сообщение
+        # тот же id = та же сделка (ноги) — её снова показали кому-то: рекомендация актуальна, карточка свежая
+        card_ts, card_px, card_risk = self._card_shown.get((w.chat_id, sid), (0, {}, None))
+        seen = max(shown.timestamp() if shown is not None else 0, card_ts)
+        if time.time() - seen > EXEC_CARD_MAX_AGE_S:
+            raise ValueError(f"Карточке больше {EXEC_CARD_MAX_AGE_S // 60} мин — нажмите «Обновить» и выставляйте "
+                             "по свежей")
+        row = await self.call(self.sigjournal.get, sid)
+        now_ms = int(time.time() * 1000)
+        if row is None:
+            raise ValueError(f"Сигнал #{sid} не найден в журнале")
+        if row["settled_ms"] is not None or (row["expiry_ms"] or 0) <= now_ms + EXEC_MIN_LEFT_MS:
+            raise ValueError(f"Сигнал #{sid} устарел (экспирация {row['expiry']} прошла или ближе часа) — "
+                             "запросите свежий /signals")
+        legs = [(d["symbol"], leg_side(d["side"]), _d(str(d["qty"])), float(d["price"]))
+                for d in row["legs"]]
+        hide_account = w.is_group and self.cfg.sensitive_commands_dm_only  # баланс, маржа, дельта — как /bal
+
+        def checked(legs: list[tuple]) -> tuple:
+            """precheck; в группе отказ лимитов — без цифр счёта. -> котировки, строки лимитов и ноги с кол-вом
+            после округления к шагу биржи (их и исполнять)."""
+            try:
+                quotes, limits = precheck(self.c, self.cfg, legs)
+            except PortfolioRiskError:  # текст — с данными счёта (символы позиций, баланс, дельта)
+                if hide_account:
+                    raise RiskError("Отказ по состоянию счёта (позиции/ордера, маржа, дельта или премия за сутки) — "
+                                    "подробности: в личке с ботом /signals BASE и «Выставить» там") from None
+                raise
+            qty = {(q.req.symbol, q.req.side): q.req.qty for q in quotes}
+            return quotes, limits, [(s, side, qty.get((s, side), q), p) for s, side, q, p in legs]
+
+        # все проверки заранее: биржа и цена — по ноге (худшая цена попыток), портфель — по сделке целиком
+        quotes, limits, legs = await self.call(checked, legs)
+        lines = [f"📝 Выставить сигнал #{sid}: {STRATEGIES.get(row['strategy'], row['strategy'])} · {row['expiry']}",
+                 f"Кол-во: {row['qty']:g} · ноги по порядку (сначала покупки):"]
+        mid_net = 0.0
+        if card_px:  # цены карточки, которую видели (а не первой выдачи сигнала)
+            legs = [(s, side, q, card_px.get((s, side), p)) for s, side, q, p in legs]
+        plans = {(s, side): p for s, side, _, p in legs}
+        for lq in quotes:
+            sym, side, qty, bid, ask, mid = lq.req.symbol, lq.req.side, lq.req.qty, lq.bid, lq.ask, lq.mid
+            plan = plans.get((sym, side), 0.0)
+            mid_net += float(mid * qty) * (1 if side == "Sell" else -1)
+            lines.append(f" {side.upper():4} {qty} {short_symbol(sym):<22} bid {px(bid)} / ask {px(ask)} "
+                         f"· mid {px(mid)} (в сигнале {px(plan)})")
+        plan_net = sum(p * float(q) * (1 if side == "Sell" else -1) for _, side, q, p in legs)
+        lines.append(f"{'Кредит' if mid_net >= 0 else 'Дебет'} по mid сейчас: {abs(mid_net):.2f} USDT "
+                     f"(в сигнале {abs(plan_net):.2f}) · макс. риск по сигналу "
+                     f"{card_risk if card_risk is not None else (row['max_loss'] or 0):.2f}")
+        if limits and hide_account:
+            lines.append("Лимиты (сделка целиком): проверены (подробности — в личке)")
+        elif limits:
+            lines.append("Лимиты (сделка целиком): " + "; ".join(limits))
+        prev = await self.call(self.sigjournal.executions, sid)
+        if prev:
+            done_qty = sum(e["qty"] or 0 for e in prev)
+            # открытая позиция по ногам сюда не дошла бы (precheck: символ занят) — значит, прошлые закрыты
+            lines.append(f"⚠️ Уже выставлялся {len(prev)} раз (исполнено {done_qty:g}) — откроется новая позиция")
+        passive = self.cfg.passive_first_leg_seconds
+        if passive > 0 and quotes and quotes[0].req.side == "Buy":
+            lines.append(f"Первая покупка — сначала PostOnly по mid на {passive:g} с, остаток — IOC")
+        else:
+            passive = 0
+        lines.append(f"Каждая нога — IOC от ask/bid, не дальше mid ±{self.cfg.multileg_slippage_pct:g}%, "
+                     f"{self.cfg.multileg_steps} попыт.; не собралось — исполненное закроется reduce-only")
+        est = passive + len(legs) * self.cfg.multileg_steps * (1.2 + self.cfg.multileg_step_delay_s)
+        lines.append(f"Обычно до ~{est:.0f} с; при задержках биржи и закрытии лишнего — дольше. В это время другие "
+                     "сделки по сигналам и ручные ордера по этим символам отклоняются")
+
+        def run() -> dict:
+            self._guard.claim_exec({s for s, *_ in legs})
+            try:
+                res = execute()
+            finally:
+                self._guard.release_exec()  # до записи в журнал: занятая БД не держит символы закрытыми
+            try:
+                self.sigjournal.record_execution(sid, res, w.user_id, w.name, w.chat_id)
+            except Exception:
+                log.exception("Журнал сигналов: исполнение #%s не записано", sid)
+            return {"result": res}
+
+        def execute():
+            # портфель мог измениться за время подтверждения (другие сделки) — ещё раз, по свежим данным.
+            # Ничего ещё не отправлено: сбой связи здесь — обычная ошибка, а не «исход неизвестен»
+            if row["expiry_ms"] <= time.time() * 1000 + EXEC_MIN_LEFT_MS:  # за время подтверждения
+                raise ValueError(f"До экспирации {row['expiry']} меньше часа — не выставляю")
+            try:
+                _, _, fresh = checked(legs)  # исполняем то, что проверено сейчас (кол-во после округления)
+            except BybitNetworkError as e:
+                raise BybitError(f"сбой связи при проверке, ордера не отправлялись: {e}") from e
+            ex = MultiLegExecutor(self.c, self.cfg, link=lambda leg: self.journal.register_signal_order(
+                sid, leg, w.user_id, w.name, w.chat_id), forget=self.journal.forget_order)
+            return ex.execute(fresh)
+
+        def done(r: dict) -> str:
+            res = r["result"]
+            try:
+                text = fmt_result(res, sid)
+            except Exception as e:  # итог не сформирован — срочное админу всё равно уходит
+                log.exception("Итог сделки по сигналу #%s не сформирован", sid)
+                text = (f"⚠️ Итог сделки по сигналу #{sid} не сформирован ({type(e).__name__}): статус {res.status}, "
+                        f"осталось: {'; '.join(res.left) or '—'} — проверьте /pos и /orders")
+            if res.alert:  # неполное исполнение / осталась позиция / исход неизвестен — администратору сразу
+                context.application.create_task(self._send_admins(pre(
+                    f"{env_banner(self.cfg.env)}\n🚨 Многоногий ордер исполнен не полностью ({w.name})\n\n{text}")))
+            return text
+
+        await self._ask_confirm(update, context, w, "\n".join(lines), "signal_exec", action=run, done=done)
 
     # ---------- сборщик рыночных данных ----------
     async def _collect_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:

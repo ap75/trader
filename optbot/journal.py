@@ -34,7 +34,7 @@ from . import db
 from .bybit_client import ACTIVE_STATUSES, parse_option_symbol, option_intrinsic
 from .config import Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, short_symbol, utc
-from .linkid import new_link_id, parse_link_id, user_hash
+from .linkid import new_link_id, parse_link_id, signal_link_id, user_hash
 
 if TYPE_CHECKING:
     from .bybit_client import OptionsClient
@@ -242,6 +242,33 @@ class Journal:
             except Exception:
                 log.exception("Журнал: не удалось записать ордер %s (ордер всё равно отправляется)", link)
         return link
+
+    def register_signal_order(self, signal_id: int, leg: int, user_id: int | None, user_name: str = "",
+                              chat_id: int | None = None) -> str:
+        """orderLinkId ноги сигнала (`sig<ID>-l<N>-u<хеш>-<попытка>`) и запись «кто выставил» — до отправки.
+        Попытка — следующая по журналу для (сигнал, нога): orderLinkId уникален и между нажатиями «Выставить»
+        (Bybit повтор отвергает). Журнал недоступен — номер из времени (тоже уникален)."""
+        tag = self.tag(user_id)
+        now = int(time.time() * 1000)
+        if self.enabled:
+            try:
+                with self._db(timeout=2) as c:
+                    c.execute("BEGIN IMMEDIATE")
+                    n = c.execute("SELECT COUNT(*) FROM order_links WHERE signal_id = ? AND leg = ?",
+                                  (signal_id, leg)).fetchone()[0] + 1
+                    link = signal_link_id(signal_id, leg, tag, n)
+                    # удалённая запись (отказ до отправки) делает пропуск в номерах — следующий свободный
+                    while c.execute("SELECT 1 FROM order_links WHERE link_id = ?", (link,)).fetchone():
+                        n += 1
+                        link = signal_link_id(signal_id, leg, tag, n)
+                    c.execute("INSERT INTO order_links (link_id, source, signal_id, leg, user_id, user_name, "
+                              "user_hash, chat_id, created_ms) VALUES (?,?,?,?,?,?,?,?,?)",
+                              (link, "signal", signal_id, leg, user_id, user_name, tag, chat_id, now))
+                    return link
+            except Exception:
+                log.exception("Журнал: не удалось записать ордер сигнала #%s (ордер всё равно отправляется)",
+                              signal_id)
+        return signal_link_id(signal_id, leg, tag, now % 10**12)  # мс: повтор — через ~31 год
 
     def describe_many(self, link_ids: list[str | None]) -> dict[str | None, str]:
         """describe() для нескольких ордеров одним запросом к БД (уведомления о пачке исполнений, сводка сверки)."""

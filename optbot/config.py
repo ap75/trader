@@ -199,6 +199,14 @@ class Settings:
     # секрет для хеша пользователя в orderLinkId; пусто — производный от BYBIT_API_SECRET
     journal_secret: str = os.getenv("JOURNAL_SECRET", "").strip()
 
+    # Многоногая сделка (этап 5, кнопка «Выставить»): каждая нога — лимитный IOC, первая попытка по ask/bid,
+    # дальше шагами к mid ± MULTILEG_SLIPPAGE_PCT; сначала покупки, потом продажи (без непокрытых коротких)
+    multileg_steps: int = _int_in("MULTILEG_STEPS", 3, 1, 10)
+    multileg_slippage_pct: float = _float_in("MULTILEG_SLIPPAGE_PCT", 10, 0, 50)
+    multileg_step_delay_s: float = _float_in("MULTILEG_STEP_DELAY_S", 1, 0, 30)
+    # первая нога (покупка) сначала PostOnly по mid столько секунд; 0 — выключено (сразу IOC по ask)
+    passive_first_leg_seconds: float = _float_in("PASSIVE_FIRST_LEG_SECONDS", 0, 0, 120)
+
     # Сигналы (этап 3): пороги SIG_*
     sig: SignalSettings = _SIG_DEFAULT  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
 

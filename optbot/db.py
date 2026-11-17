@@ -227,6 +227,31 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # 4: исполнение сигналов кнопкой «Выставить» (этап 5) — расчётная и фактическая цена по ногам
+    [
+        """
+        CREATE TABLE signal_executions (
+            id          INTEGER PRIMARY KEY,
+            signal_id   INTEGER NOT NULL,
+            ts          INTEGER NOT NULL,
+            user_id     INTEGER,
+            user_name   TEXT,
+            chat_id     INTEGER,
+            status      TEXT NOT NULL,     -- complete | partial | none | unwound | stuck | unknown
+            planned_qty REAL,
+            qty         REAL,              -- исполнено стратегией
+            planned_net REAL,              -- премия по ценам сигнала на исполненное кол-во (+ кредит)
+            actual_net  REAL,              -- фактическая по средним ценам ног
+            cash        REAL,              -- всё движение премии, с закрытием лишнего (cash − actual_net — откат)
+            legs        TEXT,              -- JSON: нога, сторона, нужно, исполнено, средняя, попыток, ошибка
+            unwind      TEXT,              -- JSON: закрытие лишнего
+            note        TEXT
+        )
+        """,
+        """
+        CREATE INDEX signal_executions_signal ON signal_executions (signal_id)
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе

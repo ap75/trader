@@ -6,7 +6,7 @@ import pytest
 import requests
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 
-from optbot.bybit_client import BybitError, BybitNetworkError, OrderRequest, RiskError
+from optbot.bybit_client import BybitError, BybitLocalError, BybitNetworkError, OrderRequest, RiskError
 from tests.helpers import with_cfg
 from tests.fakes import BTC_CALL, BTC_PUT
 
@@ -24,8 +24,8 @@ def bybit_reject(code):
     (requests.exceptions.ReadTimeout("timeout"), BybitNetworkError),
     (requests.exceptions.ConnectionError("down"), BybitNetworkError),
     (FailedRequestError("req", "Retries exceeded", 500, "0", {}), BybitNetworkError),
-    (PermissionError("no api key"), BybitError),              # локальная ошибка — не «сбой связи»
-    (TypeError("bad kwarg"), BybitError),
+    (PermissionError("no api key"), BybitLocalError),              # локальная ошибка — не «сбой связи»
+    (TypeError("bad kwarg"), BybitLocalError),
 ])
 def test_call_error_mapping(client, exc, cls):
     def boom(**kw):

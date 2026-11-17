@@ -223,6 +223,55 @@ def test_network_failure_after_send_reports_status(b, tg):
     assert "Сбой связи" in final and "ордер НА БИРЖЕ" in final and "Не повторяйте" in final
 
 
+def test_unparsed_response_after_send_looked_up_not_forgotten(b, tg):
+    """Ответ на отправку не разобран (ордер ушёл) — как сбой связи: статус по orderLinkId, запись журнала цела."""
+    run(b.cmd_buy(tg.upd(TRADER), tg.ctx(BTC_PUT, "0.01", "20")))
+    b.c.http.after["place_order"] = KeyError("result")
+    run(b.on_callback(tg.upd(TRADER, data=f"ok:{pid_from(tg)}"), tg.ctx()))
+    final = tg.last("edit")
+    assert "ордер НА БИРЖЕ" in final and "Не повторяйте" in final
+    link = b.c.http.called("place_order")[0]["orderLinkId"]
+    conn = __import__("optbot.db", fromlist=["db"]).connect(b.cfg.db_file)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM order_links WHERE link_id = ?", (link,)).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_symbol_held_until_status_lookup_after_network_error(b, tg):
+    """Сбой связи после отправки ручного ордера — символ занят до выяснения статуса: сделка по сигналу с ним
+    в это время не начнётся (ордер мог дойти до биржи); после выяснения — свободен."""
+    run(b.cmd_buy(tg.upd(TRADER), tg.ctx(BTC_PUT, "0.01", "20")))
+    b.c.http.after["place_order"] = requests.exceptions.ReadTimeout("timeout")
+    seen = {}
+
+    def lookup(req, *a, **kw):
+        seen["held"] = dict(b._guard._manual)
+        try:
+            b._guard.claim_exec({req.symbol})
+        except ValueError as e:
+            seen["refused"] = str(e)
+        return "найден"
+    b.c.order_status_after_failure = lookup
+    run(b.on_callback(tg.upd(TRADER, data=f"ok:{pid_from(tg)}"), tg.ctx()))
+    assert seen["held"] and "ручной ордер" in seen["refused"]
+    assert not b._guard.busy                                         # после выяснения — свободен
+
+
+def test_symbol_released_on_network_error_before_send(b, tg):
+    run(b.cmd_buy(tg.upd(TRADER), tg.ctx(BTC_PUT, "0.01", "20")))
+    real = b.c.place_order
+
+    from optbot.bybit_client import BybitNetworkError
+
+    def fail(req):
+        raise BybitNetworkError("до отправки")                       # req.sent не выставлен
+    b.c.place_order = fail
+    run(b.on_callback(tg.upd(TRADER, data=f"ok:{pid_from(tg)}"), tg.ctx()))
+    b.c.place_order = real
+    assert "Сбой связи" in tg.last("edit") and not b._guard.busy
+
+
 def test_unexpected_error_does_not_hang(b, tg):
     run(b.cmd_buy(tg.upd(TRADER), tg.ctx(BTC_PUT, "0.01", "20")))
     b.c.place_order = lambda req: 1 / 0  # сбой в коде бота/клиента, не ответ биржи
@@ -730,7 +779,7 @@ def test_signals_card_and_refresh(b, tg, fake, monkeypatch):
     now = _sig_market(fake)
     monkeypatch.setattr("optbot.signals.time", NS(time=lambda: now / 1000, monotonic=time.monotonic))
     run(b.cmd_signals(tg.upd(VIEWER, "g"), tg.ctx("btc")))   # просмотр, в группе — не чувствительное
-    assert "Железный кондор" in tg.last("reply") and tg.buttons() == ["sig:BTC"]
+    assert "Железный кондор" in tg.last("reply") and tg.buttons() == ["sig:BTC", "ex:1"]  # «Выставить» — у записанного в журнал
     run(b.on_callback(tg.upd(VIEWER, data="sig:BTC"), tg.ctx()))
     assert "Железный кондор" in tg.last("edit")
     assert fake.called("place_order") == []

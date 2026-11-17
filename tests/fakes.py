@@ -73,6 +73,9 @@ class FakeHTTP:
         self.calls: list[tuple[str, dict]] = []
         self.fail: dict[str, Exception] = {}   # метод -> исключение (один раз)
         self.after: dict[str, Exception] = {}  # метод выполняется, затем бросает (обрыв после отправки)
+        # IOC исполняется сразу против тикера (покупка ≥ ask, продажа ≤ bid); ioc_max — сколько максимум за раз
+        self.ioc_max: dict[str, Decimal] = {}
+        self.margin_mode = "REGULAR_MARGIN"
 
     # ---------- служебное ----------
     def _rec(self, name, kw):
@@ -166,6 +169,10 @@ class FakeHTTP:
         return ok({"a": a, "b": b})
 
     # ---------- счёт ----------
+    def get_account_info(self):
+        self._rec("get_account_info", locals())
+        return ok({"marginMode": self.margin_mode, "unifiedMarginStatus": 3})
+
     def get_wallet_balance(self, accountType):
         self._rec("get_wallet_balance", locals())
         return ok({"list": [{"totalEquity": "1000", "totalAvailableBalance": "900", "coin": []}]})
@@ -214,10 +221,48 @@ class FakeHTTP:
              "side": kw["side"], "orderType": kw["orderType"], "qty": kw["qty"], "price": kw.get("price", "0"),
              "orderIv": kw.get("orderIv", ""), "leavesQty": kw["qty"], "cumExecQty": "0", "cumExecValue": "0",
              "orderStatus": "New", "reduceOnly": kw["reduceOnly"], "createdTime": str(int(time.time() * 1000))}
-        self.orders.append(o)
+        if any(x["orderLinkId"] == o["orderLinkId"] for x in self.orders + self.history):
+            raise InvalidRequestError("req", "OrderLinkedID is duplicate", 110072, "0", {})
+        if kw.get("timeInForce") == "IOC":
+            self._ioc(o)
+        elif kw.get("timeInForce") == "PostOnly" and self._crosses(o):  # как Bybit: взял бы ликвидность — снят
+            o.update(leavesQty="0", orderStatus="Cancelled")
+            self.history.append(o)
+        else:
+            self.orders.append(o)
         if "place_order" in self.after:
             raise self.after.pop("place_order")
         return ok({"orderId": o["orderId"], "orderLinkId": o["orderLinkId"]})
+
+    def _ioc(self, o: dict) -> None:
+        """Исполнить против тикера сразу, остаток снять — как IOC на бирже. Ордер — в историю."""
+        t = self.tickers[o["symbol"]]
+        qty = Decimal(o["qty"])
+        touch = Decimal(t["ask1Price"] if o["side"] == "Buy" else t["bid1Price"])
+        crosses = self._crosses(o)
+        filled = min(qty, self.ioc_max.get(o["symbol"], qty)) if crosses else Decimal(0)
+        o.update(cumExecQty=str(filled), cumExecValue=str(filled * touch), leavesQty="0",
+                 orderStatus="Filled" if filled == qty else "PartiallyFilledCanceled" if filled else "Cancelled")
+        self.history.append(o)
+
+    def _crosses(self, o: dict) -> bool:
+        t = self.tickers[o["symbol"]]
+        price = Decimal(o["price"])
+        touch = Decimal(t["ask1Price"] if o["side"] == "Buy" else t["bid1Price"])
+        return touch > 0 and (price >= touch if o["side"] == "Buy" else price <= touch)
+
+    def fill_resting(self, link_id: str, qty) -> None:
+        """Исполнить стоящий ордер (частично или целиком) по его цене — «рынок пришёл к нам»."""
+        o = next(o for o in self.orders if o["orderLinkId"] == link_id)
+        q = Decimal(o["cumExecQty"]) + Decimal(str(qty))
+        o.update(cumExecQty=str(q), cumExecValue=str(q * Decimal(o["price"])),
+                 leavesQty=str(Decimal(o["qty"]) - q))
+        if q >= Decimal(o["qty"]):
+            o["orderStatus"] = "Filled"
+            self.orders.remove(o)
+            self.history.append(o)
+        else:
+            o["orderStatus"] = "PartiallyFilled"
 
     def amend_order(self, **kw):
         self._rec("amend_order", kw)
@@ -232,10 +277,17 @@ class FakeHTTP:
             raise self.after.pop("amend_order")
         return ok({"orderId": o["orderId"]})
 
-    def cancel_order(self, category, symbol, orderId):
+    def cancel_order(self, category, symbol, orderId=None, orderLinkId=None):
         self._rec("cancel_order", locals())
-        self.orders = [o for o in self.orders if o["orderId"] != orderId]
-        return ok({"orderId": orderId})
+        hit = [o for o in self.orders if (orderId and o["orderId"] == orderId) or
+               (orderLinkId and o["orderLinkId"] == orderLinkId)]
+        if not hit:  # как Bybit: 110001 order not exists or too late to cancel
+            raise InvalidRequestError("req", "order not exists or too late to cancel", 110001, "0", {})
+        for o in hit:  # снятый — в историю, как на бирже
+            o.update(leavesQty="0", orderStatus="PartiallyFilledCanceled" if Decimal(o["cumExecQty"]) else "Cancelled")
+            self.history.append(o)
+        self.orders = [o for o in self.orders if o not in hit]
+        return ok({"orderId": hit[0]["orderId"]})
 
     def cancel_all_orders(self, category, baseCoin=None):
         self._rec("cancel_all_orders", locals())
@@ -276,7 +328,7 @@ def set_chain(fake, base="BTC", F=65000.0, iv=0.5, step=500, n=20, spread=0.04, 
                 "lotSizeFilter": {"qtyStep": min_qty, "minOrderQty": min_qty, "maxOrderQty": "100"}})
             fake.tickers[sym] = {
                 "symbol": sym, "markPrice": f"{price:.2f}", "bid1Price": f"{price * (1 - spread / 2):.2f}",
-                "ask1Price": f"{price * (1 + spread / 2):.2f}", "markIv": str(iv), "delta": f"{delta:.4f}",
+                "ask1Price": f"{price * (1 + spread / 2):.2f}", "bid1Size": "10", "ask1Size": "10", "markIv": str(iv), "delta": f"{delta:.4f}",
                 "gamma": "0.00001", "vega": "10", "theta": "-20", "underlyingPrice": str(F),
                 "indexPrice": str(F - 10), "openInterest": oi}
 

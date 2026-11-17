@@ -24,7 +24,8 @@
   один токен — один экземпляр (Telegram `Conflict`). Рабочая БД — на сервере; локальная `data/` устарела,
   `collector`/`journal` локально дают старые данные — запускать на сервере.
 - Обновление сервера: `git pull`; изменились зависимости — `.venv/bin/pip install -r requirements.txt`; затем
-  `systemctl --user restart options-bot` не ближе минуты к :00/:15/:30/:45 (иначе пропуск среза сборщика).
+  `systemctl --user restart options-bot` не ближе минуты к :00/:15/:30/:45 (иначе пропуск среза сборщика)
+  и не во время сделки по сигналу («Выставить»: до минуты и дольше) — перезапуск оборвёт её между ногами без итога.
 - Реальные ордера в проверках — далеко от рынка и сразу отменять (на demo пользователь разрешал мелкие сделки).
 - `.env` (ключи, токен) не коммитить, не показывать и не передавать во внешние сервисы.
 
@@ -64,6 +65,7 @@ cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служ
 
 SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`) и журнал сделок (`journal.py`);
 сигналы (`signals.py`) читают `snapshots` для IV percentile; журнал сигналов (`sigjournal.py`) — таблица `signals`,
-путь сделки — по `leg_marks`, итог — по `delivery_prices`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
+путь сделки — по `leg_marks`, итог — по `delivery_prices`. Кнопка «Выставить» — `multileg.py` (ноги IOC, сначала покупки),
+итог исполнения — таблица `signal_executions`, ордера — `order_links` с `source=signal`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.
