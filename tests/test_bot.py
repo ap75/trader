@@ -981,3 +981,52 @@ def test_paging_keeps_requester_view(make_bot, cfg, tg, fake):
     run(bb.cmd_orders(tg.upd(VIEWER, "g"), tg.ctx("BTC")))
     _press(bb, tg, "▶", uid=TRADER, chat="g")
     assert not any(x.startswith(("cx:", "am:")) for x in tg.buttons())
+
+
+def _polling_error(e):
+    """Исключение с трейсбеком из опроса getUpdates (как его передаёт библиотека)."""
+    async def polling_action_cb():
+        raise e
+    try:
+        run(polling_action_cb())
+    except type(e) as caught:
+        return caught
+
+
+def test_on_error_polling_one_line_and_outage_report(b, caplog, monkeypatch):
+    """502 опроса — WARNING одной строкой без трейсбека; затянувшийся сбой — ERROR раз в 5 мин."""
+    import logging
+    clock = [1000.0]
+    monkeypatch.setattr(botmod.time, "monotonic", lambda: clock[0])
+    caplog.set_level(logging.WARNING, logger="optbot")
+
+    def err(e, update=None):
+        run(b.on_error(update, NS(error=e)))
+    err(_polling_error(NetworkError("Bad Gateway")))
+    rec = caplog.records[-1]
+    assert rec.levelno == logging.WARNING and "Bad Gateway" in rec.getMessage() and not rec.exc_info
+    for _ in range(4):                                              # серия: каждые 100 с, всего 400 с
+        clock[0] += 100
+        err(_polling_error(NetworkError("Bad Gateway")))
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "недоступен уже 5 мин" in errors[0].getMessage()
+    clock[0] += 100
+    err(_polling_error(NetworkError("Bad Gateway")))                 # отчёт был 100 с назад — тихо
+    clock[0] += 1000                                                 # пауза > 2 мин — новая серия, без ERROR
+    err(_polling_error(NetworkError("Bad Gateway")))
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+
+
+def test_on_error_handler_network_error_keeps_traceback(b, caplog):
+    """Сетевая ошибка в команде/задаче (не опрос) никем не повторяется — ERROR с трейсбеком, как раньше."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="optbot")
+    try:
+        raise TimedOut()
+    except TimedOut as e:
+        handler_err = e
+    for e, upd in ((handler_err, None), (_polling_error(NetworkError("x")), NS(id=1)),
+                   (_polling_error(BadRequest("Message is not modified")), None), (ValueError("bug"), None)):
+        run(b.on_error(upd, NS(error=e)))
+    errs = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errs) == 4 and all(r.exc_info and "Необработанная ошибка" in r.getMessage() for r in errs)

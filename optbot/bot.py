@@ -276,6 +276,7 @@ class OptionsBot:
         self.c = client
         self.cfg = cfg
         self.collector = Collector(client, cfg)
+        self._tg_outage: tuple[float, float, float] | None = None  # серия сбоев опроса: начало, последний, отчёт
         self.journal = Journal(cfg)
         self.signals = SignalEngine(client, cfg)
         self.sigjournal = SignalJournal(cfg)
@@ -1596,9 +1597,37 @@ class OptionsBot:
                 log.warning("Уведомление %s в %s не доставлено: %s", what, chat_id, e)
         return sent
 
+    TG_OUTAGE_GAP_S = 120      # сбои опроса Telegram с паузой больше — уже новая серия
+    TG_OUTAGE_REPORT_S = 300   # серия дольше — раз в столько секунд ERROR «Telegram недоступен N мин»
+
     @staticmethod
-    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-        log.error("Необработанная ошибка", exc_info=context.error)
+    def _from_polling(err: BaseException) -> bool:
+        """Ошибка самого опроса getUpdates (её повторяет библиотека), а не команды/задачи (их не повторяет никто)."""
+        tb = err.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code.co_name == "polling_action_cb":
+                return True
+            tb = tb.tb_next
+        return False
+
+    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Сетевой сбой опроса getUpdates (502 Bad Gateway и т.п.) — одной строкой WARNING: библиотека сама повторяет
+        запрос, сообщения не теряются. Затянувшаяся серия — строкой ERROR раз в 5 мин. Таймауты опроса библиотека
+        повторяет молча, сюда они не попадают. Ошибки команд, кнопок и задач — ERROR с трейсбеком (их не повторяют)."""
+        err = context.error
+        if (update is None and isinstance(err, NetworkError) and not isinstance(err, BadRequest)
+                and self._from_polling(err)):
+            now = time.monotonic()
+            start, last, reported = self._tg_outage or (now, now, now)
+            if now - last > self.TG_OUTAGE_GAP_S:
+                start = reported = now
+            log.warning("Telegram: сбой опроса (%s: %s) — библиотека повторит", type(err).__name__, err)
+            if now - start >= self.TG_OUTAGE_REPORT_S and now - reported >= self.TG_OUTAGE_REPORT_S:
+                log.error("Telegram недоступен уже %d мин (последняя ошибка: %s)", (now - start) // 60, err)
+                reported = now
+            self._tg_outage = (start, now, reported)
+            return
+        log.error("Необработанная ошибка (update: %s)", update, exc_info=err)
 
     # ---------- сборка ----------
     COMMANDS = [
