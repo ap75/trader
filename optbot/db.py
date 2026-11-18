@@ -252,6 +252,15 @@ MIGRATIONS: list[list[str]] = [
         CREATE INDEX signal_executions_signal ON signal_executions (signal_id)
         """,
     ],
+    # 5: состояние бота между запусками (отметка «работает» — нештатная остановка видна при следующем старте)
+    [
+        """
+        CREATE TABLE bot_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе

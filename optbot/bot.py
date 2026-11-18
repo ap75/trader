@@ -57,6 +57,7 @@ import dataclasses
 import functools
 import html
 import logging
+import os
 import secrets
 import sys
 import time
@@ -76,7 +77,9 @@ from telegram.ext import (
 
 from .bybit_client import (LOOKUP_DELAYS, BybitError, BybitNetworkError, OptionsClient, OrderRequest,
                            PortfolioRiskError, RiskError, _d)
+from . import db
 from .collector import Collector, seconds_to_next_slot
+from .linkid import parse_link_id
 from .journal import Journal, fmt_report, parse_period
 from .multileg import MultiLegExecutor, SymbolGuard, fmt_result, leg_side, precheck, quote_mid
 from .signals import STRATEGIES, Signal, SignalEngine, fmt_signal, fmt_signal_brief, signal_key, strategy_name
@@ -292,6 +295,12 @@ class OptionsBot:
         self._app: Application | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dm_failed: set[int] = set()
+        # срочные администратору: ключ -> когда последний раз отправлено (повтор — не чаще ADMIN_ALERT_QUIET_MIN)
+        self._alert_last: dict[str, float] = {}
+        # повторы недошедших срочных -> исходный текст (снимаются при остановке, текст — в сообщение об остановке)
+        self._alert_retries: dict[asyncio.Task, str] = {}
+        self.c.on_access_error = self.alert_threadsafe  # нет доступа к бирже (ключ, права, IP, регион)
+        self.c.on_limit = self.alert_threadsafe         # сработал лимит риска (MAX_*, маржа)
         # orderId -> [блокировка, сколько держат/ждут]: изменения/отмены одного ордера идут строго по очереди
         self._order_locks: dict[str, list] = {}
         self._guide_ids: dict[str, tuple[tuple, str]] = {}  # файл -> ((mtime, размер), file_id): без повторной загрузки
@@ -673,6 +682,111 @@ class OptionsBot:
                 await self._mark_announced([r["id"] for r in chunk])
         except Exception:
             log.exception("Журнал сигналов: сводка итогов не отправлена")
+
+    # ---------- срочные администратору ----------
+    ALERT_RETRY_S = (60, 120, 300, 600, 1200)  # не дошло — повторы (важное: сделки вне бота, исполнение не полностью)
+
+    async def admin_alert(self, key: str, text: str, quiet: bool = True, retry: bool = False) -> bool:
+        """Срочное администраторам в личку. Одно и то же (ключ) — не чаще ADMIN_ALERT_QUIET_MIN (quiet=False —
+        всегда: запуск/остановка, исполнение не полностью). retry — не дошло никому: повторить позже (фоном).
+        -> отправлено ли (хоть кому-то)."""
+        if not self.cfg.tg_admin_ids:
+            return False
+        now, when = time.monotonic(), time.strftime("%H:%M UTC", time.gmtime())  # время события — до отправки
+        last = self._alert_last.get(key)
+        if quiet and last is not None and now - last < self.cfg.admin_alert_quiet_min * 60:
+            log.info("Срочное %s — повтор в «тишине», не отправлено: %s", key, text)
+            return False
+        # ключ занят до отправки: одновременные одинаковые (сбой ключа сразу в нескольких запросах) — одно сообщение
+        self._alert_last[key] = now
+        log.warning("Срочное администратору (%s): %s", key, text)
+        try:
+            got = await self._send_admins(pre(f"{env_banner(self.cfg.env)}\n🚨 {text}"))
+        except Exception:  # не TelegramError (сбой HTTP-клиента и т.п.) — как «не дошло»
+            log.exception("Срочное %s: сбой отправки", key)
+            got = []
+        if not got:
+            # никому не дошло — «тишину» не начинаем: следующий повтор попробует снова
+            if self._alert_last.get(key) == now:
+                if last is None:
+                    self._alert_last.pop(key, None)
+                else:
+                    self._alert_last[key] = last
+            if retry and self._loop is not None:
+                # на голом цикле, не app.create_task: остановка бота не ждёт повторов (до ~40 мин) — их снимает
+                # post_stop, а недоставленное уходит в сообщении об остановке
+                marked = f"{text}\n(событие в {when}, доставлено с задержкой)"
+                t = self._loop.create_task(self._retry_alert(key, marked))
+                self._alert_retries[t] = marked
+                t.add_done_callback(lambda t: self._alert_retries.pop(t, None))
+            return False
+        if len(self._alert_last) > 500:  # ключи с суммами/символами копятся — старые не нужны
+            cut = now - self.cfg.admin_alert_quiet_min * 60
+            self._alert_last = {k: v for k, v in self._alert_last.items() if v >= cut}
+        return True
+
+    async def _retry_alert(self, key: str, text: str) -> None:
+        """Повторы недошедшего — без «тишины» (повторяются только важные: каждое — своё событие)."""
+        for d in self.ALERT_RETRY_S:
+            await asyncio.sleep(d)
+            if await self.admin_alert(key, text, quiet=False):
+                return
+        log.error("Срочное %s так и не доставлено: %s", key, text)
+
+    def alert_threadsafe(self, key: str, text: str) -> None:
+        """admin_alert из любого потока (клиент биржи работает в to_thread). Без запущенного бота — только лог."""
+        if self._loop is None or self._app is None or not self.cfg.tg_admin_ids:
+            log.warning("Срочное %s не отправлено (бот не запущен или нет администраторов): %s", key, text)
+            return
+        try:
+            self._loop.call_soon_threadsafe(lambda: self._app.create_task(self.admin_alert(key, text)))
+        except RuntimeError:  # цикл уже закрыт (остановка)
+            log.warning("Срочное %s не поставлено (бот останавливается): %s", key, text)
+
+    def _state(self, key: str, value: str | None = None) -> str | None:
+        """bot_state: чтение (value=None) или запись значения."""
+        conn = db.connect(self.cfg.db_file)
+        try:
+            with conn:
+                if value is not None:
+                    conn.execute("INSERT INTO bot_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
+                                 "SET value = excluded.value", (key, value))
+                    return value
+                r = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+                return r["value"] if r else None
+        finally:
+            conn.close()
+
+    async def _announce_start(self) -> None:
+        """Запуск: отметка «работает» в БД; осталась с прошлого раза — остановка была нештатной (падение, kill)."""
+        try:
+            prev = await asyncio.to_thread(self._state, "running")
+        except Exception:
+            log.exception("Состояние бота в БД не прочитано — о прошлой остановке не сообщаю")
+            prev = None
+        try:  # отдельно от чтения: сбой записи не прячет уже найденную нештатную остановку
+            await asyncio.to_thread(self._state, "running", str(int(time.time())))
+        except Exception:
+            log.exception("Отметка запуска в БД не записана — о следующей нештатной остановке не узнаем")
+        text = f"🟢 Бот запущен (pid {os.getpid()})"
+        if prev and prev != "0":
+            when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(int(prev))) if prev.isdigit() else prev
+            text += (f"\n⚠️ Прошлая остановка была нештатной (падение или kill; тот запуск — {when}). "
+                     "Проверьте /pos и /orders.")
+        await self.admin_alert("start", text, quiet=False, retry=True)  # «нештатная» не должна потеряться
+
+    async def _announce_stop(self, undelivered: list[str] | None = None) -> None:
+        """Штатная остановка: сообщение и снятие отметки «работает»."""
+        try:
+            await asyncio.to_thread(self._state, "running", "0")
+        except Exception:
+            log.exception("Отметка остановки в БД не записана — следующий запуск сообщит «нештатная»")
+        # идущую сделку по сигналу библиотека дожидается до post_stop (задача create_task) — к этому моменту
+        # она завершена; оборвать её может только kill по таймауту остановки — тогда post_stop не выполнится
+        text = "🔴 Бот остановлен штатно."
+        if undelivered:  # ждали повтора — не терять: хотя бы в этом сообщении
+            text += "\n\nНе доставлено раньше (Telegram был недоступен):\n" + "\n\n".join(undelivered)
+        await self.admin_alert("stop", text[:TG_MAX_TEXT - 200], quiet=False)
 
     # ---------- автосигналы администраторам ----------
     async def _send_admins(self, msg: str) -> list[int]:
@@ -1449,8 +1563,9 @@ class OptionsBot:
                 text = (f"⚠️ Итог сделки по сигналу #{sid} не сформирован ({type(e).__name__}): статус {res.status}, "
                         f"осталось: {'; '.join(res.left) or '—'} — проверьте /pos и /orders")
             if res.alert:  # неполное исполнение / осталась позиция / исход неизвестен — администратору сразу
-                context.application.create_task(self._send_admins(pre(
-                    f"{env_banner(self.cfg.env)}\n🚨 Многоногий ордер исполнен не полностью ({w.name})\n\n{text}")))
+                context.application.create_task(self.admin_alert(
+                    f"multileg:{sid}", f"Многоногий ордер исполнен не полностью ({w.name})\n\n{text}", quiet=False,
+                    retry=True))
             return text
 
         await self._ask_confirm(update, context, w, "\n".join(lines), "signal_exec", action=run, done=done)
@@ -1504,6 +1619,15 @@ class OptionsBot:
             log.exception("Журнал: сводка сверки не отправлена")
         if not sent:  # никому не дошло — вернуть «не объявлено», объявит следующая сверка
             await asyncio.to_thread(self.journal.unnotify, [r.get("execId") for r in missed])
+        ext = [r for r in missed if r.get("execType", "Trade") == "Trade"
+               and parse_link_id(r.get("orderLinkId"))["source"] == "external"]
+        if ext and sent:  # сделки вне бота, пропущенные WebSocket, — тоже срочно администратору (одним сообщением;
+            # сводка не дошла — исполнения вернутся в следующую сверку, сообщим тогда)
+            body = "; ".join(f"{r.get('side', '?').upper()} {r.get('execQty')} {r.get('symbol', '?')} @ "
+                             f"{r.get('execPrice')}" for r in ext[:10]) + (f" … и ещё {len(ext) - 10}" if len(ext) > 10 else "")
+            await self.admin_alert("external-sync",
+                                   f"Сделки не через бота (найдены сверкой): {body}. Проверьте /pos.",
+                                   quiet=False, retry=True)
 
     @guarded("view", sensitive=True)
     async def cmd_journal(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
@@ -1552,7 +1676,7 @@ class OptionsBot:
         by_order: dict[str, list[dict]] = {}
         for r in rows:
             by_order.setdefault(r.get("orderId", "?"), []).append(r)
-        texts = []
+        texts, outside = [], []
         srcs = await asyncio.to_thread(self.journal.describe_many,
                                        [rs[-1].get("orderLinkId") for rs in by_order.values()])
         for oid, rs in by_order.items():
@@ -1565,6 +1689,10 @@ class OptionsBot:
             kind = {"Trade": "", "Delivery": " (поставка/экспирация)", "Settle": " (расчёт)",
                     "BustTrade": " (ликвидация)"}.get(etype, f" ({etype})")
             src = srcs[last.get("orderLinkId")]
+            if etype == "Trade" and parse_link_id(last.get("orderLinkId"))["source"] == "external":
+                outside.append((f"external:{oid}", f"Сделка не через бота: {last.get('side', '?').upper()} {qty} "
+                                f"{last.get('symbol', '?')} @ {px(avg)} (ордер {oid[:8]}) — позиция изменена вне "
+                                "бота (вручную на бирже или другой программой). Проверьте /pos."))
             left = _d(last.get("leavesQty"))
             status = "ордер исполнен полностью" if left == 0 else f"остаток {left}"
             texts.append(f"💥 Исполнение{kind}\n"
@@ -1574,6 +1702,10 @@ class OptionsBot:
                            last.get("symbol"), last.get("side"), qty, avg, fee, etype, oid, last.get("orderLinkId"))
         if texts:
             await self._broadcast(pre(f"{env_banner(self.cfg.env)}\n" + "\n\n".join(texts)), "об исполнении")
+        if outside:  # срочно администратору одним сообщением — после общего уведомления; не дошло — повторы
+            more = f"\n\n… и ещё {len(outside) - 10} ордеров вне бота" if len(outside) > 10 else ""
+            await self.admin_alert(outside[0][0], "\n\n".join(t for _, t in outside[:10]) + more, quiet=False,
+                                   retry=True)
 
     def _targets(self) -> list[int]:
         """Получатели уведомлений: разрешённые группы и лички трейдеров и администраторов (кроме недоступных)."""
@@ -1680,6 +1812,10 @@ class OptionsBot:
         async def post_init(app: Application):
             await app.bot.set_my_commands([BotCommand(n, d) for n, _, d in self.COMMANDS])
             self._app, self._loop = app, asyncio.get_running_loop()
+            try:  # уведомление о запуске не должно мешать запуску
+                await self._announce_start()
+            except Exception:
+                log.exception("Сообщение о запуске не отправлено")
             self.watcher = ExecutionWatcher(self.cfg, self._on_ws_executions, self._on_ws_orders)
             try:
                 await asyncio.to_thread(self.watcher.start)
@@ -1710,6 +1846,13 @@ class OptionsBot:
                 log.info("Сборщик: каждые %d мин, первый срез через %.0f с, БД %s",
                          self.cfg.collector_interval_min, first, self.cfg.db_file)
 
+        async def post_stop(app: Application):  # Telegram ещё доступен (post_shutdown — уже нет)
+            undelivered = [x for t, x in self._alert_retries.items() if not t.done()]
+            for t in list(self._alert_retries):  # повторы недошедших — не держать остановку
+                t.cancel()
+            with contextlib.suppress(Exception):
+                await self._announce_stop(undelivered)
+
         async def post_shutdown(app: Application):
             if self._auto_task and not self._auto_task.done():  # не слать в остановленный Telegram
                 self._auto_task.cancel()
@@ -1723,6 +1866,7 @@ class OptionsBot:
             .token(self.cfg.tg_token)
             .rate_limiter(AIORateLimiter(max_retries=3))
             .post_init(post_init)
+            .post_stop(post_stop)
             .post_shutdown(post_shutdown)
             .build()
         )

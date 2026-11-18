@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from typing import Callable
 
 import requests
 from pybit.exceptions import FailedRequestError, InvalidRequestError
@@ -53,6 +54,19 @@ SIDE_SIGN = {"Buy": Decimal(1), "Sell": Decimal(-1)}  # знак стороны 
 class PortfolioRiskError(RiskError):
     """Отказ по состоянию счёта (позиции, ордера, дельта, маржа, премия за сутки): текст содержит данные счёта —
     в группах при SENSITIVE_COMMANDS_DM_ONLY не показывать."""
+
+
+class LimitError(RiskError):
+    """Сработал лимит риска из настроек (MAX_*, маржа) — о нём срочно администратору (OptionsClient.on_limit)."""
+
+
+class PortfolioLimitError(PortfolioRiskError, LimitError):
+    """Лимит риска по состоянию счёта (позиция, дельта, маржа, премия за сутки)."""
+
+
+# retCode Bybit — нет доступа: ключ неверен/истёк, подпись, права, IP, регион (срочно администратору)
+ACCESS_RET_CODES = {10003, 10004, 10005, 10007, 10009, 10010, 10024, 33004}
+ACCESS_HTTP_CODES = {401, 403}
 
 
 @dataclass
@@ -187,15 +201,23 @@ class OptionsClient:
         self._instruments: dict[str, Instrument] = {}
         self._instr_loaded_at: dict[str, float] = {}
         self._instr_lock = threading.RLock()  # бот вызывает методы из разных потоков
+        # срочное администратору (бот подставляет; вызываются из любого потока, ошибки — только в лог):
+        # on_access_error(key, text) — нет доступа к бирже; on_limit(key, text) — сработал лимит риска
+        self.on_access_error: Callable[[str, str], None] | None = None
+        self.on_limit: Callable[[str, str], None] | None = None
 
     # ---------- низкий уровень ----------
-    @staticmethod
-    def _ok(resp: dict) -> dict:
+    def _ok(self, resp: dict) -> dict:
         code = resp.get("retCode")
         if code != 0:
+            self._access_check(code, resp.get("retMsg"))
             cls = BybitNetworkError if code in UNCERTAIN_RET_CODES else BybitError
             raise cls(f"{code}: {resp.get('retMsg')}")
         return resp["result"]
+
+    def _access_check(self, code, msg) -> None:
+        if code in ACCESS_RET_CODES:  # одинаково — пришёл ли отказ исключением pybit или ответом
+            self._notify(self.on_access_error, f"access:{code}", f"Нет доступа к Bybit: retCode {code} — {msg}")
 
     def _call(self, fn, **params) -> dict:
         try:
@@ -203,14 +225,36 @@ class OptionsClient:
         except BybitError:
             raise
         except InvalidRequestError as e:  # retCode != 0: отказ биржи, кроме её внутренних сбоев
+            self._access_check(e.status_code, e.message)
             cls = BybitNetworkError if e.status_code in UNCERTAIN_RET_CODES else BybitError
             raise cls(f"{e.status_code}: {e.message}") from e
         except (requests.exceptions.RequestException, FailedRequestError) as e:
             # таймаут/обрыв, HTTP 5xx, нечитаемый ответ (pybit оборачивает в FailedRequestError):
             # запрос мог дойти до биржи
+            code = getattr(e, "status_code", None)
+            if code in ACCESS_HTTP_CODES:
+                # 401 — ключ; 403 — по pybit «превышен лимит запросов по IP или IP из запрещённого региона».
+                # Запрос отклонён до обработки — исход известен (не «сбой связи»)
+                why = "ключ API не принят" if code == 401 else "лимит запросов по IP или регион/IP запрещён"
+                self._notify(self.on_access_error, f"access:http{code}",
+                             f"Нет доступа к Bybit: HTTP {code} ({why}) — {str(e)[:300]}")
+                raise BybitError(f"HTTP {code}: {why}") from e
             raise BybitNetworkError(f"{type(e).__name__}: {e}") from e
         except Exception as e:  # локальная ошибка (нет ключей, неверные параметры, ответ не разобран)
             raise BybitLocalError(f"Ошибка запроса/конфигурации: {type(e).__name__}: {e}") from e
+
+    @staticmethod
+    def _notify(cb: Callable[[str, str], None] | None, key: str, text: str) -> None:
+        if cb is not None:
+            try:
+                cb(key, text)
+            except Exception:  # уведомление не должно ломать запрос
+                log.exception("Срочное уведомление не поставлено: %s", key)
+
+    def _limit(self, key: str, msg: str, portfolio: bool = False) -> LimitError:
+        """Исключение «сработал лимит» + срочное администратору (повторы глушит бот по ключу)."""
+        self._notify(self.on_limit, f"limit:{key}", f"Лимит риска: {msg} — ордер не отправлен")
+        return (PortfolioLimitError if portfolio else LimitError)(msg)
 
     # ---------- справочник инструментов ----------
     def load_instruments(self, base: str, force: bool = False) -> list[Instrument]:
@@ -425,7 +469,7 @@ class OptionsClient:
 
         limit = self.cfg.max_order_qty.get(inst.base, Decimal(0))
         if limit > 0 and req.qty > limit and not req.reduce_only:
-            raise RiskError(f"Превышен лимит MAX_QTY_{inst.base}={limit}")
+            raise self._limit(f"MAX_QTY_{inst.base}", f"Превышен лимит MAX_QTY_{inst.base}={limit}")
 
         t = req.quote if req.quote is not None else self.ticker(inst.symbol)
         req.ticker = t
@@ -456,10 +500,9 @@ class OptionsClient:
             premium = req.qty * ((ask if buy else bid) or mark)  # оценка: цену по IV считает биржа
 
         if not req.reduce_only and premium > self.cfg.max_order_premium_usdt:
-            raise RiskError(
-                f"Премия ~{premium:.2f} {self.cfg.settle_coin} > лимита MAX_ORDER_PREMIUM_USDT="
-                f"{self.cfg.max_order_premium_usdt}"
-            )
+            raise self._limit(
+                "MAX_ORDER_PREMIUM_USDT", f"Премия ~{premium:.2f} {self.cfg.settle_coin} > лимита "
+                f"MAX_ORDER_PREMIUM_USDT={self.cfg.max_order_premium_usdt}")
 
         req.premium = premium
         if not req.reduce_only and not req.portfolio_checked:
@@ -488,7 +531,8 @@ class OptionsClient:
                 for s in sorted({r.symbol for r in legs}):
                     after = sum((SIDE_SIGN[r.side] * r.qty for r in legs if r.symbol == s), Decimal(0))
                     if abs(after) > lim:
-                        raise PortfolioRiskError(f"Позиция {s} станет {after:+} — больше MAX_POSITION_{b}={lim}")
+                        raise self._limit(f"MAX_POSITION_{b}",
+                                          f"Позиция {s} станет {after:+} — больше MAX_POSITION_{b}={lim}", True)
             lim = self.cfg.max_net_delta.get(b, Decimal(0))
             if lim > 0:
                 g = next((x for x in self.greeks(b) if x.get("baseCoin") == b), {})
@@ -496,8 +540,8 @@ class OptionsClient:
                 after = before + sum((SIDE_SIGN[r.side] * r.qty * _d((r.ticker or {}).get("delta")) for r in legs),
                                      Decimal(0))
                 if abs(after) > lim and abs(after) > abs(before):
-                    raise PortfolioRiskError(f"Дельта опционов {b} станет {after:+.4f} (сделка целиком) — больше "
-                                    f"MAX_NET_DELTA_{b}={lim}")
+                    raise self._limit(f"MAX_NET_DELTA_{b}", f"Дельта опционов {b} станет {after:+.4f} (сделка "
+                                      f"целиком) — больше MAX_NET_DELTA_{b}={lim}", True)
                 info.append(f"Δ {b} после: {after:+.4f} (лимит {lim})")
         # маржа: покупки идут первыми — нехватку на коротких лучше узнать до них, а не после (откат с потерей)
         shorts = [r for r in reqs if r.side == "Sell"]
@@ -508,8 +552,8 @@ class OptionsClient:
                     (r.premium or Decimal(0) for r in reqs if r.side == "Buy"), Decimal(0))
                 avail = _d(self.balance().get("totalAvailableBalance"))
                 if need > avail:
-                    raise PortfolioRiskError(f"Маржи не хватит: нужно ~{need:.2f} USDT (короткие ноги в REGULAR_MARGIN — "
-                                    f"как непокрытые, плюс покупки), доступно {avail:.2f}")
+                    raise self._limit("margin", f"Маржи не хватит: нужно ~{need:.2f} USDT (короткие ноги в "
+                                      f"REGULAR_MARGIN — как непокрытые, плюс покупки), доступно {avail:.2f}", True)
                 info.append(f"маржа: ~{need:.2f} из доступных {avail:.2f}")
             else:
                 info.append(f"маржа ({mode or '?'}) — считает биржа, заранее не проверена")
@@ -518,8 +562,8 @@ class OptionsClient:
             used = self.daily_premium_used(open_orders=orders)
             add = sum((r.premium or Decimal(0) for r in reqs), Decimal(0))
             if used + add > lim:
-                raise PortfolioRiskError(f"Премия за сутки UTC: {used:.2f} + {add:.2f} (все ноги) > "
-                                f"MAX_DAILY_PREMIUM_USDT={lim}")
+                raise self._limit("MAX_DAILY_PREMIUM_USDT", f"Премия за сутки UTC: {used:.2f} + {add:.2f} (все ноги) > "
+                                  f"MAX_DAILY_PREMIUM_USDT={lim}", True)
             info.append(f"премия за сутки: {used + add:.2f} из {lim}")
         return info
 
@@ -636,8 +680,8 @@ class OptionsClient:
             before = cur + pending
             after = before + sign * new_qty
             if abs(after) > lim and abs(after) > abs(before):
-                raise RiskError(f"Позиция {inst.symbol} станет {after:+} (с учётом открытых ордеров {pending:+}) — "
-                                f"больше MAX_POSITION_{inst.base}={lim}")
+                raise self._limit(f"MAX_POSITION_{inst.base}", f"Позиция {inst.symbol} станет {after:+} (с учётом "
+                                  f"открытых ордеров {pending:+}) — больше MAX_POSITION_{inst.base}={lim}", True)
             req.info.append(f"позиция после: {after:+} (лимит {lim})")
 
         lim = self.cfg.max_net_delta.get(inst.base, Decimal(0))
@@ -646,7 +690,8 @@ class OptionsClient:
             before = _d(g.get("totalDelta"))
             after = before + sign * new_qty * _d(t.get("delta"))
             if abs(after) > lim and abs(after) > abs(before):
-                raise RiskError(f"Дельта опционов {inst.base} станет {after:+.4f} — больше MAX_NET_DELTA_{inst.base}={lim}")
+                raise self._limit(f"MAX_NET_DELTA_{inst.base}", f"Дельта опционов {inst.base} станет {after:+.4f} — "
+                                  f"больше MAX_NET_DELTA_{inst.base}={lim}", True)
             req.info.append(f"Δ {inst.base} после: {after:+.4f} (лимит {lim})")
 
         lim = self.cfg.max_daily_premium_usdt
@@ -657,7 +702,8 @@ class OptionsClient:
             filled_today = req.amend_filled_value if req.amend_created_ms >= self._day_start_ms() else Decimal(0)
             add = (premium * new_qty / req.qty if req.qty else premium) + filled_today
             if used + add > lim:
-                raise RiskError(f"Премия за сутки UTC: {used:.2f} + {add:.2f} > MAX_DAILY_PREMIUM_USDT={lim}")
+                raise self._limit("MAX_DAILY_PREMIUM_USDT",
+                                  f"Премия за сутки UTC: {used:.2f} + {add:.2f} > MAX_DAILY_PREMIUM_USDT={lim}", True)
             req.info.append(f"премия за сутки: {used + add:.2f} из {lim}")
 
     @staticmethod

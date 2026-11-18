@@ -67,5 +67,6 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 сигналы (`signals.py`) читают `snapshots` для IV percentile; журнал сигналов (`sigjournal.py`) — таблица `signals`,
 путь сделки — по `leg_marks`, итог — по `delivery_prices`. Кнопка «Выставить» — `multileg.py` (ноги IOC, сначала покупки),
 итог исполнения — таблица `signal_executions`, ордера — `order_links` с `source=signal`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
+`bot_state` — отметка «бот работает» (нештатная остановка видна при следующем старте; срочные администратору — `bot.admin_alert`).
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

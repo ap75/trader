@@ -239,8 +239,8 @@ def precheck(client: OptionsClient, cfg: Settings, legs: list[tuple]) -> tuple[l
         if side == "Sell":  # для лимитов премии — наибольшая премия попыток: продажа идёт от bid вниз
             req.premium = req.qty * max(step_price(t, side, Decimal(0), cfg, tick=tick), req.price)
             if req.premium > cfg.max_order_premium_usdt:  # prepare_order проверил по худшей (низкой) цене
-                raise RiskError(f"{sym}: премия ~{req.premium:.2f} по bid > лимита MAX_ORDER_PREMIUM_USDT="
-                                f"{cfg.max_order_premium_usdt}")
+                raise client._limit("MAX_ORDER_PREMIUM_USDT", f"{sym}: премия ~{req.premium:.2f} по bid > лимита "
+                                    f"MAX_ORDER_PREMIUM_USDT={cfg.max_order_premium_usdt}")
         out.append(LegQuote(req, bid, ask, mid))
     return out, client.check_strategy([q.req for q in out])
 

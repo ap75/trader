@@ -223,6 +223,8 @@ class Settings:
     auto_signals_daily_utc: tuple[int, int] | None = _hhmm("AUTO_SIGNALS_DAILY_UTC", "09:05")  # сводка; None — нет
     # сообщение о смене рекомендации по активу — не чаще раза в N часов; 0 — не присылать
     auto_signals_change_hours: float = _float_in("AUTO_SIGNALS_CHANGE_HOURS", 4, 0, 168)
+    # срочные администратору (доступ к бирже, лимиты, сделки вне бота): одно и то же — не чаще раза в N минут
+    admin_alert_quiet_min: float = _float_in("ADMIN_ALERT_QUIET_MIN", 30, 0, 1440)
     # Просмотр (не торговля) для всех участников разрешённых групп
     allow_all_group_members_view: bool = _bool("ALLOW_ALL_GROUP_MEMBERS_VIEW", False)
     # Баланс/позиции/ордера/греки — только в личке
