@@ -79,6 +79,8 @@ from .bybit_client import (LOOKUP_DELAYS, BybitError, BybitNetworkError, Options
                            PortfolioRiskError, RiskError, _d)
 from . import db
 from .collector import Collector, seconds_to_next_slot
+from . import paper as paper_mod
+from .paper import PaperEngine
 from .linkid import parse_link_id
 from .journal import Journal, fmt_report, parse_period
 from .multileg import MultiLegExecutor, SymbolGuard, fmt_result, leg_side, precheck, quote_mid
@@ -282,6 +284,8 @@ class OptionsBot:
         self._tg_outage: tuple[float, float, float] | None = None  # серия сбоев опроса: начало, последний, отчёт
         self.journal = Journal(cfg)
         self.signals = SignalEngine(client, cfg)
+        self.paper = PaperEngine(client, cfg, self.signals)  # бумажные книги E1: шаг после каждого среза
+        self._paper_task: asyncio.Task | None = None
         self.sigjournal = SignalJournal(cfg)
         self._sig_cache: dict[str, tuple[float, Signal]] = {}  # актив -> (когда, Signal)
         self._sig_locks = {b: asyncio.Lock() for b in cfg.base_coins}  # актив -> блокировка расчёта
@@ -862,6 +866,20 @@ class OptionsBot:
             for sig in sigs.values():
                 if not isinstance(sig, Exception):
                     await self._record_auto(sig, got)
+
+    def _kick_paper(self) -> None:
+        """Шаг бумажных книг — отдельной задачей (запросы к бирже не задерживают сборщик); прошлый идёт — пропуск."""
+        if self._paper_task and not self._paper_task.done():
+            log.warning("Бумажные книги: прошлый шаг ещё идёт — этот пропущен")
+            return
+        self._paper_task = asyncio.get_running_loop().create_task(self._paper_job())
+
+    async def _paper_job(self) -> None:
+        try:
+            res = await asyncio.to_thread(self.paper.step)
+            (log.warning if res.errors else log.info)("Бумажные книги: %s", res)
+        except Exception:
+            log.exception("Бумажные книги: шаг не выполнен")
 
     def _break_streaks(self, bases) -> None:
         for b in bases:
@@ -1581,6 +1599,8 @@ class OptionsBot:
             self._break_streaks(self.cfg.base_coins)  # среза нет — история IV старая: смену не проверяем,
             return                                    # а пропуск рвёт серию «подряд»
         (log.warning if res.errors else log.info)("Сборщик: %s", res)
+        if self.cfg.paper.enabled and (res.snapshots or res.skipped):
+            self._kick_paper()
         if self._auto_change_on():
             # только активы со срезом в этом слоте (записан сейчас или уже был — повторный запуск); по активу
             # с ошибкой сбора история IV старая — его смену не проверяем
@@ -1599,6 +1619,7 @@ class OptionsBot:
             log.exception("Журнал: сверка не выполнена")
             return
         (log.warning if res.errors else log.info)("Журнал: %s", res)
+        await self._check_delivery_fees()
         missed = res.missed
         if not missed:
             return
@@ -1628,6 +1649,31 @@ class OptionsBot:
             await self.admin_alert("external-sync",
                                    f"Сделки не через бота (найдены сверкой): {body}. Проверьте /pos.",
                                    quiet=False, retry=True)
+
+    async def _check_delivery_fees(self) -> None:
+        """Новая поставка в деньгах в журнале — сверить формулу комиссии поставки бумажных книг (справки Bybit
+        расходятся): администратору — первое совпадение и каждое расхождение."""
+        def run():
+            conn = db.connect(self.cfg.db_file)
+            try:
+                return paper_mod.check_delivery_fees(self.cfg, conn)
+            finally:
+                conn.close()
+        if not self.cfg.paper.enabled:
+            return
+        try:
+            got = await asyncio.to_thread(run)
+        except Exception:
+            log.exception("Проверка комиссии поставки не выполнена")
+            return
+        rep = [x for x in got if x["report"]]
+        for x in got:
+            if not x["report"]:
+                log.info("%s", paper_mod.fmt_delivery_check(x))
+        if rep:  # одним сообщением (первая проверка может найти много старых поставок)
+            body = "\n\n".join(paper_mod.fmt_delivery_check(x) for x in rep[:5])
+            more = f"\n\n… и ещё {len(rep) - 5} — python -m optbot.paper --check-delivery-fees" if len(rep) > 5 else ""
+            await self.admin_alert(f"delivery-fee:{rep[-1]['key']}", body + more, quiet=False, retry=True)
 
     @guarded("view", sensitive=True)
     async def cmd_journal(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
@@ -1858,6 +1904,8 @@ class OptionsBot:
                 self._auto_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._auto_task
+            if self._paper_task and not self._paper_task.done():  # шаг в потоке доработает сам (запись — транзакциями)
+                self._paper_task.cancel()
             if self.watcher:
                 await asyncio.to_thread(self.watcher.stop)
 

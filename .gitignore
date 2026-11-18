@@ -6,5 +6,6 @@ __pycache__/
 *.log
 .idea/
 data/
+research/
 .pytest_cache/
 .coverage

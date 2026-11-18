@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 
 from . import db
 from .collector import track
-from .config import Settings, settings
+from .config import SIG_LONG_FIELDS, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
 from .journal import Journal, load_delivery_prices, nearest_price, parse_period
 from .signals import STRATEGIES, Leg, Signal, payoff
@@ -48,7 +48,7 @@ REGIMES = {"high": "IV высокая", "low": "IV низкая"}
 
 def cfg_version(cfg: Settings) -> tuple[str, str]:
     """(хеш, JSON) порогов SIG_*: статистику можно разбить по версии настроек."""
-    raw = json.dumps(asdict(cfg.sig), sort_keys=True)
+    raw = json.dumps({k: v for k, v in asdict(cfg.sig).items() if k not in SIG_LONG_FIELDS}, sort_keys=True)
     return hashlib.sha1(raw.encode()).hexdigest()[:8], raw
 
 

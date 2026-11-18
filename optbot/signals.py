@@ -25,10 +25,18 @@ IV низкая: pctl ≤ SIG_PCTL_LOW при IV7 ≤ RV7·SIG_IV_RV_HIGH, ил�
 ликвидны и премия разумна. Цены — по исполнимой стороне (покупка по ask, продажа по bid), mid — для сравнения.
 Количество — минимальный лот инструмента.
 
-Запуск: /signals BASE в боте, python -m optbot.cli signals BASE.
+Длинный горизонт (эксперимент E1, бумажные книги; horizon="long"): окно SIG_LONG_DTE_MIN…MAX (14–45 дн.),
+IV30 (SIG_LONG_TARGET_DAYS) против RV30; RV14/RV30 ≥ SIG_RV14_RV30_MAX — волатильность растёт, премию не продаём;
+percentile IV30 — только при истории ≥ IV_PCT_MIN_DAYS (до этого — по IV30/RV30, «мало истории»).
+Календарный спред (`calendar_signal`): ATM IV ближней (SIG_CAL_NEAR_DTE_MIN…MAX) / дальней (длинное окно) ≥
+SIG_CALENDAR_INVERSION и тренд боковой — продажа ближней ATM, покупка дальней того же страйка; риск = дебет.
+Событие высокой важности (EVENTS_FILE) до ближней экспирации — тег event (статистика — отдельно).
+
+Запуск: /signals BASE в боте, python -m optbot.cli signals BASE [--horizon long].
 """
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from decimal import Decimal
@@ -40,7 +48,10 @@ from . import db
 from .bybit_client import OptionsClient, group_by_strike, option_intrinsic, parse_option_symbol, spread_pct
 from .collector import _f, expiry_metrics
 from .config import Settings, SignalSettings, settings
+from .events import calendar as events_calendar
 from .fmt import DAY_MS, env_banner, money, num, pct, px, short_symbol, utc
+
+log = logging.getLogger("optbot.signals")
 
 MIN_INTERP_DTE = 1.0      # экспирации короче суток в IV7 не участвуют
 KLINE_COVERAGE = 0.8      # доля ожидаемых свечей, без которой RV не считается
@@ -58,7 +69,9 @@ STRATEGIES = {
     "bull_call": "Бычий колл-спред (дебет)",
     "bear_put": "Медвежий пут-спред (дебет)",
     "long_straddle": "Длинный стрэддл",
+    "calendar": "Календарный спред",
 }
+HORIZONS = {"short": "2–7 дн.", "long": "14–45 дн."}
 CREDIT = {"iron_condor", "bull_put", "bear_call"}
 TREND_NAMES = {"up": "вверх", "down": "вниз", "flat": "нет"}
 
@@ -375,6 +388,30 @@ def leg_issue(l: Leg, forward: float, sc: SignalSettings) -> str | None:
     return None
 
 
+def option_fee(index: float, price: float, qty: float, rate: float, cap_pct: float) -> float:
+    """Комиссия Bybit за сделку с опционом: min(ставка·индекс, потолок % премии) × кол-во."""
+    return min(rate * index, cap_pct / 100 * price) * qty
+
+
+def cost_pct(legs: list[Leg], index: float, rate: float, cap_pct: float, slippage_pct: float = 0.0,
+             exit_trade: bool = True) -> float | None:
+    """Ожидаемые издержки, % премии по mid: вход — полуспред, проскальзывание и комиссия по ask/bid; exit_trade —
+    ещё выход сделкой (полуспред, проскальзывание, комиссия по противоположной стороне). Держать до экспирации
+    (exit_trade=False): выхода сделкой нет, поставка вне денег бесплатна. Премии нет — None."""
+    prem = abs(sum(-l.side * l.qty * l.mid for l in legs))
+    if not prem > 0:
+        return None
+    k = slippage_pct / 100
+    cost = 0.0
+    for l in legs:
+        half = (l.ask - l.bid) / 2
+        cost += (half + k * l.price) * l.qty + option_fee(index, l.price, l.qty, rate, cap_pct)
+        if exit_trade:
+            out = l.bid if l.side > 0 else l.ask
+            cost += (half + k * out) * l.qty + option_fee(index, out, l.qty, rate, cap_pct)
+    return 100 * cost / prem
+
+
 def spread_width(legs: list[Leg]) -> float:
     """Наибольшая ширина вертикали (у кондора — худшая из двух сторон), на единицу актива."""
     out = 0.0
@@ -385,7 +422,8 @@ def spread_width(legs: list[Leg]) -> float:
     return out
 
 
-def check_economics(strategy: str, legs: list[Leg], sc: SignalSettings, fair_rv: float | None = None) -> None:
+def check_economics(strategy: str, legs: list[Leg], sc: SignalSettings, fair_rv: float | None = None,
+                    rv_name: str = "RV7") -> None:
     """fair_rv — справедливая цена ATM-стрэддла при волатильности RV7 (≈0.8·S·RV·√t): покупать дороже — платить
     больше, чем стоит фактическая волатильность."""
     net = sum(-l.side * l.price for l in legs)  # на единицу: > 0 — кредит
@@ -399,7 +437,7 @@ def check_economics(strategy: str, legs: list[Leg], sc: SignalSettings, fair_rv:
         if -net > sc.max_debit_ratio * width:
             raise NoTrade(f"дебет {px(-net)} > {sc.max_debit_ratio:.0%} ширины {num(width)}")
     elif strategy == "long_straddle" and fair_rv is not None and -net > fair_rv:
-        raise NoTrade(f"стрэддл {px(-net)} дороже справедливой цены по RV7 {px(fair_rv)}")
+        raise NoTrade(f"стрэддл {px(-net)} дороже справедливой цены по {rv_name} {px(fair_rv)}")
 
 
 # ---------- выбор стратегии ----------
@@ -417,14 +455,38 @@ class Metrics:
     history_stale: bool = False        # сборщик давно не писал — pctl по старым данным не используется
     enough_history: bool = False
     trend: Trend = field(default_factory=lambda: Trend(None))
+    horizon: str = "short"             # short — IV7/RV7; long — IV30/RV30 (E1)
+    iv30: float | None = None
+    rv30: float | None = None
+
+    @property
+    def iv(self) -> float | None:
+        return self.iv30 if self.horizon == "long" else self.iv7
+
+    @property
+    def rv(self) -> float | None:
+        return self.rv30 if self.horizon == "long" else self.rv7
+
+    @property
+    def iv_name(self) -> str:
+        return ("IV30", "RV30") if self.horizon == "long" else ("IV7", "RV7")
+
+    @property
+    def rv_rising(self) -> float | None:
+        """RV14 / RV30, если волатильность растёт (длинный горизонт) — порог проверяет choose; иначе None."""
+        if self.horizon != "long" or not self.rv14 or not self.rv30:
+            return None
+        return self.rv14 / self.rv30
 
 
 def classify_iv(m: Metrics, sc: SignalSettings) -> tuple[str | None, list[str]]:
     """-> ('high' | 'low' | 'normal' | None, пояснения)."""
-    if m.iv7 is None or m.rv7 is None or m.rv7 <= 0:
-        return None, ["нет IV7 или RV7"]
-    ratio = m.iv7 / m.rv7
-    why = [f"IV7/RV7 = {m.iv7 * 100:.1f}/{m.rv7 * 100:.1f} = {ratio:.2f}"]
+    ivn, rvn = m.iv_name
+    iv, rv = m.iv, m.rv
+    if iv is None or rv is None or rv <= 0:
+        return None, [f"нет {ivn} или {rvn}"]
+    ratio = iv / rv
+    why = [f"{ivn}/{rvn} = {iv * 100:.1f}/{rv * 100:.1f} = {ratio:.2f}"]
     if m.enough_history and m.pctl is not None:
         why.append(f"pctl {m.pctl:.0f}")
         if m.pctl >= sc.pctl_high and ratio > sc.iv_rv_high:
@@ -432,13 +494,19 @@ def classify_iv(m: Metrics, sc: SignalSettings) -> tuple[str | None, list[str]]:
         # IV < RV при высоком pctl — скачок RV, а не дешёвая IV; низкий pctl при IV ≫ RV — премия дорогая
         # относительно факта: в обоих случаях покупать премию нельзя
         if m.pctl <= sc.pctl_low and ratio <= sc.iv_rv_high or ratio < 1 and m.pctl < sc.pctl_high:
-            return "low", why + [f"pctl ≤ {sc.pctl_low:g}" if m.pctl <= sc.pctl_low else "IV7 < RV7"]
+            return "low", why + [f"pctl ≤ {sc.pctl_low:g}" if m.pctl <= sc.pctl_low else f"{ivn} < {rvn}"]
     else:
-        why.append("история устарела — только IV/RV" if m.history_stale else "мало истории — только IV/RV")
+        if m.history_stale:
+            why.append("история устарела — только IV/RV")
+        elif m.horizon == "long":
+            why.append(f"мало истории (< IV_PCT_MIN_DAYS={sc.iv_pct_min_days:g} дн.) — pctl не используется, "
+                       f"только {ivn}/{rvn}")
+        else:
+            why.append("мало истории — только IV/RV")
         if ratio > sc.iv_rv_high:
             return "high", why + [f"IV/RV > {sc.iv_rv_high:g}"]
         if ratio < 1:
-            return "low", why + ["IV7 < RV7"]
+            return "low", why + [f"{ivn} < {rvn}"]
     return "normal", why
 
 
@@ -457,11 +525,13 @@ def choose(m: Metrics, sc: SignalSettings,
     why.append(f"тренд {TREND_NAMES[t.direction]} (EMA {sc.ema_fast}/{sc.ema_slow}: {t.gap_pct:+.2f}%, "
                f"наклон {t.slope_pct:+.2f}%/сут)")
     if regime == "high":
+        if (k := m.rv_rising) is not None and k >= sc.rv14_rv30_max:
+            return None, why + [f"RV14/RV30 = {k:.2f} ≥ {sc.rv14_rv30_max:g} — волатильность растёт, премию не продаём"]
         return {"flat": "iron_condor", "up": "bull_put", "down": "bear_call"}[t.direction], why
     if regime == "low":
         if t.direction != "flat":
             return {"up": "bull_call", "down": "bear_put"}[t.direction], why
-        if m.iv7 < m.rv7:
+        if m.iv < m.rv:
             return "long_straddle", why
         return None, why + ["IV низкая по истории, но не ниже RV — стрэддл не оправдан"]
     raise AssertionError(f"неизвестный режим IV: {regime}")
@@ -489,6 +559,24 @@ class Signal:
     id: int | None = None              # номер в журнале сигналов (sigjournal), если записан
     journal_first_ms: int | None = None  # повторный показ: когда записан первый (цены журнала — оттуда)
     journal_net: float | None = None     # повторный показ: премия в журнале (от первого показа)
+    horizon: str = "short"
+    far_expiry: str | None = None        # календарь: дальняя экспирация (expiry — ближняя)
+    far_expiry_ms: int | None = None
+    events: list = field(default_factory=list)  # события высокой важности до (ближней) экспирации
+    cost_pct: float | None = None        # издержки круга «вход — выход», % премии по mid
+    max_cost_pct: float = 0.0            # порог SIG_MAX_COST_PCT для карточки (книги берут его из настроек)
+
+    def is_costly(self, limit: float) -> bool:
+        """Издержки выше порога (или премии нет — издержки к ней не ограничены); limit 0 — без фильтра."""
+        return bool(limit) and bool(self.legs) and (self.cost_pct is None or self.cost_pct > limit)
+
+    @property
+    def costly(self) -> bool:
+        return self.is_costly(self.max_cost_pct)
+
+    @property
+    def tags(self) -> list[str]:
+        return ["event"] if self.events else []
 
     @property
     def net(self) -> float:
@@ -503,11 +591,29 @@ class Signal:
         return sum(l.side * l.qty * getattr(l, name) for l in self.legs)
 
 
+@dataclass
+class Market:
+    """Данные одного запроса к бирже — общие для горизонтов и календаря (paper считает всё по одному запросу)."""
+    base: str
+    now_ms: int
+    insts: dict
+    by_exp: dict[str, list[dict]]
+    exp_ms: dict[str, int]
+    exp_m: dict[str, dict]
+    h1: list
+    h4: list
+
+
+RV_HOURS = 30 * 24 + 1   # часовые свечи: RV7, RV14 и RV30 одним запросом (лимит kline — 1000)
+
+
 class SignalEngine:
     def __init__(self, client: OptionsClient, cfg: Settings = settings):
         self.c = client
         self.cfg = cfg
         self.history = IV7History(cfg.db_file, cfg.sig.target_days)
+        self.history_long = IV7History(cfg.db_file, cfg.sig.long_target_days)  # IV30 (E1)
+        self.events = events_calendar(cfg.events_file)
         self._reloaded: dict[str, float] = {}  # актив -> когда справочник перечитан из-за нового символа
 
     def _fetch(self, base: str) -> tuple[list[dict], dict, list, list]:
@@ -515,7 +621,7 @@ class SignalEngine:
         sc = self.cfg.sig
         pool = _POOL
         f_rows = pool.submit(self.c.tickers, base)
-        f_h1 = pool.submit(self.c.perp_closes, base, 60, 14 * 24 + 1)
+        f_h1 = pool.submit(self.c.perp_closes, base, 60, RV_HOURS)
         f_h4 = pool.submit(self.c.perp_closes, base, 240, min(max(200, 3 * sc.ema_slow), 999))
         insts = {i.symbol: i for i in self.c.load_instruments(base)}
         rows = f_rows.result()
@@ -534,11 +640,9 @@ class SignalEngine:
             raise ValueError(f"Базовый актив {base} не в списке BASE_COINS")
         return base
 
-    def compute(self, base: str, now_ms: int | None = None) -> Signal:
+    def market(self, base: str, now_ms: int | None = None) -> Market:
         base = self.check_base(base)
-        sc = self.cfg.sig
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-
         rows, insts, h1, h4c = self._fetch(base)
         exp_ms = {i.expiry_code: i.expiry_ms for i in insts.values()}
         by_exp: dict[str, list[dict]] = {}
@@ -547,72 +651,207 @@ class SignalEngine:
             if p and p[1] in exp_ms and r["symbol"] in insts:
                 by_exp.setdefault(p[1], []).append(r)
         exp_m = {e: m for e, rs in by_exp.items() if (m := expiry_metrics(rs, now_ms, exp_ms[e]))}
+        return Market(base, now_ms, insts, by_exp, exp_ms, exp_m, h1, h4c)
 
-        m = Metrics(base=base, ts_ms=now_ms)
-        m.iv7 = const_maturity_iv([(x["dte"], x["atm_iv"]) for x in exp_m.values()], sc.target_days)
+    def metrics(self, mk: Market, horizon: str = "short") -> Metrics:
+        sc = self.cfg.sig
+        long = horizon == "long"
+        target = sc.long_target_days if long else sc.target_days
+        m = Metrics(base=mk.base, ts_ms=mk.now_ms, horizon=horizon)
+        iv = const_maturity_iv([(x["dte"], x["atm_iv"]) for x in mk.exp_m.values()], target)
+        m.rv7 = realized_vol_window(mk.h1, 3_600_000, 7 * DAY_MS)
+        m.rv14 = realized_vol_window(mk.h1, 3_600_000, 14 * DAY_MS)
+        if long:
+            m.iv30 = iv
+            m.rv30 = realized_vol_window(mk.h1, 3_600_000, 30 * DAY_MS)
+        else:
+            m.iv7 = iv
+        m.trend = trend_of([c for _, c in mk.h4], sc.ema_fast, sc.ema_slow, sc.trend_pct)
 
-        m.rv7 = realized_vol_window(h1, 3_600_000, 7 * DAY_MS)
-        m.rv14 = realized_vol_window(h1, 3_600_000, 14 * DAY_MS)
-        m.trend = trend_of([c for _, c in h4c], sc.ema_fast, sc.ema_slow, sc.trend_pct)
-
-        hist = self.history.get(base, now_ms - sc.lookback_days * DAY_MS)
+        hist = (self.history_long if long else self.history).get(mk.base, mk.now_ms - sc.lookback_days * DAY_MS)
         if hist:
             m.history_n = len(hist)
             m.history_last_ms = hist[-1][0]
             # не размах, а покрытие — часы, в которые были срезы: пропуски в сборе не выдают себя за историю,
             # а смена COLLECTOR_INTERVAL_MIN и ручные срезы не искажают счёт
             m.history_days = len({ts // 3_600_000 for ts, _ in hist}) / 24
-            m.history_stale = now_ms - m.history_last_ms > HISTORY_STALE_MS
-            m.enough_history = m.history_days >= sc.min_history_days and not m.history_stale
-            if m.iv7 is not None:
-                m.pctl = percentile([v for _, v in hist], m.iv7)
+            m.history_stale = mk.now_ms - m.history_last_ms > HISTORY_STALE_MS
+            need = sc.iv_pct_min_days if long else sc.min_history_days
+            m.enough_history = m.history_days >= need and not m.history_stale
+            if iv is not None:
+                m.pctl = percentile([v for _, v in hist], iv)
+        return m
 
+    def _tag_events(self, sig: Signal) -> None:
+        """Собранный сигнал: тег event и оценка издержек."""
+        pc = self.cfg.paper
+        sig.max_cost_pct = self.cfg.sig.max_cost_pct
+        if sig.legs and sig.forward:
+            # круг «вход — выход» всегда: и при удержании до экспирации книги часто выходят сделкой (цель, стоп),
+            # а поставка в деньгах стоит комиссии — оценка «только вход» пропускала бы дорогие сделки
+            sig.cost_pct = cost_pct(sig.legs, sig.forward, pc.fee_rate, pc.fee_cap_pct, pc.slippage_pct)
+        if sig.expiry_ms is not None:
+            try:  # календарь — справочный: сбой чтения не мешает сигналу
+                sig.events = self.events.between(sig.metrics.ts_ms, sig.expiry_ms)
+            except Exception:
+                log.exception("Календарь событий не прочитан")
+
+    def compute(self, base: str, now_ms: int | None = None, horizon: str = "short",
+                market: Market | None = None, min_dte: float = 0.0) -> Signal:
+        """min_dte — экспирации не ближе (бумажные книги: срок раннего выхода — иначе выход сразу после входа)."""
+        if horizon not in HORIZONS:
+            raise ValueError(f"горизонт {horizon!r}: short или long")
+        sc = self.cfg.sig
+        mk = market if market is not None else self.market(base, now_ms)
+        long = horizon == "long"
+        dte_min, dte_max = (sc.long_dte_min, sc.long_dte_max) if long else (sc.dte_min, sc.dte_max)
+        dte_min = max(dte_min, min_dte)
+        target = sc.long_target_days if long else sc.target_days
+        m = self.metrics(mk, horizon)
         cls = classify_iv(m, sc)
         strategy, why = choose(m, sc, cls)
-        sig = Signal(metrics=m, strategy=strategy, reasons=why, regime=cls[0])
+        sig = Signal(metrics=m, strategy=strategy, reasons=why, regime=cls[0], horizon=horizon)
         if strategy is None:
             sig.no_signal = why[-1]
             return sig
 
-        cands = sorted((e for e, x in exp_m.items() if sc.dte_min <= x["dte"] <= sc.dte_max),
-                       key=lambda e: abs(exp_m[e]["dte"] - sc.target_days))
+        exp_m, insts = mk.exp_m, mk.insts
+        cands = sorted((e for e, x in exp_m.items() if dte_min <= x["dte"] <= dte_max),
+                       key=lambda e: abs(exp_m[e]["dte"] - target))
         if not cands:
-            sig.no_signal = f"нет экспирации в окне {sc.dte_min:g}–{sc.dte_max:g} дн."
+            sig.no_signal = f"нет экспирации в окне {dte_min:g}–{dte_max:g} дн."
             return sig
         for e in cands:
             x = exp_m[e]
             if not x["atm_iv"]:
                 sig.rejected.append(f"{e}: нет ATM IV")
                 continue
-            chain: Chain = {float(k): v for k, v in group_by_strike(by_exp[e]).items()}
+            chain: Chain = {float(k): v for k, v in group_by_strike(mk.by_exp[e]).items()}
             em = x["underlying"] * x["atm_iv"] * math.sqrt(x["dte"] / 365)
             try:
                 legs = build_legs(strategy, chain, x["atm_strike"], em, 1.0, sc, x["underlying"])
-                qty = max(float(insts[l.symbol].min_qty) for l in legs)  # минимальный лот, общий для всех ног
-                q = Decimal(str(qty))
-                if any(insts[l.symbol].qty_step and q % insts[l.symbol].qty_step for l in legs):
-                    raise NoTrade(f"лот {num(qty)} не кратен шагу количества одной из ног")
-                for l in legs:
-                    l.qty = qty
+                qty = self._lot(legs, insts)
                 issues = [i for l in legs if (i := leg_issue(l, x["underlying"], sc))]
                 if issues:
                     raise NoTrade("; ".join(issues))
-                fair_rv = x["underlying"] * m.rv7 * math.sqrt(x["dte"] / 365) * STRADDLE_K if m.rv7 else None
-                check_economics(strategy, legs, sc, fair_rv)
+                fair_rv = x["underlying"] * m.rv * math.sqrt(x["dte"] / 365) * STRADDLE_K if m.rv else None
+                check_economics(strategy, legs, sc, fair_rv, m.iv_name[1])
             except NoTrade as err:
                 sig.rejected.append(f"{e}: {err}")
                 continue
             sig.expiry, sig.dte, sig.forward, sig.exp_iv = e, x["dte"], x["underlying"], x["atm_iv"]
-            sig.expiry_ms = exp_ms[e]
+            sig.expiry_ms = mk.exp_ms[e]
             sig.em, sig.straddle, sig.qty, sig.legs = em, x["straddle_mark"], qty, legs
             sig.profile = profile(legs)
+            self._tag_events(sig)
             return sig
         sig.no_signal = "ни на одной экспирации окна стратегия не собралась"
         return sig
 
+    @staticmethod
+    def _lot(legs: list[Leg], insts: dict) -> float:
+        """Минимальный лот, общий для всех ног (проставляется в ноги)."""
+        qty = max(float(insts[l.symbol].min_qty) for l in legs)
+        q = Decimal(str(qty))
+        if any(insts[l.symbol].qty_step and q % insts[l.symbol].qty_step for l in legs):
+            raise NoTrade(f"лот {num(qty)} не кратен шагу количества одной из ног")
+        for l in legs:
+            l.qty = qty
+        return qty
+
+    def calendar_signal(self, base: str, now_ms: int | None = None, market: Market | None = None,
+                        metrics: Metrics | None = None, min_near_dte: float = 0.0) -> Signal:
+        """Календарный спред (длинный горизонт): продажа ближней ATM, покупка дальней того же страйка.
+        metrics — уже посчитанные метрики длинного горизонта по тому же market (не считать дважды)."""
+        sc = self.cfg.sig
+        mk = market if market is not None else self.market(base, now_ms)
+        m = metrics if metrics is not None else self.metrics(mk, "long")
+        sig = Signal(metrics=m, strategy=None, reasons=[], horizon="long")
+        t = m.trend
+        if t.direction != "flat":
+            sig.no_signal = ("тренд не определён (мало свечей)" if t.direction is None
+                             else f"тренд {TREND_NAMES[t.direction]} — календарь только при боковом")
+            sig.reasons.append(sig.no_signal)
+            return sig
+        sig.reasons.append(f"тренд нет (EMA {sc.ema_fast}/{sc.ema_slow}: {t.gap_pct:+.2f}%)")
+        if (k := m.rv_rising) is not None and k >= sc.rv14_rv30_max:
+            sig.no_signal = f"RV14/RV30 = {k:.2f} ≥ {sc.rv14_rv30_max:g} — волатильность растёт, ближнюю не продаём"
+            sig.reasons.append(sig.no_signal)
+            return sig
+        exp_m = mk.exp_m
+        nears = sorted((e for e, x in exp_m.items() if max(sc.cal_near_dte_min, min_near_dte) <= x["dte"]
+                        <= sc.cal_near_dte_max and x["atm_iv"]), key=lambda e: abs(exp_m[e]["dte"] - sc.target_days))
+        fars = sorted((e for e, x in exp_m.items() if sc.long_dte_min <= x["dte"] <= sc.long_dte_max
+                       and x["atm_iv"]), key=lambda e: abs(exp_m[e]["dte"] - sc.long_target_days))
+        if not nears or not fars:
+            sig.no_signal = (f"нет пары экспираций: ближняя {sc.cal_near_dte_min:g}–{sc.cal_near_dte_max:g} дн., "
+                             f"дальняя {sc.long_dte_min:g}–{sc.long_dte_max:g} дн.")
+            return sig
+        best_ratio, built = None, False  # built — инверсия была, но ноги не собрались
+        for ne in nears:
+            for fe in fars:
+                xn, xf = exp_m[ne], exp_m[fe]
+                if xf["dte"] < xn["dte"] + 7:  # дальняя — хотя бы на неделю дальше
+                    continue
+                ratio = xn["atm_iv"] / xf["atm_iv"]
+                best_ratio = ratio if best_ratio is None else max(best_ratio, ratio)
+                if ratio < sc.calendar_inversion:
+                    sig.rejected.append(f"{ne}/{fe}: IV {ratio:.2f} < {sc.calendar_inversion:g}")
+                    continue
+                try:
+                    legs = self._calendar_legs(mk, ne, fe, xn)
+                except NoTrade as err:
+                    sig.rejected.append(f"{ne}/{fe}: {err}")
+                    built = True
+                    continue
+                sig.strategy, sig.regime = "calendar", "inversion"
+                sig.reasons.append(f"IV ближней {ne} / дальней {fe} = {xn['atm_iv'] * 100:.1f}/"
+                                   f"{xf['atm_iv'] * 100:.1f} = {ratio:.2f} ≥ {sc.calendar_inversion:g}")
+                sig.expiry, sig.expiry_ms, sig.dte = ne, mk.exp_ms[ne], xn["dte"]
+                sig.far_expiry, sig.far_expiry_ms = fe, mk.exp_ms[fe]
+                sig.forward, sig.exp_iv, sig.straddle = xn["underlying"], xn["atm_iv"], xn["straddle_mark"]
+                sig.em = xn["underlying"] * xn["atm_iv"] * math.sqrt(xn["dte"] / 365)  # до ближней
+                sig.legs, sig.qty = legs, legs[0].qty
+                debit = -sig.net
+                sig.profile = Profile(max_profit=math.nan, max_loss=debit, breakevens=[])  # риск одного страйка = дебет
+                self._tag_events(sig)
+                return sig
+        if built:
+            sig.no_signal = "инверсия IV есть, но календарь не собрался"
+        elif best_ratio is None:
+            sig.no_signal = "нет пары экспираций с разницей ≥ 7 дн."
+        else:
+            sig.no_signal = f"инверсии IV нет (лучшая {best_ratio:.2f} < {sc.calendar_inversion:g})"
+        sig.reasons.append(sig.no_signal)
+        return sig
+
+    def _calendar_legs(self, mk: Market, ne: str, fe: str, xn: dict) -> list[Leg]:
+        sc = self.cfg.sig
+        near = {float(k): v for k, v in group_by_strike(mk.by_exp[ne]).items()}
+        far = {float(k): v for k, v in group_by_strike(mk.by_exp[fe]).items()}
+        k = xn["atm_strike"]
+        issues = []
+        for kind in ("C", "P"):  # колл или пут того же страйка — что ликвиднее (сначала колл)
+            if kind not in near.get(k, {}) or kind not in far.get(k, {}):
+                issues.append(f"нет {kind} {num(k)} в обеих сериях")
+                continue
+            legs = [make_leg(near[k][kind], -1, 1.0), make_leg(far[k][kind], +1, 1.0)]
+            bad = [i for l in legs if (i := leg_issue(l, xn["underlying"], sc))]
+            if bad:
+                issues.append("; ".join(bad))
+                continue
+            if sum(-l.side * l.price for l in legs) >= 0:
+                issues.append("нет дебета (дальняя не дороже ближней по исполнимым ценам)")
+                continue
+            self._lot(legs, mk.insts)
+            return legs
+        raise NoTrade(" | ".join(issues))
+
 
 # ---------- карточка ----------
 def _usd(x: float) -> str:
+    if math.isnan(x):  # календарь: зависит от IV дальней в момент выхода
+        return "оценки нет"
     return "без ограничения" if math.isinf(x) else f"{money(x)} USDT"
 
 
@@ -623,7 +862,9 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
     lines = [env_banner(env), *([head] if head else []), f"📊 {m.base} — сигнал на {utc(m.ts_ms)} UTC"]
     if sig.strategy and sig.legs:
         num_ = f"#{sig.id} " if sig.id else ""
-        lines.append(f"{num_}{STRATEGIES[sig.strategy]} · {sig.expiry} ({sig.dte:.1f} дн.)")
+        far = f" / {sig.far_expiry}" if sig.far_expiry else ""
+        hz = f" · горизонт {HORIZONS[sig.horizon]}" if sig.horizon != "short" else ""
+        lines.append(f"{num_}{STRATEGIES[sig.strategy]} · {sig.expiry}{far} ({sig.dte:.1f} дн.){hz}")
         # повтор — запись старше этого расчёта или с другими ценами (свой же показ из кэша — не повтор)
         if sig.id and sig.journal_first_ms and (
                 sig.journal_first_ms < m.ts_ms
@@ -650,6 +891,13 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
                      f"Vega {sig.greek('vega'):+.2f} Θ {sig.greek('theta'):+.2f}/сут")
         lines.append(f"Ожидаемое движение до {sig.expiry}: ±{px(sig.em)} "
                      f"({sig.em / sig.forward * 100:.1f}%) · стрэддл {px(sig.straddle or 0)} · F {px(sig.forward)}")
+        if sig.cost_pct is not None:
+            warn = "⚠️ " if sig.costly else ""
+            lines.append(f"{warn}Издержки ≈ {sig.cost_pct:.0f}% премии (вход и выход: комиссии, спред, проскальзывание)"
+                         + (f" > {sig.max_cost_pct:g}% — книги с фильтром не открыли бы" if warn else ""))
+        if sig.events:
+            lines.append("⚠️ event: " + ", ".join(f"{e.name} {utc(e.ts_ms)}" for e in sig.events)
+                         + f" — до {sig.expiry} (статистика с тегом — отдельно)")
     for r in sig.rejected:
         lines.append(f"  ✗ {r}")
 
@@ -657,7 +905,10 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
         return pct(x) + ("%" if x else "")
 
     lines.append("\nМетрики:")
-    lines.append(f" IV7 {pc(m.iv7)} · RV7 {pc(m.rv7)} · RV14 {pc(m.rv14)}")
+    if m.horizon == "long":
+        lines.append(f" IV30 {pc(m.iv30)} · RV30 {pc(m.rv30)} · RV14 {pc(m.rv14)}")
+    else:
+        lines.append(f" IV7 {pc(m.iv7)} · RV7 {pc(m.rv7)} · RV14 {pc(m.rv14)}")
     if m.pctl is None:
         hist = "истории нет"
     else:

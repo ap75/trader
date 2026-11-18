@@ -310,10 +310,11 @@ def bs(F, K, t, iv, kind):
 
 
 def set_chain(fake, base="BTC", F=65000.0, iv=0.5, step=500, n=20, spread=0.04, oi="50", exp=EXP,
-              exp_ms=EXP_MS, now=NOW, min_qty="0.01"):
-    """Заменяет опционы актива цепочкой с ценами и дельтами по Блэку–Шоулзу."""
-    fake.instruments = [i for i in fake.instruments if i["baseCoin"] != base]
-    fake.tickers = {s: t for s, t in fake.tickers.items() if not s.startswith(base + "-")}
+              exp_ms=EXP_MS, now=NOW, min_qty="0.01", keep=False):
+    """Заменяет опционы актива цепочкой с ценами и дельтами по Блэку–Шоулзу (keep — добавить серию к прежним)."""
+    if not keep:
+        fake.instruments = [i for i in fake.instruments if i["baseCoin"] != base]
+        fake.tickers = {s: t for s, t in fake.tickers.items() if not s.startswith(base + "-")}
     t = (exp_ms - now) / DAY_MS / 365
     atm = round(F / step) * step
     for k in range(atm - n * step, atm + n * step + 1, step):
@@ -336,7 +337,7 @@ def set_chain(fake, base="BTC", F=65000.0, iv=0.5, step=500, n=20, spread=0.04, 
 def set_klines(fake, base="BTC", rv=0.4, trend_per_bar=0.0, now=NOW):
     """1h: колебания с годовой RV ≈ rv; 4h: рост/падение trend_per_bar за свечу (0 — колебания без тренда)."""
     a = rv / math.sqrt(365 * 24)
-    h1 = [65000 * (1 + a if i % 2 else 1) for i in range(400)]
+    h1 = [65000 * (1 + a if i % 2 else 1) for i in range(800)]  # RV30 — 720 ч
     if trend_per_bar:
         h4 = [65000 * (1 + trend_per_bar) ** i for i in range(200)]
     else:

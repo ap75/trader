@@ -261,6 +261,93 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # 6: бумажные книги эксперимента E1 (optbot/paper.py)
+    [
+        """
+        CREATE TABLE books (                   -- книга = горизонт × стратегия × актив
+            id         TEXT PRIMARY KEY,       -- short:iron_condor:BTC
+            horizon    TEXT NOT NULL,          -- short (2–7 дн.) | long (14–45 дн.)
+            strategy   TEXT NOT NULL,
+            base       TEXT NOT NULL,
+            created_ms INTEGER NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE paper_trades (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            book          TEXT    NOT NULL,
+            horizon       TEXT    NOT NULL,
+            strategy      TEXT    NOT NULL,
+            base          TEXT    NOT NULL,
+            opened_ms     INTEGER NOT NULL,
+            expiry        TEXT    NOT NULL,    -- у календаря — ближняя
+            expiry_ms     INTEGER NOT NULL,
+            far_expiry    TEXT,                -- календарь: дальняя
+            far_expiry_ms INTEGER,
+            legs          TEXT    NOT NULL,    -- JSON: symbol, kind, strike, side, expiry_ms, bid, ask, mark, fill
+            qty           REAL    NOT NULL,
+            qty_budget    REAL,                -- кол-во по бюджету риска (до лимитов и шага лота)
+            qty_cap       TEXT,                -- урезано лимитом: MAX_QTY_<A> / MAX_POSITION_<A>
+            entry_net     REAL,                -- премия по ценам входа на позицию: > 0 кредит
+            entry_fees    REAL,
+            max_profit    REAL,                -- на позицию с комиссией входа, NULL — без потолка / нет оценки
+            max_loss      REAL    NOT NULL,    -- риск сделки (R) с комиссией входа
+            im_regular    REAL,                -- IM обычного режима на входе (расчёт)
+            im_pm         REAL,                -- IM Portfolio Margin — для бумажных книг не известна (NULL)
+            forward       REAL,
+            em            REAL,                -- ожидаемое движение до (ближней) экспирации
+            tags          TEXT,                -- event — событие высокой важности до (ближней) экспирации
+            events        TEXT,                -- JSON: [{ts, name}]
+            metrics       TEXT,                -- JSON: IV/RV, pctl (используется ли), тренд, режим, причины
+            cfg           TEXT,                -- PAPER_* на входе (JSON)
+            status        TEXT    NOT NULL DEFAULT 'open',  -- open | closed | void
+            closed_ms     INTEGER,
+            close_reason  TEXT,                -- take | stop | time | cal_time | cal_take | cal_move | expiry | void
+            exit_net      REAL,                -- премия закрытия (+ получено) или выплата на поставке
+            exit_fees     REAL,
+            delivery_price REAL,
+            pnl           REAL,                -- с издержками входа и выхода
+            r_mult        REAL,                -- pnl / max_loss
+            mark_ms       INTEGER,             -- последняя отметка по рынку
+            mark_pnl      REAL                 -- PnL по mark на последней отметке
+        )
+        """,
+        """
+        CREATE INDEX paper_trades_book ON paper_trades (book, status)
+        """,
+        """
+        CREATE TABLE book_equity (             -- кривая книги на каждый срез (просадка, Шарп, Сортино — E3)
+            ts         INTEGER NOT NULL,
+            book       TEXT    NOT NULL,
+            realized   REAL    NOT NULL,       -- сумма PnL закрытых
+            unrealized REAL    NOT NULL,       -- открытые по mark, с комиссией входа
+            open_n     INTEGER NOT NULL,
+            open_risk  REAL    NOT NULL,
+            im_regular REAL,
+            im_pm      REAL,
+            PRIMARY KEY (ts, book)
+        )
+        """,
+        """
+        CREATE TABLE paper_skips (             -- сигнал был, сделки нет: одна причина на книгу и экспирацию
+            book   TEXT    NOT NULL,
+            expiry TEXT    NOT NULL,
+            code   TEXT    NOT NULL,           -- qty | max_open | total_risk | data
+            ts     INTEGER NOT NULL,
+            reason TEXT,
+            PRIMARY KEY (book, expiry, code)
+        )
+        """,
+    ],
+    # 7: книги с фильтром издержек (SIG_MAX_COST_PCT) рядом с книгами без него, издержки сделки
+    [
+        """
+        ALTER TABLE books ADD COLUMN cost_filter INTEGER NOT NULL DEFAULT 0
+        """,
+        """
+        ALTER TABLE paper_trades ADD COLUMN cost_pct REAL
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе

@@ -19,7 +19,8 @@
 
 ## Безопасность
 
-- `BYBIT_ENV=demo` сейчас. Переход на mainnet — только с явного согласия пользователя.
+- `BYBIT_ENV=demo` сейчас. Переход на mainnet — только с явного согласия пользователя. При переходе — напомнить: в боевом `.env`
+  малые `MAX_QTY_*`/`MAX_POSITION_*` (на demo `MAX_QTY_BTC`/`MAX_POSITION_BTC` подняты до 0.5 — не переносить).
 - Бот работает **на сервере** (`~/trader`, служба `options-bot`, `systemctl --user`). Локально `optbot.bot` не запускать:
   один токен — один экземпляр (Telegram `Conflict`). Рабочая БД — на сервере; локальная `data/` устарела,
   `collector`/`journal` локально дают старые данные — запускать на сервере.
@@ -41,6 +42,7 @@
 .venv/bin/python -m optbot.journal --sync | --report 7d [--csv f]   # журнал сделок (на сервере)
 .venv/bin/python -m optbot.cli signals BTC       # сигнал этапа 3 (pctl — по истории БД: на сервере)
 .venv/bin/python -m optbot.sigjournal --evaluate | --stats 30d [--base BTC] [--csv f]   # журнал сигналов (на сервере)
+.venv/bin/python -m optbot.paper --status | --stats 30d [--csv f] | --step | --check-delivery-fees   # книги E1 (на сервере)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
 ```
@@ -67,6 +69,10 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 сигналы (`signals.py`) читают `snapshots` для IV percentile; журнал сигналов (`sigjournal.py`) — таблица `signals`,
 путь сделки — по `leg_marks`, итог — по `delivery_prices`. Кнопка «Выставить» — `multileg.py` (ноги IOC, сначала покупки),
 итог исполнения — таблица `signal_executions`, ордера — `order_links` с `source=signal`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
+Бумажные книги E1 (`paper.py`, шаг после каждого среза): `books`, `paper_trades`, `book_equity`, `paper_skips`;
+каждая книга — в двух версиях: без фильтра издержек и `…:cost` (`SIG_MAX_COST_PCT`);
+ноги — на слежение (`tracked_symbols`, reason `book:<id>`); длинный горизонт и календарь — `signals.py`
+(`horizon="long"`, `calendar_signal`); тег event — `events.csv` (`events.py`, дописывать вперёд).
 `bot_state` — отметка «бот работает» (нештатная остановка видна при следующем старте; срочные администратору — `bot.admin_alert`).
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

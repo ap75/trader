@@ -1,0 +1,27 @@
+# Календарь событий высокой важности (тег event у бумажных сделок, optbot/paper.py). Время — UTC.
+# Источники: federalreserve.gov/monetarypolicy/fomccalendars.htm (решение FOMC 14:00 ET, второй день),
+# bls.gov/schedule/news_release/cpi.htm (CPI 08:30 ET). Проверено 2026-11-18; даты 2027 FOMC — предварительные.
+# Дописывать вперёд хотя бы на 45 дней (горизонт длинных книг); прошедшие строки можно не удалять.
+# date,time_utc,importance,name
+2026-12-09,19:00,high,FOMC
+2026-12-10,13:30,high,CPI
+2027-01-13,13:30,high,CPI
+2027-01-27,19:00,high,FOMC
+2027-02-11,13:30,high,CPI
+2027-03-10,13:30,high,CPI
+2027-03-17,18:00,high,FOMC
+2027-04-13,12:30,high,CPI
+2027-04-28,18:00,high,FOMC
+2027-05-12,12:30,high,CPI
+2027-06-09,18:00,high,FOMC
+2027-06-10,12:30,high,CPI
+2027-07-14,12:30,high,CPI
+2027-07-28,18:00,high,FOMC
+2027-08-11,12:30,high,CPI
+2027-09-14,12:30,high,CPI
+2027-09-15,18:00,high,FOMC
+2027-10-14,12:30,high,CPI
+2027-10-27,18:00,high,FOMC
+2027-11-10,13:30,high,CPI
+2027-11-17,19:00,high,FOMC
+2027-12-10,13:30,high,CPI

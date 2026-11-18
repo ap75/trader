@@ -85,7 +85,8 @@ def _pair_bad(a, b, k, strict: bool) -> bool:
 
 
 _SIG_PAIRS = {"dte_min": 2, "dte_max": 7, "ema_fast": 12, "ema_slow": 48, "pctl_low": 30, "pctl_high": 70,
-              "debit_short_delta": 0.25, "debit_long_delta": 0.45, "min_history_days": 14, "lookback_days": 60}
+              "debit_short_delta": 0.25, "debit_long_delta": 0.45, "min_history_days": 14, "lookback_days": 60,
+              "long_dte_min": 14, "long_dte_max": 45, "cal_near_dte_min": 5, "cal_near_dte_max": 14}
 # ↑ значения по умолчанию связанных порогов — единственный источник: поля ниже берут их отсюда
 
 
@@ -111,6 +112,21 @@ class SignalSettings:
     min_oi_usd: float = _float_in("SIG_MIN_OI_USD", 20000, 0, 1e9)     # OI ноги × форвард, USDT
     min_credit_ratio: float = _float_in("SIG_MIN_CREDIT_RATIO", 0.10, 0, 0.9)  # кредит ≥ доли ширины спреда
     max_debit_ratio: float = _float_in("SIG_MAX_DEBIT_RATIO", 0.60, 0.1, 1)    # дебет ≤ доли ширины спреда
+    # издержки (комиссии входа и выхода + спред bid/ask) ≤ N% премии по mid: в карточке — предупреждение,
+    # бумажные книги с фильтром («:cost») не открывают; 0 — без фильтра
+    max_cost_pct: float = _float_in("SIG_MAX_COST_PCT", 15, 0, 100)
+    # Длинный горизонт (эксперимент E1, бумажные книги): окно экспираций, срок IV, RV за 30 дн.
+    long_dte_min: float = _float_in("SIG_LONG_DTE_MIN", _SIG_PAIRS["long_dte_min"], 7, 120)
+    long_dte_max: float = _float_in("SIG_LONG_DTE_MAX", _SIG_PAIRS["long_dte_max"], 7, 180)
+    long_target_days: float = _float_in("SIG_LONG_TARGET_DAYS", 30, 7, 120)   # IV30
+    # RV14 / RV30 ≥ k — волатильность растёт: премию не продавать (кредитные стратегии, календарь)
+    rv14_rv30_max: float = _float_in("SIG_RV14_RV30_MAX", 1.25, 1, 5)
+    # percentile IV30 — только при истории ≥ N дн. (до этого решение по IV30/RV30, с пометкой)
+    iv_pct_min_days: float = _float_in("IV_PCT_MIN_DAYS", 30, 1, 365)
+    # Календарный спред: ATM IV ближней / дальней ≥ k (инверсия) и тренд боковой
+    calendar_inversion: float = _float_in("SIG_CALENDAR_INVERSION", 1.10, 1, 3)
+    cal_near_dte_min: float = _float_in("SIG_CAL_NEAR_DTE_MIN", _SIG_PAIRS["cal_near_dte_min"], 1, 60)  # ближняя нога
+    cal_near_dte_max: float = _float_in("SIG_CAL_NEAR_DTE_MAX", _SIG_PAIRS["cal_near_dte_max"], 1, 60)
 
     def __post_init__(self):
         # перепутанные пары — обе по умолчанию (сигналы не должны молча работать на несогласованных порогах)
@@ -119,6 +135,8 @@ class SignalSettings:
                                        ("ema_fast", "ema_slow", 1, True, "меньше"),
                                        ("pctl_low", "pctl_high", 1, True, "меньше"),
                                        ("debit_short_delta", "debit_long_delta", 1, True, "меньше"),
+                                       ("long_dte_min", "long_dte_max", 1, False, "не больше"),
+                                       ("cal_near_dte_min", "cal_near_dte_max", 1, False, "не больше"),
                                # история считается по часам со срезами: окно с запасом на пропуски сбора
                                        ("min_history_days", "lookback_days", 1.25, False, "не больше 80% от")):
             a, b = getattr(self, lo), getattr(self, hi)
@@ -137,6 +155,12 @@ class SignalSettings:
                     ", ".join(f"SIG_{x.upper()}={_SIG_PAIRS[x]}" for x in reset))
                 for x in reset:
                     object.__setattr__(self, x, _SIG_PAIRS[x])
+        if self.iv_pct_min_days > 0.8 * self.lookback_days:  # покрытие часами со срезами — с запасом на пропуски
+            fixed = round(0.8 * self.lookback_days, 1)
+            logging.getLogger("optbot.config").warning(
+                "IV_PCT_MIN_DAYS=%g больше 80%% от SIG_LOOKBACK_DAYS=%g — история не наберётся, использую %g",
+                self.iv_pct_min_days, self.lookback_days, fixed)
+            object.__setattr__(self, "iv_pct_min_days", fixed)
         if not self.dte_min <= self.target_days <= self.dte_max:  # не сброс: может быть намеренно
             logging.getLogger("optbot.config").warning(
                 "SIG_TARGET_DAYS=%g вне окна экспираций SIG_DTE_MIN…SIG_DTE_MAX (%g…%g): IV считается на другой срок, "
@@ -144,6 +168,45 @@ class SignalSettings:
 
 
 _SIG_DEFAULT = SignalSettings()
+# поля длинного горизонта и календаря: в версию порогов журнала сигналов (/signals — короткий горизонт) не входят
+SIG_LONG_FIELDS = frozenset({"long_dte_min", "long_dte_max", "long_target_days", "rv14_rv30_max", "iv_pct_min_days",
+                             "calendar_inversion", "cal_near_dte_min", "cal_near_dte_max", "max_cost_pct"})
+
+
+def _per_base(name: str, default: float, lo: float, hi: float, overrides: dict[str, float] | None = None
+              ) -> dict[str, float]:
+    """{актив: значение}: NAME_<АКТИВ> или NAME, иначе default (или overrides[актив])."""
+    common = _float_in(name, default, lo, hi)
+    out = {}
+    for c in _list("BASE_COINS", "BTC,ETH,SOL"):
+        dflt = common if (os.getenv(name) or "").strip() else (overrides or {}).get(c, default)
+        out[c] = _float_in(f"{name}_{c}", dflt, lo, hi)
+    return out
+
+
+@dataclass(frozen=True)
+class PaperSettings:
+    """Бумажный движок (эксперимент E1, optbot.paper). Проценты — в процентах."""
+    enabled: bool = _bool("PAPER_ENABLED", True)
+    bases: tuple[str, ...] = tuple(_list("PAPER_BASES") or _list("BASE_COINS", "BTC,ETH,SOL"))
+    risk_usdt: float = _float_in("PAPER_RISK_USDT", 100, 1, 1e6)               # бюджет риска на сделку
+    max_open_per_book: int = _int_in("PAPER_MAX_OPEN_PER_BOOK", 5, 1, 100)
+    max_total_risk_usdt: float = _float_in("PAPER_MAX_TOTAL_RISK_USDT", 3000, 0, 1e9)  # 0 — без лимита
+    slippage_pct: float = _float_in("PAPER_SLIPPAGE_PCT", 1, 0, 50)            # хуже bid/ask на N% цены
+    fee_rate: float = _float_in("PAPER_FEE_RATE", 0.0003, 0, 0.01)            # от индекса × кол-во (taker)
+    fee_cap_pct: float = _float_in("PAPER_FEE_CAP_PCT", 7, 0, 100)             # но не больше N% премии
+    # поставка: min(ставка × индекс, 12.5% внутренней стоимости) × кол-во; вне денег — 0 (Bybit, 2026-11)
+    delivery_fee_rate: dict[str, float] = field(default_factory=lambda: _per_base(
+        "PAPER_DELIVERY_FEE_RATE", 0.00015, 0, 0.01, {"SOL": 0.0002}))
+    delivery_fee_cap_pct: float = _float_in("PAPER_DELIVERY_FEE_CAP_PCT", 12.5, 0, 100)
+    take_pct: float = _float_in("PAPER_TAKE_PCT", 50, 1, 100)                  # выход: % макс. прибыли
+    stop_pct: float = _float_in("PAPER_STOP_PCT", 50, 1, 100)                  # стоп: убыток ≥ % макс. убытка
+    exit_days_short: float = _float_in("PAPER_EXIT_DAYS_SHORT", 0, 0, 30)      # за N дн. до экспирации; 0 — держать
+    exit_days_long: float = _float_in("PAPER_EXIT_DAYS_LONG", 7, 0, 60)
+    calendar_exit_h: float = _float_in("PAPER_CALENDAR_EXIT_H", 18, 1, 72)     # до ближней экспирации
+    calendar_take_pct: float = _float_in("PAPER_CALENDAR_TAKE_PCT", 35, 1, 500)  # прибыль ≥ % дебета
+    im_short_pct: float = _float_in("PAPER_IM_SHORT_PCT", 10, 0, 100)          # IM короткой: mark + max(N%·S − OTM,
+    im_min_pct: float = _float_in("PAPER_IM_MIN_PCT", 5, 0, 100)               #                     M%·S)
 
 
 @dataclass(frozen=True)
@@ -208,7 +271,10 @@ class Settings:
     passive_first_leg_seconds: float = _float_in("PASSIVE_FIRST_LEG_SECONDS", 0, 0, 120)
 
     # Сигналы (этап 3): пороги SIG_*
-    sig: SignalSettings = _SIG_DEFAULT  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
+    sig: SignalSettings = _SIG_DEFAULT
+    paper: PaperSettings = field(default_factory=PaperSettings)
+    # календарь событий высокой важности (тег event): относительный путь — от корня проекта
+    events_path: str = os.getenv("EVENTS_FILE", "events.csv").strip() or "events.csv"  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
 
     # Telegram
     tg_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -249,6 +315,10 @@ class Settings:
     def db_file(self) -> str:
         path = self.db_path or os.path.join("data", f"market-{self.env}.db")
         return path if os.path.isabs(path) else os.path.join(ROOT, path)
+
+    @property
+    def events_file(self) -> str:
+        return self.events_path if os.path.isabs(self.events_path) else os.path.join(ROOT, self.events_path)
 
     @property
     def is_mainnet(self) -> bool:

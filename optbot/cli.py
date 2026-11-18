@@ -13,6 +13,7 @@
     python -m optbot.cli cancel-all [BASE]
     python -m optbot.cli close BTC-27MAR26-70000-P [--price 120]
     python -m optbot.cli signals BTC        сигнал (этап 3): стратегия, ноги, риск — без ордеров; пишется в журнал
+    python -m optbot.cli signals BTC --horizon long   14–45 дн. и календарь (E1, без журнала)
                                             сигналов (статистика: python -m optbot.sigjournal --stats 30d)
 
 Любое действие с ордерами требует подтверждения y/N.
@@ -98,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("signals", help="сигнал: стратегия, ноги, риск (без ордеров; история — из БД сборщика)")
     s.add_argument("base")
+    s.add_argument("--horizon", choices=("short", "long"), default="short",
+                   help="long — 14–45 дн. и календарный спред (бумажные книги E1; в журнал сигналов не пишется)")
 
     sub.add_parser("balance", help="баланс UTA")
     for name, hlp in (("positions", "открытые позиции"), ("orders", "открытые ордера"),
@@ -145,6 +148,12 @@ def run(args: argparse.Namespace, c: OptionsClient) -> None:
         print(fmt_chain(c.chain(args.base, args.expiry, args.n), wide=args.wide))
     elif cmd == "ticker":
         print(fmt_ticker(c.ticker(c.resolve_symbol(args.symbol).symbol)))
+    elif cmd == "signals" and args.horizon == "long":
+        eng = SignalEngine(c, c.cfg)
+        mk = eng.market(args.base)
+        print(fmt_signal(eng.compute(args.base, horizon="long", market=mk), c.cfg.env))
+        print()
+        print(fmt_signal(eng.calendar_signal(args.base, market=mk), c.cfg.env, "Календарный спред:"))
     elif cmd == "signals":
         sig = SignalEngine(c, c.cfg).compute(args.base)
         try:  # тоже выдача — в журнал сигналов; сбой записи не мешает показать сигнал
