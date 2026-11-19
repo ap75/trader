@@ -48,6 +48,7 @@ from decimal import ROUND_FLOOR, Decimal
 from . import db
 from .bybit_client import OptionsClient, option_intrinsic, parse_option_symbol
 from .collector import track
+from .context import FNG_ORDER, FUNDING_ORDER, fng_bucket, funding_bucket
 from .config import PaperSettings, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
 from .journal import Journal, load_delivery_prices, nearest_price, parse_period
@@ -317,7 +318,7 @@ class PaperEngine:
                        rv30=m.rv30, pctl=m.pctl, pctl_used=m.enough_history and m.pctl is not None,
                        history_days=m.history_days, history_stale=m.history_stale, regime=sig.regime,
                        trend=m.trend.direction, ema_gap_pct=m.trend.gap_pct, exp_iv=sig.exp_iv, dte=sig.dte,
-                       reasons=sig.reasons)
+                       reasons=sig.reasons, **(m.ctx.as_dict() if m.ctx else {}))
         events = [dict(ts=e.ts_ms, name=e.name) for e in sig.events]
         over, tid = None, None
         with conn:
@@ -716,6 +717,13 @@ def fmt_rejects(rejects: dict[str, tuple[int, int]]) -> list[str]:
     return lines
 
 
+def _metrics(r: dict) -> dict:
+    try:
+        return json.loads(r.get("metrics") or "{}")
+    except (TypeError, ValueError):
+        return {}
+
+
 def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] | None = None) -> str:
     if not rows:
         return "\n".join([f"Бумажные книги, {label}: закрытых сделок нет", *fmt_rejects(rejects or {})])
@@ -738,6 +746,21 @@ def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] 
                       ("книги с фильтром издержек", [r for r in rows if is_cost_book(r["book"])])):
         if part:
             lines.append(line(tag, part))
+    # фон — только книги без фильтра: «:cost» — те же входы, иначе одна сделка считалась бы дважды
+    plain = [r for r in rows if not is_cost_book(r["book"])]
+    ctx = {r["id"]: _metrics(r) for r in plain}
+    for title, order, key in (
+            ("По индексу страха и жадности (на входе, книги без фильтра):", FNG_ORDER,
+             lambda c: fng_bucket(c.get("fng"), c.get("fng_label"))),
+            ("По фондированию перпетуала (на входе, книги без фильтра):", FUNDING_ORDER,
+             lambda c: funding_bucket(c.get("funding"), c.get("funding_h")))):
+        got = {r["id"]: key(ctx[r["id"]]) for r in plain}
+        if set(got.values()) - {"нет данных"}:
+            lines.append(title)
+            for b in order:
+                part = [r for r in plain if got[r["id"]] == b]
+                if part:
+                    lines.append(line(b, part))
     lines.append("По книгам:")
     for book in sorted({r["book"] for r in rows}):
         part = [r for r in rows if r["book"] == book]
@@ -750,7 +773,7 @@ def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] 
 
 CSV_FIELDS = ("id", "book", "cost_pct", "horizon", "strategy", "base", "opened_ms", "closed_ms", "expiry", "far_expiry", "qty",
               "qty_cap", "entry_net", "entry_fees", "exit_net", "exit_fees", "max_profit", "max_loss", "im_regular",
-              "pnl", "r_mult", "close_reason", "delivery_price", "tags")
+              "pnl", "r_mult", "close_reason", "delivery_price", "tags", "fng", "funding", "oi_chg_24h")
 
 
 def to_csv(rows: list[dict]) -> str:
@@ -758,6 +781,7 @@ def to_csv(rows: list[dict]) -> str:
     w = csv.writer(buf)
     w.writerow(CSV_FIELDS + ("opened_utc", "closed_utc"))
     for r in rows:
+        r = {**_metrics(r), **r}  # фон — из metrics JSON
         w.writerow(csv_safe([r.get(k) for k in CSV_FIELDS]) + [utc(r["opened_ms"]), utc(r["closed_ms"])])
     return buf.getvalue()
 

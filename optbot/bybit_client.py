@@ -349,6 +349,12 @@ class OptionsClient:
         rows = self._call(self.http.get_tickers, category="linear", symbol=f"{base.upper()}USDT").get("list", [])
         return rows[0] if rows else None
 
+    def perp_open_interest(self, base: str, limit: int = 25) -> list[tuple[int, float]]:
+        """Часовая история открытого интереса перпетуала BASEUSDT (в контрактах): [(ts, oi)], от старых к новым."""
+        res = self._call(self.http.get_open_interest, category="linear", symbol=f"{base.upper()}USDT",
+                         intervalTime="1h", limit=min(limit, 200))
+        return sorted((int(r["timestamp"]), float(r["openInterest"])) for r in res.get("list", []))
+
     def perp_closes(self, base: str, interval_min: int, limit: int) -> list[tuple[int, float]]:
         """Закрытия ЗАВЕРШЁННЫХ свечей перпетуала BASEUSDT: [(начало свечи, close)], от старых к новым.
         Bybit отдаёт от новых к старым, первая — текущая незакрытая (её close меняется): отбрасывается всегда,

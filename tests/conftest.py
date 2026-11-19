@@ -20,6 +20,7 @@ os.environ.update(
     TELEGRAM_BOT_TOKEN="123:test", TELEGRAM_ALLOWED_CHAT_IDS="-100111,-100222",
     TELEGRAM_TRADER_IDS="10", TELEGRAM_VIEWER_IDS="20",
     ALLOW_ALL_GROUP_MEMBERS_VIEW="false", SENSITIVE_COMMANDS_DM_ONLY="true",
+    FNG_URL="",  # без сети: индекс страха и жадности в тестах подменяется
 )
 
 import dataclasses  # noqa: E402

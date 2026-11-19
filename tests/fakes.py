@@ -145,10 +145,20 @@ class FakeHTTP:
     def get_tickers(self, category, baseCoin=None, symbol=None, expDate=None):
         self._rec("get_tickers", locals())
         if category == "linear":  # перпетуал BASEUSDT
-            return ok({"list": [{"symbol": symbol, "markPrice": self.perp.get(symbol, "65010")}]})
+            return ok({"list": [{"symbol": symbol, "markPrice": self.perp.get(symbol, "65010"),
+                                 "fundingRate": "0.0001", "fundingIntervalHour": "8",
+                                 "openInterestValue": "6500000000", "openInterest": "100000"}]})
         if symbol:
             return ok({"list": [self.tickers[symbol]] if symbol in self.tickers else []})
         return ok({"list": [t for s, t in self.tickers.items() if s.startswith(baseCoin + "-")]})
+
+    def get_open_interest(self, category, symbol, intervalTime, limit=50, **kw):
+        self._rec("get_open_interest", locals())
+        now = int(time.time() * 1000) // 3_600_000 * 3_600_000
+        rows = getattr(self, "oi_hist", None) or [100000 * (1 + 0.001 * i) for i in range(25)]  # старые -> новые
+        n = len(rows)
+        return ok({"symbol": symbol, "list": [{"openInterest": str(v), "timestamp": str(now - (n - 1 - i) * 3_600_000)}
+                                              for i, v in reversed(list(enumerate(rows)))][:limit]})
 
     def get_kline(self, category, symbol, interval, limit=200, **kw):
         self._rec("get_kline", locals())

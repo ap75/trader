@@ -48,6 +48,7 @@ from . import db
 from .bybit_client import OptionsClient, group_by_strike, option_intrinsic, parse_option_symbol, spread_pct
 from .collector import _f, expiry_metrics
 from .config import Settings, SignalSettings, settings
+from .context import MarketContext, fear_greed, fmt_context, perp_funding, perp_oi_change
 from .events import calendar as events_calendar
 from .fmt import DAY_MS, env_banner, money, num, pct, px, short_symbol, utc
 
@@ -458,6 +459,7 @@ class Metrics:
     horizon: str = "short"             # short — IV7/RV7; long — IV30/RV30 (E1)
     iv30: float | None = None
     rv30: float | None = None
+    ctx: MarketContext | None = None   # фондирование, OI, страх/жадность — справочно, на выбор не влияет
 
     @property
     def iv(self) -> float | None:
@@ -602,6 +604,7 @@ class Market:
     exp_m: dict[str, dict]
     h1: list
     h4: list
+    ctx: MarketContext | None = None   # рыночный фон (справочно)
 
 
 RV_HOURS = 30 * 24 + 1   # часовые свечи: RV7, RV14 и RV30 одним запросом (лимит kline — 1000)
@@ -616,13 +619,15 @@ class SignalEngine:
         self.events = events_calendar(cfg.events_file)
         self._reloaded: dict[str, float] = {}  # актив -> когда справочник перечитан из-за нового символа
 
-    def _fetch(self, base: str) -> tuple[list[dict], dict, list, list]:
-        """Тикеры, справочник, 1h- и 4h-свечи — параллельно (независимые запросы)."""
+    def _fetch(self, base: str) -> tuple[list[dict], dict, list, list, MarketContext]:
+        """Тикеры, справочник, 1h- и 4h-свечи, рыночный фон — параллельно (независимые запросы)."""
         sc = self.cfg.sig
         pool = _POOL
         f_rows = pool.submit(self.c.tickers, base)
         f_h1 = pool.submit(self.c.perp_closes, base, 60, RV_HOURS)
         f_h4 = pool.submit(self.c.perp_closes, base, 240, min(max(200, 3 * sc.ema_slow), 999))
+        f_ctx = pool.submit(perp_funding, self.c, base)   # фон — после обязательного (очередь общего пула)
+        f_oi = pool.submit(perp_oi_change, self.c, base)
         insts = {i.symbol: i for i in self.c.load_instruments(base)}
         rows = f_rows.result()
         # новые страйки/экспирация появились, а справочник ещё в кэше — перечитать, но не чаще его TTL:
@@ -632,7 +637,12 @@ class SignalEngine:
                 and any(r.get("symbol") not in insts and parse_option_symbol(r.get("symbol", "")) for r in rows)):
             insts = {i.symbol: i for i in self.c.load_instruments(base, force=True)}
             self._reloaded[base] = now  # после успеха: сбой перечитывания не блокирует повтор на TTL
-        return rows, insts, f_h1.result(), f_h4.result()
+        ctx = f_ctx.result()  # perp_funding / perp_oi_change ошибок не бросают
+        ctx.oi_chg_24h = f_oi.result()
+        fng = fear_greed(self.cfg.fng_url).get(first_wait=3)  # ждём только первый ответ в процессе
+        if fng:
+            ctx.fng, ctx.fng_label = fng
+        return rows, insts, f_h1.result(), f_h4.result(), ctx
 
     def check_base(self, base: str) -> str:
         base = base.upper()
@@ -643,7 +653,7 @@ class SignalEngine:
     def market(self, base: str, now_ms: int | None = None) -> Market:
         base = self.check_base(base)
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-        rows, insts, h1, h4c = self._fetch(base)
+        rows, insts, h1, h4c, ctx = self._fetch(base)
         exp_ms = {i.expiry_code: i.expiry_ms for i in insts.values()}
         by_exp: dict[str, list[dict]] = {}
         for r in rows:
@@ -651,13 +661,13 @@ class SignalEngine:
             if p and p[1] in exp_ms and r["symbol"] in insts:
                 by_exp.setdefault(p[1], []).append(r)
         exp_m = {e: m for e, rs in by_exp.items() if (m := expiry_metrics(rs, now_ms, exp_ms[e]))}
-        return Market(base, now_ms, insts, by_exp, exp_ms, exp_m, h1, h4c)
+        return Market(base, now_ms, insts, by_exp, exp_ms, exp_m, h1, h4c, ctx)
 
     def metrics(self, mk: Market, horizon: str = "short") -> Metrics:
         sc = self.cfg.sig
         long = horizon == "long"
         target = sc.long_target_days if long else sc.target_days
-        m = Metrics(base=mk.base, ts_ms=mk.now_ms, horizon=horizon)
+        m = Metrics(base=mk.base, ts_ms=mk.now_ms, horizon=horizon, ctx=mk.ctx)
         iv = const_maturity_iv([(x["dte"], x["atm_iv"]) for x in mk.exp_m.values()], target)
         m.rv7 = realized_vol_window(mk.h1, 3_600_000, 7 * DAY_MS)
         m.rv14 = realized_vol_window(mk.h1, 3_600_000, 14 * DAY_MS)
@@ -920,6 +930,8 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
     lines.append(f" {hist} ({m.history_days:.1f} дн., {m.history_n} срезов){flag}")
     if t.direction:
         lines.append(f" тренд 4h: {TREND_NAMES[t.direction]} · EMA {num(round(t.ema_fast))}/{num(round(t.ema_slow))}")
+    if (bg := fmt_context(m.ctx)):
+        lines.append(bg + " — фон, справочно")
     lines.append("Почему: " + "; ".join(sig.reasons))
     lines.append("\nЦены — по исполнимой стороне (покупка ask, продажа bid), без комиссий. "
                  "Не торговый совет: решение за трейдером.")

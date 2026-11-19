@@ -289,6 +289,7 @@ class OptionsBot:
         self.signals = SignalEngine(client, cfg)
         self.paper = PaperEngine(client, cfg, self.signals)  # бумажные книги E1: шаг после каждого среза
         self._paper_task: asyncio.Task | None = None
+        self._fng_task: asyncio.Task | None = None
         self.sigjournal = SignalJournal(cfg)
         self._sig_cache: dict[str, tuple[float, Signal]] = {}  # актив -> (когда, Signal)
         self._sig_locks = {b: asyncio.Lock() for b in cfg.base_coins}  # актив -> блокировка расчёта
@@ -876,6 +877,14 @@ class OptionsBot:
             log.warning("Бумажные книги: прошлый шаг ещё идёт — этот пропущен")
             return
         self._paper_task = asyncio.get_running_loop().create_task(self._paper_job())
+
+    async def _fng_job(self) -> None:
+        try:
+            n = await asyncio.to_thread(self.collector.update_fear_greed)
+            if n:
+                log.info("Сборщик: индекс страха и жадности +%d дн.", n)
+        except Exception:
+            log.exception("Сборщик: индекс страха и жадности не обновлён")
 
     async def _paper_job(self) -> None:
         try:
@@ -1633,6 +1642,8 @@ class OptionsBot:
             self._break_streaks(self.cfg.base_coins)  # среза нет — история IV старая: смену не проверяем,
             return                                    # а пропуск рвёт серию «подряд»
         (log.warning if res.errors else log.info)("Сборщик: %s", res)
+        if self.cfg.fng_url and not (self._fng_task and not self._fng_task.done()):
+            self._fng_task = asyncio.get_running_loop().create_task(self._fng_job())  # сеть — не на пути среза
         if self.cfg.paper.enabled and (res.snapshots or res.skipped):
             self._kick_paper()
         if self._auto_change_on():
@@ -1946,6 +1957,8 @@ class OptionsBot:
                     await self._auto_task
             if self._paper_task and not self._paper_task.done():  # шаг в потоке доработает сам (запись — транзакциями)
                 self._paper_task.cancel()
+            if self._fng_task and not self._fng_task.done():
+                self._fng_task.cancel()
             if self.watcher:
                 await asyncio.to_thread(self.watcher.stop)
 
@@ -1989,6 +2002,8 @@ def check_config(cfg: Settings) -> list[str]:
     if no_qty:  # лимит кол-ва на ордер обязателен для каждой монеты, иначе ордера без ограничения размера
         errors.append("Не задан лимит кол-ва на ордер: " + ", ".join(f"MAX_QTY_{c}" for c in no_qty)
                       + " (обязателен для каждой монеты из BASE_COINS)")
+    if cfg.fng_url and not cfg.fng_url.startswith("https://"):
+        errors.append("FNG_URL: нужен https://-адрес (или пусто — без индекса страха и жадности)")
     if cfg.healthcheck_url and not cfg.healthcheck_url.startswith("https://"):
         errors.append("HEALTHCHECK_URL: нужен https://-адрес проверки")
     return errors

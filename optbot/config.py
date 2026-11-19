@@ -279,6 +279,14 @@ class Settings:
     backup_keep_days: int = _int_in("BACKUP_KEEP_DAYS", 14, 1, 3650)
     # внешний мониторинг (healthchecks.io и т.п.): GET после каждого среза сборщика, сбой среза — <url>/fail
     healthcheck_url: str = os.getenv("HEALTHCHECK_URL", "").strip()
+    # полная цепочка опционов в БД (история для проверок задним числом): раз в N мин (первый срез периода;
+    # 0 — нет), экспирации до N дней, страйки с |Δ| от N, хранить N дней (0 — всегда)
+    chain_snapshot_min: int = _int_in("CHAIN_SNAPSHOT_MIN", 60, 0, 1440)
+    chain_max_dte: float = _float_in("CHAIN_MAX_DTE", 60, 1, 400)
+    chain_min_delta: float = _float_in("CHAIN_MIN_DELTA", 0.02, 0, 0.5)
+    chain_keep_days: int = _int_in("CHAIN_KEEP_DAYS", 0, 0, 36500)
+    # индекс страха и жадности (рыночный фон в карточке и журналах; пусто — не запрашивать)
+    fng_url: str = os.getenv("FNG_URL", "https://api.alternative.me/fng/?limit=1").strip()
     # календарь событий высокой важности (тег event): относительный путь — от корня проекта
     events_path: str = os.getenv("EVENTS_FILE", "events.csv").strip() or "events.csv"  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
 

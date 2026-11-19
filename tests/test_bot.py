@@ -789,10 +789,10 @@ def test_signals_refresh_cached(b, tg, fake, monkeypatch):
     now = _sig_market(fake)
     monkeypatch.setattr("optbot.signals.time", NS(time=lambda: now / 1000, monotonic=time.monotonic))
     run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("BTC")))
-    n = len(fake.called("get_tickers"))
+    n = len([c for c in fake.called("get_tickers") if c["category"] == "option"])
     u = tg.upd(VIEWER, data="sig:BTC")                     # другое сообщение (меню) — карточка его меняет
     run(b.on_callback(u, tg.ctx()))
-    assert len(fake.called("get_tickers")) == n            # в пределах SIGNAL_CACHE_TTL — без запросов
+    assert len([c for c in fake.called("get_tickers") if c["category"] == "option"]) == n            # в пределах SIGNAL_CACHE_TTL — без запросов
     assert u.callback_query.answer.await_args.args == (None,)  # сообщение изменилось — «без изменений» не врём
     u = tg.upd(VIEWER, data="sig:BTC")                     # «Обновить» на той же карточке: текст тот же
     u.callback_query.edit_message_text = AsyncMock(side_effect=BadRequest("Message is not modified"))
@@ -800,7 +800,7 @@ def test_signals_refresh_cached(b, tg, fake, monkeypatch):
     assert "Без изменений" in u.callback_query.answer.await_args.args[0]
     monkeypatch.setattr(botmod, "SIGNAL_CACHE_TTL", 0)
     run(b.on_callback(tg.upd(VIEWER, data="sig:BTC"), tg.ctx()))
-    assert len(fake.called("get_tickers")) > n
+    assert len([c for c in fake.called("get_tickers") if c["category"] == "option"]) > n
 
 
 def test_signals_concurrent_presses_share_one_compute(b, tg, fake, monkeypatch):
@@ -810,7 +810,7 @@ def test_signals_concurrent_presses_share_one_compute(b, tg, fake, monkeypatch):
     async def go():
         await asyncio.gather(*[b.on_callback(tg.upd(VIEWER, data="sig:BTC"), tg.ctx()) for _ in range(3)])
     run(go())
-    assert len(fake.called("get_tickers")) == 1
+    assert len([c for c in fake.called("get_tickers") if c["category"] == "option"]) == 1
 
 
 def test_signals_same_card_after_cache_says_so(b, tg, fake, monkeypatch):
@@ -838,7 +838,13 @@ def test_signals_unknown_base_no_lock(b, tg):
 
 
 def test_signals_button_answered_on_error(b, tg, fake):
-    fake.fail["get_tickers"] = __import__("requests").exceptions.ConnectionError("down")
+    real = fake.get_tickers
+
+    def down(category, **kw):  # опционы недоступны (тикер перпетуала для фона — отдельно)
+        if category == "option":
+            raise __import__("requests").exceptions.ConnectionError("down")
+        return real(category, **kw)
+    fake.get_tickers = down
     u = tg.upd(VIEWER, data="sig:BTC")
     run(b.on_callback(u, tg.ctx()))
     assert "Не удалось" in u.callback_query.answer.await_args.args[0]  # кнопка не крутится до таймаута

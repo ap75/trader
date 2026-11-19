@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 
 from . import db
 from .collector import track
+from .context import FNG_ORDER, FUNDING_ORDER, fng_bucket, funding_bucket
 from .config import SIG_LONG_FIELDS, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
 from .journal import Journal, load_delivery_prices, nearest_price, parse_period
@@ -171,7 +172,8 @@ class SignalJournal:
                 metrics = dict(iv7=m.iv7, rv7=m.rv7, rv14=m.rv14, pctl=m.pctl, history_days=m.history_days,
                                enough_history=m.enough_history, history_stale=m.history_stale,
                                trend=m.trend.direction, ema_gap_pct=m.trend.gap_pct, exp_iv=sig.exp_iv,
-                               dte=sig.dte, straddle=sig.straddle)
+                               dte=sig.dte, straddle=sig.straddle,
+                               **(m.ctx.as_dict() if m.ctx else {}))  # рыночный фон — для разбивки итогов
                 cur = conn.execute(
                     "INSERT INTO signals (ts, last_shown_ms, base, strategy, regime, trend, expiry, expiry_ms, legs_key, "
                     "legs, qty, net, net_mid, max_profit, max_loss, breakevens, forward, em, metrics, reasons, "
@@ -462,6 +464,15 @@ class Stats:
     total: Group = field(default_factory=Group)
     by_strategy: dict[str, Group] = field(default_factory=dict)
     by_regime: dict[str, Group] = field(default_factory=dict)
+    by_fng: dict[str, Group] = field(default_factory=dict)
+    by_funding: dict[str, Group] = field(default_factory=dict)
+
+
+def _ctx_of(r: dict) -> dict:
+    try:
+        return json.loads(r["metrics"] or "{}") if "metrics" in r.keys() else {}
+    except (TypeError, ValueError):
+        return {}
 
 
 def compute_stats(rows: list[dict], label: str, base: str | None = None, now_ms: int | None = None) -> Stats:
@@ -471,6 +482,9 @@ def compute_stats(rows: list[dict], label: str, base: str | None = None, now_ms:
         st.total.add(r, now_ms)
         st.by_strategy.setdefault(r["strategy"], Group()).add(r, now_ms)
         st.by_regime.setdefault(r["regime"] or "?", Group()).add(r, now_ms)
+        c = _ctx_of(r)
+        st.by_fng.setdefault(fng_bucket(c.get("fng"), c.get("fng_label")), Group()).add(r, now_ms)
+        st.by_funding.setdefault(funding_bucket(c.get("funding"), c.get("funding_h")), Group()).add(r, now_ms)
     return st
 
 
@@ -496,15 +510,21 @@ def fmt_stats(st: Stats) -> str:
             "Медианная просадка: " + (f"{statistics.median(t.dd_r):+.2f}R" if t.dd_r else "-"),
         ]
 
-    def table(title: str, groups: dict[str, Group], names: dict[str, str]) -> None:
+    def table(title: str, groups: dict[str, Group], names: dict[str, str], order: tuple = ()) -> None:
         lines.append(f"\n{title}:")
         lines.append(f"{'':<22} {'n':>3} {'итог':>4} {'приб':>4} {'ΣR':>6} {'ср.R':>6}")
-        for k, g in sorted(groups.items(), key=lambda kv: -kv[1].n):
+        key = (lambda kv: order.index(kv[0]) if kv[0] in order else len(order)) if order else (lambda kv: -kv[1].n)
+        for k, g in sorted(groups.items(), key=key):
             avg = f"{g.sum_r / g.n_r:+.2f}" if g.n_r else "-"
             lines.append(f"{names.get(k, k)[:22]:<22} {g.n:>3} {g.settled:>4} {g.wins:>4} {g.sum_r:>+6.2f} {avg:>6}")
 
     table("По стратегиям", st.by_strategy, STRATEGIES)
     table("По режиму IV", st.by_regime, REGIMES)
+    # фон пишется с 2026-11-19 — без данных таблицу не показывать; каждую — по своим данным
+    if set(st.by_fng) - {"нет данных"}:
+        table("По индексу страха и жадности (на момент сигнала)", st.by_fng, {}, FNG_ORDER)
+    if set(st.by_funding) - {"нет данных"}:
+        table("По фондированию перпетуала", st.by_funding, {}, FUNDING_ORDER)
     lines.append("\nR — доля макс. риска; итог на экспирации по ценам входа на исполнимой стороне, без комиссий. "
                  "Просадка — худший промежуточный итог при закрытии по bid/ask.")
     return "\n".join(lines)

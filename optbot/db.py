@@ -348,6 +348,52 @@ MIGRATIONS: list[list[str]] = [
         ALTER TABLE paper_trades ADD COLUMN cost_pct REAL
         """,
     ],
+    # 8: история для проверок задним числом — полная цепочка опционов (у Bybit истории цепочки нет), фондирование
+    # и открытый интерес перпетуала по срезам, индекс страха и жадности по дням
+    [
+        """
+        CREATE TABLE chain_snapshots (         -- раз в CHAIN_SNAPSHOT_MIN: все страйки экспираций до CHAIN_MAX_DTE
+            ts         INTEGER NOT NULL,       -- начало слота сборщика
+            symbol     TEXT    NOT NULL,
+            base       TEXT    NOT NULL,
+            expiry_ms  INTEGER NOT NULL,
+            strike     REAL    NOT NULL,
+            kind       TEXT    NOT NULL,       -- C | P
+            bid        REAL,
+            ask        REAL,
+            bid_size   REAL,
+            ask_size   REAL,
+            mark       REAL,
+            iv         REAL,                   -- markIv
+            bid_iv     REAL,
+            ask_iv     REAL,
+            delta      REAL,
+            oi         REAL,
+            underlying REAL,
+            PRIMARY KEY (ts, symbol)
+        )
+        """,
+        "CREATE INDEX chain_snapshots_base_ts ON chain_snapshots (base, ts)",
+        """
+        CREATE TABLE perp_context (            -- каждый срез: фондирование и открытый интерес BASEUSDT
+            ts          INTEGER NOT NULL,
+            base        TEXT    NOT NULL,
+            funding     REAL,                  -- текущая ставка за период (доля)
+            funding_h   REAL,                  -- период фондирования, ч
+            oi          REAL,                  -- открытый интерес, контрактов (= базового актива)
+            oi_value    REAL,                  -- USDT
+            captured_ms INTEGER,
+            PRIMARY KEY (ts, base)
+        )
+        """,
+        """
+        CREATE TABLE fear_greed (              -- индекс страха и жадности alternative.me, значение дня (UTC)
+            ts    INTEGER PRIMARY KEY,         -- начало дня у источника, мс
+            value INTEGER NOT NULL,
+            label TEXT
+        )
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе
