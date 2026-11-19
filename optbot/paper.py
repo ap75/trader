@@ -590,6 +590,24 @@ class PaperEngine:
                          f"кол-во {r['qty']:g}{cap}, риск {r['max_loss']:.2f}{mark}{tag}")
         return "\n".join(lines)
 
+    def cost_rejects(self, start_ms: int, end_ms: int) -> dict[str, tuple[int, int]]:
+        """Книги с фильтром издержек за период: {книга: (отказов фильтра, открыто сделок)} — раз на книгу и
+        экспирацию (как в paper_skips, по времени первого отказа); экспирация, по которой сделка потом всё же
+        открылась, — не отказ."""
+        conn = self._db()
+        try:
+            out: dict[str, list[int]] = {}
+            for r in conn.execute("SELECT s.book, COUNT(*) n FROM paper_skips s WHERE s.code = 'cost' AND s.ts >= ? "
+                                  "AND s.ts < ? AND NOT EXISTS (SELECT 1 FROM paper_trades t WHERE t.book = s.book "
+                                  "AND t.expiry = s.expiry AND t.opened_ms < ?) GROUP BY s.book", (start_ms, end_ms, end_ms)):
+                out.setdefault(r["book"], [0, 0])[0] = r["n"]
+            for r in conn.execute("SELECT book, COUNT(*) n FROM paper_trades WHERE book LIKE ? AND opened_ms >= ? "
+                                  "AND opened_ms < ? GROUP BY book", ("%" + COST_SUFFIX, start_ms, end_ms)):
+                out.setdefault(r["book"], [0, 0])[1] = r["n"]
+            return {k: (v[0], v[1]) for k, v in out.items()}
+        finally:
+            conn.close()
+
     def closed(self, start_ms: int, end_ms: int) -> list[dict]:
         conn = self._db()
         try:
@@ -683,9 +701,24 @@ def summarize(rows: list[dict]) -> dict:
                 avg_r=sum(rs) / len(rs) if rs else None, worst=min(pnl) if pnl else None)
 
 
-def fmt_stats(rows: list[dict], label: str) -> str:
+def fmt_rejects(rejects: dict[str, tuple[int, int]]) -> list[str]:
+    """Доля отказов фильтра издержек по книгам «:cost»: отказов / (отказов + открытых)."""
+    if not rejects:
+        return []
+    lines = ["Фильтр издержек (SIG_MAX_COST_PCT): отказов из сигналов"]
+    tot_r = sum(r for r, _ in rejects.values())
+    tot = tot_r + sum(o for _, o in rejects.values())
+    for book in sorted(rejects):
+        r, o = rejects[book]
+        lines.append(f" {book}: {r} из {r + o} ({100 * r / (r + o):.0f}%)")
+    if tot:
+        lines.append(f" всего: {tot_r} из {tot} ({100 * tot_r / tot:.0f}%)")
+    return lines
+
+
+def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] | None = None) -> str:
     if not rows:
-        return f"Бумажные книги, {label}: закрытых сделок нет"
+        return "\n".join([f"Бумажные книги, {label}: закрытых сделок нет", *fmt_rejects(rejects or {})])
     rows = [{"status": "closed", **r} for r in rows]
     void = [r for r in rows if r["status"] == "void"]
     rows = [r for r in rows if r["status"] != "void"]
@@ -712,7 +745,7 @@ def fmt_stats(rows: list[dict], label: str) -> str:
                      f" {book}: только с event")
         if any(r["tags"] for r in part):
             lines.append(line(f"{book} [event]", [r for r in part if r["tags"]]))
-    return "\n".join(lines)
+    return "\n".join(lines + fmt_rejects(rejects or {}))
 
 
 CSV_FIELDS = ("id", "book", "cost_pct", "horizon", "strategy", "base", "opened_ms", "closed_ms", "expiry", "far_expiry", "qty",
@@ -755,7 +788,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.stats:
         start, end, label = parse_period([a.stats])
         rows = eng.closed(start, end)
-        print(fmt_stats(rows, label))
+        print(fmt_stats(rows, label, eng.cost_rejects(start, end)))
         if a.csv:
             with open(a.csv, "w", encoding="utf-8", newline="") as f:
                 f.write(to_csv(rows))

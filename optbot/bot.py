@@ -58,6 +58,8 @@ import functools
 import html
 import logging
 import os
+import urllib.parse
+import urllib.request
 import secrets
 import sys
 import time
@@ -79,6 +81,7 @@ from .bybit_client import (LOOKUP_DELAYS, BybitError, BybitNetworkError, Options
                            PortfolioRiskError, RiskError, _d)
 from . import db
 from .collector import Collector, seconds_to_next_slot
+from . import backup as backup_mod
 from . import paper as paper_mod
 from .paper import PaperEngine
 from .linkid import parse_link_id
@@ -1589,13 +1592,44 @@ class OptionsBot:
         await self._ask_confirm(update, context, w, "\n".join(lines), "signal_exec", action=run, done=done)
 
     # ---------- сборщик рыночных данных ----------
+    async def _backup_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
+        """Ежедневная копия БД (sqlite backup API); сбой — срочно администратору."""
+        try:
+            path = await asyncio.to_thread(backup_mod.backup, self.cfg)
+            log.info("Резервная копия БД: %s", path)
+        except Exception as e:
+            log.exception("Резервная копия БД не сделана")
+            await self.admin_alert("backup", f"Резервная копия БД не сделана: {e}")
+
+    async def _ping_health(self, ok: bool) -> None:
+        """Внешний мониторинг: пинг после среза (сбой среза — /fail). Пинги пропали — сервис сообщит сам."""
+        url = self.cfg.healthcheck_url
+        if not url:
+            return
+        if not ok:  # /fail — к пути, не после ?query
+            u = urllib.parse.urlsplit(url)
+            url = urllib.parse.urlunsplit(u._replace(path=u.path.rstrip("/") + "/fail"))
+        else:
+            url = url.rstrip("/")
+
+        def get():
+            req = urllib.request.Request(url, headers={"User-Agent": "options-bot"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read(64)
+        try:
+            await asyncio.to_thread(get)
+        except Exception as e:  # сбой мониторинга — не сбой бота: только лог (без адреса — в нём ключ проверки)
+            log.warning("Мониторинг: пинг не отправлен — %s", type(e).__name__)
+
     async def _collect_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Задача JobQueue: срез в БД. Ошибки не роняют бота — следующий проход по расписанию. Затем — проверка
-        смены автосигналов отдельной задачей (по свежему срезу; срез не удался — без проверки)."""
+        """Задача JobQueue: срез в БД. Ошибки не роняют бота — следующий проход по расписанию. Затем — пинг
+        мониторинга и проверка смены автосигналов отдельной задачей (по свежему срезу; срез не удался — без
+        проверки)."""
         try:
             res = await asyncio.to_thread(self.collector.collect)
         except Exception:
             log.exception("Сборщик: проход не выполнен")
+            await self._ping_health(False)
             self._break_streaks(self.cfg.base_coins)  # среза нет — история IV старая: смену не проверяем,
             return                                    # а пропуск рвёт серию «подряд»
         (log.warning if res.errors else log.info)("Сборщик: %s", res)
@@ -1609,6 +1643,7 @@ class OptionsBot:
                 self._kick_auto_change(fresh)
             else:
                 self._break_streaks(self.cfg.base_coins)
+        await self._ping_health(bool(res.snapshots or res.skipped))  # последним: медленный мониторинг не задержит
 
     # ---------- журнал сделок ----------
     async def _sync_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1868,12 +1903,17 @@ class OptionsBot:
             except Exception:
                 log.exception("WebSocket исполнений не подключён — уведомлений об исполнениях не будет")
 
-            if app.job_queue is None and (self.cfg.collector_enabled or self.cfg.journal_enabled or self._auto_daily_on() or self._auto_change_on()):
-                log.warning("Сборщик, сверка журнала, итоги сигналов и автосигналы выключены: нет JobQueue — "
+            if app.job_queue is None and (self.cfg.collector_enabled or self.cfg.journal_enabled or self._auto_daily_on() or self._auto_change_on() or self.cfg.backup_daily_utc):
+                log.warning("Сборщик, сверка журнала, итоги сигналов, автосигналы и резервная копия БД выключены: нет JobQueue — "
                             "установите python-telegram-bot[job-queue] (pip install -r requirements.txt)")
                 return
             if app.job_queue is not None:
                 self._schedule_auto(app.job_queue)
+                if self.cfg.backup_daily_utc:
+                    h, m = self.cfg.backup_daily_utc
+                    app.job_queue.run_daily(self._backup_job, time=dtime(h, m, tzinfo=timezone.utc), name="backup")
+                    log.info("Резервная копия БД: ежедневно в %02d:%02d UTC в %s (хранить %d дн.)", h, m,
+                             self.cfg.backup_dir_abs, self.cfg.backup_keep_days)
             if self.cfg.journal_enabled:
                 # при старте (догрузить пропущенное, пока бот был выключен) и далее по расписанию
                 app.job_queue.run_repeating(self._sync_job, interval=self.cfg.journal_sync_min * 60, first=10,
@@ -1945,7 +1985,30 @@ def check_config(cfg: Settings) -> list[str]:
     svc = (cfg.tg_admin_ids | cfg.tg_trader_ids | cfg.tg_viewer_ids) & SERVICE_USER_IDS
     if svc:
         errors.append(f"В списках пользователей служебные id Telegram: {sorted(svc)}")
+    no_qty = [c for c in cfg.base_coins if not cfg.max_order_qty.get(c, 0) > 0]
+    if no_qty:  # лимит кол-ва на ордер обязателен для каждой монеты, иначе ордера без ограничения размера
+        errors.append("Не задан лимит кол-ва на ордер: " + ", ".join(f"MAX_QTY_{c}" for c in no_qty)
+                      + " (обязателен для каждой монеты из BASE_COINS)")
+    if cfg.healthcheck_url and not cfg.healthcheck_url.startswith("https://"):
+        errors.append("HEALTHCHECK_URL: нужен https://-адрес проверки")
     return errors
+
+
+def config_warnings(cfg: Settings) -> list[str]:
+    """Нефатальное: бот стартует, но часть функций не работает."""
+    out = []
+    if not cfg.tg_admin_ids:
+        out.append("TELEGRAM_ADMIN_IDS пуст — срочные уведомления (доступ к бирже, лимиты, сделки вне бота, "
+                   "запуск и остановка), автосигналы и проверка комиссии поставки никому не отправляются")
+    if not cfg.healthcheck_url:
+        out.append("HEALTHCHECK_URL не задан — о падении бота внешний мониторинг не сообщит")
+    elif not cfg.collector_enabled:
+        out.append("HEALTHCHECK_URL задан, но сборщик выключен — пинги идут после срезов, их не будет: "
+                   "мониторинг покажет бот лежащим")
+    elif cfg.collector_interval_min > 15:
+        out.append(f"HEALTHCHECK_URL: пинг раз в COLLECTOR_INTERVAL_MIN={cfg.collector_interval_min} мин — период "
+                   f"проверки в сервисе мониторинга поставьте не меньше (не 15)")
+    return out
 
 
 def main() -> int:
@@ -1959,6 +2022,8 @@ def main() -> int:
         return 1
     if settings.allow_all_group_members_view and not settings.tg_allowed_chat_ids:
         log.warning("ALLOW_ALL_GROUP_MEMBERS_VIEW=true, но TELEGRAM_ALLOWED_CHAT_IDS пуст — флаг ни на что не влияет")
+    for w in config_warnings(settings):
+        log.warning("%s", w)
 
     log.info("Старт: env=%s, активы=%s, администраторов=%d, трейдеров=%d, зрителей=%d, групп=%d, "
              "просмотр всем в группах=%s, счёт только в личке=%s",

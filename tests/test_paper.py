@@ -860,3 +860,43 @@ def test_delivery_check_caps_mismatch_reports_and_abs_fee(pcfg):
     got = check_delivery_fees(pcfg, conn)
     assert [x["report"] for x in got] == [True, True, True, False, False]
     conn.close()
+
+
+def test_stats_cost_reject_share(make_client, pcfg, fake):
+    set_chain(fake)
+    set_chain(fake, exp=FAR, exp_ms=FAR_MS, keep=True)
+    pe = eng(make_client, pcfg)
+    bad = bull_put(fake)
+    bad.cost_pct = 40.0
+    pe.step(NOW, {"BTC": {"short:bull_put:BTC:cost": bad}})
+    ok = mksig(fake, "bull_put", [(sym(62000, "P", FAR), -1), (sym(60000, "P", FAR), +1)], expiry=FAR, expiry_ms=FAR_MS)
+    ok.cost_pct = 5.0
+    pe.step(NOW, {"BTC": {"short:bull_put:BTC:cost": ok}})
+    rej = pe.cost_rejects(0, NOW + 1)
+    assert rej == {"short:bull_put:BTC:cost": (1, 1)}
+    text = paper.fmt_stats([], "x", rej)
+    assert "short:bull_put:BTC:cost: 1 из 2 (50%)" in text and "всего: 1 из 2 (50%)" in text
+
+
+def test_cost_reject_then_opened_not_counted(make_client, pcfg, fake):
+    set_chain(fake)
+    pe = eng(make_client, pcfg)
+    s = bull_put(fake)
+    s.cost_pct = 40.0
+    pe.step(NOW, {"BTC": {"short:bull_put:BTC:cost": s}})
+    s2 = bull_put(fake)
+    s2.cost_pct = 5.0                                         # издержки упали — та же экспирация открылась
+    pe.step(NOW + 1, {"BTC": {"short:bull_put:BTC:cost": s2}})
+    assert pe.cost_rejects(0, NOW + 2) == {"short:bull_put:BTC:cost": (0, 1)}
+
+
+def test_cost_reject_window_counts_reject_opened_after_window(make_client, pcfg, fake):
+    set_chain(fake)
+    pe = eng(make_client, pcfg)
+    s = bull_put(fake)
+    s.cost_pct = 40.0
+    pe.step(NOW, {"BTC": {"short:bull_put:BTC:cost": s}})
+    s2 = bull_put(fake)
+    s2.cost_pct = 5.0
+    pe.step(NOW + 10, {"BTC": {"short:bull_put:BTC:cost": s2}})
+    assert pe.cost_rejects(0, NOW + 5) == {"short:bull_put:BTC:cost": (1, 0)}   # в том окне — ещё отказ

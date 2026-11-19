@@ -364,7 +364,7 @@ def test_schedule_auto(make_client, acfg, monkeypatch):
                         lambda self, cb, interval, first, name: rep.append((cb, interval, first, name)))
     monkeypatch.setattr("optbot.bot.time.time", lambda: 899.5)
     _post_init(app, monkeypatch)
-    (cb, t, name), = daily
+    (cb, t, name), = [d for d in daily if d[2] != "backup"]   # копия БД — своя ежедневная задача
     assert cb == bot._auto_daily_job and (t.hour, t.minute, t.utcoffset().total_seconds()) == (9, 5, 0)
     assert bot._auto_change_job not in [r[0] for r in rep]      # со сборщиком — вызов из его прохода
 
@@ -446,7 +446,7 @@ def test_schedule_auto_off(make_client, acfg, monkeypatch, kw):
     monkeypatch.setattr(type(app.job_queue), "run_daily", lambda self, *a, **k: daily.append(a))
     monkeypatch.setattr(type(app.job_queue), "run_repeating", lambda self, cb, **k: rep.append(cb))
     _post_init(app, monkeypatch)
-    assert daily == [] and bot._auto_change_job not in rep
+    assert [a for a in daily if a[0] != bot._backup_job] == [] and bot._auto_change_job not in rep
 
 
 def test_no_job_queue_warns_for_auto(make_client, acfg, monkeypatch, caplog):
@@ -455,7 +455,7 @@ def test_no_job_queue_warns_for_auto(make_client, acfg, monkeypatch, caplog):
     app = bot.build_app()
     monkeypatch.setattr(type(app), "job_queue", property(lambda self: None))
     _post_init(app, monkeypatch)
-    assert "автосигналы выключены" in caplog.text
+    assert "автосигналы и резервная копия БД выключены" in caplog.text
 
 
 def test_change_message_banner_first(b, sig, sent, monkeypatch):

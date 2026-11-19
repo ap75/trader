@@ -273,6 +273,12 @@ class Settings:
     # Сигналы (этап 3): пороги SIG_*
     sig: SignalSettings = _SIG_DEFAULT
     paper: PaperSettings = field(default_factory=PaperSettings)
+    # резервная копия БД (sqlite backup API): раз в сутки в ЧЧ:ММ UTC (off — нет), куда, сколько дней хранить
+    backup_daily_utc: tuple[int, int] | None = _hhmm("BACKUP_DAILY_UTC", "03:20")
+    backup_dir: str = os.getenv("BACKUP_DIR", "backups").strip() or "backups"
+    backup_keep_days: int = _int_in("BACKUP_KEEP_DAYS", 14, 1, 3650)
+    # внешний мониторинг (healthchecks.io и т.п.): GET после каждого среза сборщика, сбой среза — <url>/fail
+    healthcheck_url: str = os.getenv("HEALTHCHECK_URL", "").strip()
     # календарь событий высокой важности (тег event): относительный путь — от корня проекта
     events_path: str = os.getenv("EVENTS_FILE", "events.csv").strip() or "events.csv"  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
 
@@ -315,6 +321,10 @@ class Settings:
     def db_file(self) -> str:
         path = self.db_path or os.path.join("data", f"market-{self.env}.db")
         return path if os.path.isabs(path) else os.path.join(ROOT, path)
+
+    @property
+    def backup_dir_abs(self) -> str:
+        return self.backup_dir if os.path.isabs(self.backup_dir) else os.path.join(ROOT, self.backup_dir)
 
     @property
     def events_file(self) -> str:

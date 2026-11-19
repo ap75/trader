@@ -468,6 +468,9 @@ class OptionsClient:
             raise RiskError(f"Количество больше максимального ({inst.max_qty})")
 
         limit = self.cfg.max_order_qty.get(inst.base, Decimal(0))
+        if not limit > 0 and not req.reduce_only:  # обязателен: без него открывающий ордер не уходит
+            raise RiskError(f"MAX_QTY_{inst.base} не задан в .env — открывающий ордер не отправлен "
+                            f"(закрыть позицию reduce-only можно)")
         if limit > 0 and req.qty > limit and not req.reduce_only:
             raise self._limit(f"MAX_QTY_{inst.base}", f"Превышен лимит MAX_QTY_{inst.base}={limit}")
 

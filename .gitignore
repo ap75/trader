@@ -9,3 +9,4 @@ data/
 research/
 .pytest_cache/
 .coverage
+backups/
