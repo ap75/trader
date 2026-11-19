@@ -332,7 +332,7 @@ MIGRATIONS: list[list[str]] = [
         CREATE TABLE paper_skips (             -- сигнал был, сделки нет: одна причина на книгу и экспирацию
             book   TEXT    NOT NULL,
             expiry TEXT    NOT NULL,
-            code   TEXT    NOT NULL,           -- qty | max_open | total_risk | data
+            code   TEXT    NOT NULL,           -- cost | max_open | exit_window | data | qty | total_risk | traded (миграция 9)
             ts     INTEGER NOT NULL,
             reason TEXT,
             PRIMARY KEY (book, expiry, code)
@@ -391,6 +391,23 @@ MIGRATIONS: list[list[str]] = [
             ts    INTEGER PRIMARY KEY,         -- начало дня у источника, мс
             value INTEGER NOT NULL,
             label TEXT
+        )
+        """,
+    ],
+    # 9: итог расчёта сигнала на каждом шаге книг — почему книги стоят без сделок (paper --skips)
+    [
+        "ALTER TABLE paper_skips ADD COLUMN last_ts INTEGER",  # последний повтор отказа (ts — первый)
+        """
+        CREATE TABLE paper_signals (
+            ts       INTEGER NOT NULL,         -- шаг книг
+            base     TEXT    NOT NULL,
+            kind     TEXT    NOT NULL,         -- short | long | calendar
+            outcome  TEXT    NOT NULL,         -- signal | not_built | none | error
+            strategy TEXT,
+            regime   TEXT,                     -- high | low | normal | NULL
+            trend    TEXT,
+            reason   TEXT,                     -- нет сигнала / не собрался — почему
+            PRIMARY KEY (ts, base, kind)
         )
         """,
     ],

@@ -900,3 +900,99 @@ def test_cost_reject_window_counts_reject_opened_after_window(make_client, pcfg,
     s2.cost_pct = 5.0
     pe.step(NOW + 10, {"BTC": {"short:bull_put:BTC:cost": s2}})
     assert pe.cost_rejects(0, NOW + 5) == {"short:bull_put:BTC:cost": (1, 0)}   # в том окне — ещё отказ
+
+
+def test_signal_outcomes_logged_and_skips_report(make_client, pcfg, fake, monkeypatch, capsys):
+    set_chain(fake, iv=0.6)
+    set_klines(fake, rv=0.4)
+    pe = eng(make_client, pcfg)
+    pe.step(NOW)
+    conn = db.connect(pcfg.db_file)
+    rows = [dict(r) for r in conn.execute("SELECT * FROM paper_signals")]
+    conn.close()
+    assert {(r["base"], r["kind"]) for r in rows} >= {("BTC", "short"), ("BTC", "long"), ("BTC", "calendar")}
+    assert all(r["outcome"] in ("signal", "not_built", "none", "error") for r in rows)
+    assert any(r["outcome"] != "signal" and r["reason"] for r in rows)
+    sigs, skips = pe.skips(0, NOW + 1)
+    text = paper.fmt_skips(sigs, skips, "7d")
+    assert "короткий BTC: шагов 1" in text and "длинный BTC" in text and "календарь BTC" in text
+
+
+def test_fmt_skips_groups():
+    sigs = [dict(ts=1, base="BTC", kind="short", outcome="none", strategy=None, regime="normal", trend="flat",
+                 reason="IV7/RV7 = 1.02 — в норме"),
+            dict(ts=2, base="BTC", kind="short", outcome="none", strategy=None, regime="normal", trend="flat",
+                 reason="IV7/RV7 = 1.05 — в норме"),
+            dict(ts=3, base="BTC", kind="short", outcome="signal", strategy="iron_condor", regime="high",
+                 trend="flat", reason=None),
+            dict(ts=3, base="BTC", kind="long", outcome="not_built", strategy="bull_put", regime="high",
+                 trend="up", reason="нет экспирации 14–45 дн.")]
+    skips = [dict(book="short:iron_condor:BTC:cost", expiry="27NOV26", code="cost", ts=3, last_ts=NOW,
+                  reason="издержки 30%")]
+    text = paper.fmt_skips(sigs, skips, "7d")
+    assert "короткий BTC: шагов 3 — сигнал 1, нет стратегии 2" in text
+    assert "IV normal, тренд нет, IVN/RVN = N — в норме: 2 — последняя причина: IV7/RV7 = 1.05 — в норме" in text
+    assert "Бычий пут-спред (кредит) не собрался: 1 — последняя причина: нет экспирации 14–45 дн." in text
+    from optbot.fmt import utc
+    assert f"short:iron_condor:BTC:cost: издержки 1 — последняя ({utc(NOW)} UTC): 27NOV26 издержки 30%" in text
+    assert "Итогов расчёта" in paper.fmt_skips([], [], "7d")
+
+
+def test_paper_cli_skips(make_client, pcfg, monkeypatch, capsys):
+    monkeypatch.setattr(paper, "settings", pcfg)
+    monkeypatch.setattr(paper, "OptionsClient", lambda: make_client(pcfg))
+    assert paper.main(["--skips", "7d"]) == 0
+    assert "сигналы и отказы" in capsys.readouterr().out
+
+
+def test_skip_repeat_updates_last_ts_and_window(make_client, pcfg, fake):
+    set_chain(fake)
+    pe = eng(make_client, pcfg)
+    s = bull_put(fake)
+    s.cost_pct = 40.0
+    pe.step(NOW, {"BTC": {"short:bull_put:BTC:cost": s}})
+    pe.step(NOW + 10 * DAY_MS, {"BTC": {"short:bull_put:BTC:cost": s}})
+    _, skips = pe.skips(NOW + 9 * DAY_MS, NOW + 11 * DAY_MS)         # первый отказ — до окна, повтор — в нём
+    assert [r["code"] for r in skips] == ["cost"] and skips[0]["last_ts"] == NOW + 10 * DAY_MS
+    assert pe.cost_rejects(0, NOW + 11 * DAY_MS) == {"short:bull_put:BTC:cost": (1, 0)}   # счёт — по первому
+
+
+def test_traded_expiry_recorded_as_skip(make_client, pcfg, fake):
+    set_chain(fake)
+    pe = eng(make_client, pcfg)
+    pe.step(NOW, {"BTC": {"short:bull_put:BTC": bull_put(fake)}})
+    conn = db.connect(pcfg.db_file)
+    with conn:
+        conn.execute("UPDATE paper_trades SET status = 'closed', closed_ms = ?", (NOW + 1,))
+    conn.close()
+    pe.step(NOW + 2, {"BTC": {"short:bull_put:BTC": bull_put(fake)}})
+    _, skips = pe.skips(0, NOW + 3)
+    assert [r["code"] for r in skips] == ["traded"]
+    assert "экспирация уже торговалась 1" in paper.fmt_skips([], skips, "7d")
+
+
+def test_calendar_inversion_not_built_logged_as_not_built(make_client, pcfg, fake, monkeypatch):
+    from optbot.signals import Signal as S
+    pe = eng(make_client, pcfg)
+    set_chain(fake)
+    m = Metrics(base="BTC", ts_ms=NOW, horizon="long", trend=Trend("flat"))
+    monkeypatch.setattr(pe.engine, "calendar_signal", lambda *a, **k: S(
+        metrics=m, strategy="calendar", reasons=[], horizon="long", no_signal="инверсия IV есть, но календарь не собрался"))
+    pe.step(NOW)
+    conn = db.connect(pcfg.db_file)
+    r = conn.execute("SELECT * FROM paper_signals WHERE base='BTC' AND kind='calendar'").fetchone()
+    conn.close()
+    assert r["outcome"] == "not_built" and r["strategy"] == "calendar"
+
+
+def test_skips_excludes_reject_later_opened(make_client, pcfg, fake):
+    set_chain(fake)
+    pe = eng(make_client, pcfg)
+    s = bull_put(fake)
+    s.cost_pct = 40.0
+    pe.step(NOW, {"BTC": {"short:bull_put:BTC:cost": s}})
+    s2 = bull_put(fake)
+    s2.cost_pct = 5.0
+    pe.step(NOW + 1, {"BTC": {"short:bull_put:BTC:cost": s2}})
+    assert pe.skips(0, NOW + 2)[1] == []                             # как в --stats: не отказ
+    assert len(pe.skips(0, NOW + 1)[1]) == 1                         # в окне до открытия — ещё отказ

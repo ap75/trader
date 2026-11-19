@@ -42,7 +42,7 @@
 .venv/bin/python -m optbot.journal --sync | --report 7d [--csv f]   # журнал сделок (на сервере)
 .venv/bin/python -m optbot.cli signals BTC       # сигнал этапа 3 (pctl — по истории БД: на сервере)
 .venv/bin/python -m optbot.sigjournal --evaluate | --stats 30d [--base BTC] [--csv f]   # журнал сигналов (на сервере)
-.venv/bin/python -m optbot.paper --status | --stats 30d [--csv f] | --step | --check-delivery-fees   # книги E1 (на сервере)
+.venv/bin/python -m optbot.paper --status | --stats 30d [--csv f] | --skips 7d | --step | --check-delivery-fees   # книги E1 (на сервере)
 .venv/bin/python -m optbot.backup                # резервная копия БД сейчас (бот — раз в сутки, BACKUP_*)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
@@ -70,7 +70,8 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 сигналы (`signals.py`) читают `snapshots` для IV percentile; журнал сигналов (`sigjournal.py`) — таблица `signals`,
 путь сделки — по `leg_marks`, итог — по `delivery_prices`. Кнопка «Выставить» — `multileg.py` (ноги IOC, сначала покупки),
 итог исполнения — таблица `signal_executions`, ордера — `order_links` с `source=signal`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
-Бумажные книги E1 (`paper.py`, шаг после каждого среза): `books`, `paper_trades`, `book_equity`, `paper_skips`;
+Бумажные книги E1 (`paper.py`, шаг после каждого среза): `books`, `paper_trades`, `book_equity`, `paper_skips`
+(отказы книг: первый `ts`, последний `last_ts`), `paper_signals` (итог расчёта сигнала на каждом шаге, `--skips`);
 каждая книга — в двух версиях: без фильтра издержек и `…:cost` (`SIG_MAX_COST_PCT`);
 ноги — на слежение (`tracked_symbols`, reason `book:<id>`); длинный горизонт и календарь — `signals.py`
 (`horizon="long"`, `calendar_signal`); тег event — `events.csv` (`events.py`, дописывать вперёд).

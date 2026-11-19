@@ -37,6 +37,7 @@ import argparse
 import csv
 import io
 import json
+import re
 import logging
 import math
 import sys
@@ -185,7 +186,9 @@ class PaperEngine:
                 self._exits(conn, now_ms, res)
                 self._settle(conn, now_ms, res)
                 if signals is None:
-                    signals = self._signals(now_ms, res)
+                    outcomes: list[tuple] = []  # итоги расчёта шага (paper_signals)
+                    signals = self._signals(now_ms, res, outcomes)
+                    self._log_signals(conn, outcomes)
                 for base, by_book in signals.items():
                     for bid, sig in by_book.items():
                         try:
@@ -203,8 +206,9 @@ class PaperEngine:
             conn.executemany("INSERT OR IGNORE INTO books (id, horizon, strategy, base, created_ms, cost_filter) "
                              "VALUES (?,?,?,?,?,?)", [(i, h, s, b, now_ms, int(v)) for i, h, s, b, v in all_books(self.cfg)])
 
-    def _signals(self, now_ms: int, res: StepResult) -> dict[str, dict[str, Signal]]:
-        """Сигналы по активам: короткий и длинный горизонты и календарь — по одному запросу к бирже на актив."""
+    def _signals(self, now_ms: int, res: StepResult, outcomes: list[tuple]) -> dict[str, dict[str, Signal]]:
+        """Сигналы по активам: короткий и длинный горизонты и календарь — по одному запросу к бирже на актив.
+        outcomes — сюда дописываются итоги расчёта (строки paper_signals)."""
         out: dict[str, dict[str, Signal]] = {}
         books = all_books(self.cfg)
         for base in sorted({x[3] for x in books}):
@@ -213,6 +217,8 @@ class PaperEngine:
             except Exception as e:
                 log.warning("Бумажные книги: данные %s — %s", base, e)
                 res.errors.append(f"данные {base}: {e}")
+                for key in ("short", "long", "calendar"):
+                    outcomes.append((now_ms, base, key, "error", None, None, None, f"данные: {e}"[:300]))
                 continue
             by_book, got = {}, {}
             pad = EXIT_MARGIN_MS / DAY_MS  # экспирации ближе окна раннего выхода (с запасом) — не предлагать
@@ -229,7 +235,13 @@ class PaperEngine:
                 except Exception as e:
                     log.exception("Бумажные книги: сигнал %s %s не посчитан", key, base)
                     res.errors.append(f"сигнал {key} {base}: {e}")
+                    outcomes.append((now_ms, base, key, "error", None, None, None, str(e)[:300]))
                     continue
+                strategy = sig.strategy
+                outcome = "signal" if strategy and sig.legs else "not_built" if strategy else "none"
+                outcomes.append((now_ms, base, key, outcome, strategy, sig.regime,
+                                      sig.metrics.trend.direction if sig.metrics else None,
+                                      None if outcome == "signal" else (sig.no_signal or "")[:300]))
                 if sig.strategy and sig.legs:  # обе версии книги: без фильтра и с фильтром издержек
                     for x in books:
                         if x[1:4] == (sig.horizon, sig.strategy, base):
@@ -237,11 +249,40 @@ class PaperEngine:
             out[base] = by_book
         return out
 
+    def _log_signals(self, conn, outcomes: list[tuple]) -> None:
+        """Итоги расчёта шага — для paper --skips; сбой записи не мешает шагу."""
+        try:
+            with conn:
+                conn.executemany("INSERT OR IGNORE INTO paper_signals (ts, base, kind, outcome, strategy, regime, "
+                                 "trend, reason) VALUES (?,?,?,?,?,?,?,?)", outcomes)
+        except Exception as e:
+            log.warning("Бумажные книги: итоги сигналов не записаны — %s", e)
+
+    def skips(self, start_ms: int, end_ms: int) -> tuple[list[dict], list[dict]]:
+        """-> (итоги расчёта сигналов за период, отказы книг за период)."""
+        conn = self._db()
+        try:
+            sigs = [dict(r) for r in conn.execute(
+                "SELECT * FROM paper_signals WHERE ts >= ? AND ts < ? ORDER BY ts", (start_ms, end_ms))]
+            # отказ в периоде — если он был в нём хоть раз: первый не позже конца, последний не раньше начала
+            # по экспирации потом открылась сделка (до конца периода) — не отказ, как в cost_rejects
+            skips = [dict(r) for r in conn.execute(
+                "SELECT * FROM paper_skips s WHERE s.ts < ? AND COALESCE(s.last_ts, s.ts) >= ? AND (s.code = 'traded' "
+                "OR NOT EXISTS (SELECT 1 FROM paper_trades t WHERE t.book = s.book AND t.expiry = s.expiry "
+                "AND t.opened_ms < ? AND t.opened_ms >= s.ts)) ORDER BY COALESCE(s.last_ts, s.ts)",
+                (end_ms, start_ms, end_ms))]
+            return sigs, skips
+        finally:
+            conn.close()
+
     # ---------- вход ----------
     def _skip(self, conn, bid: str, expiry: str, code: str, reason: str, now_ms: int, res: StepResult) -> None:
         with conn:
-            n = conn.execute("INSERT OR IGNORE INTO paper_skips (book, expiry, code, ts, reason) VALUES (?,?,?,?,?)",
-                             (bid, expiry, code, now_ms, reason)).rowcount
+            n = conn.execute("INSERT OR IGNORE INTO paper_skips (book, expiry, code, ts, reason, last_ts) "
+                             "VALUES (?,?,?,?,?,?)", (bid, expiry, code, now_ms, reason, now_ms)).rowcount
+            if not n:  # повтор: ts — первый отказ (доля отказов фильтра), last_ts и причина — последние (--skips)
+                conn.execute("UPDATE paper_skips SET last_ts = ?, reason = ? WHERE book = ? AND expiry = ? AND code = ?",
+                             (now_ms, reason, bid, expiry, code))
         if n:  # одна причина на книгу и экспирацию — лог не засоряется каждые 15 минут
             log.info("Бумажные книги: %s %s — пропуск: %s", bid, expiry, reason)
             res.skipped.append(f"{bid} {expiry}: {reason}")
@@ -282,9 +323,15 @@ class PaperEngine:
     def _enter(self, conn, bid: str, sig: Signal, now_ms: int, res: StepResult) -> None:
         pc = self.pc
         expiry = sig.expiry
+        had = conn.execute("SELECT MAX(status = 'open') o FROM paper_trades WHERE book = ? AND expiry = ?",
+                           (bid, expiry)).fetchone()["o"]  # NULL — сделок не было, 1 — открыта, 0 — закрыта
+        if had == 1:
+            return  # сделка по этой экспирации открыта — это не отказ
+        if had == 0:
+            # одна сделка на экспирацию: после выхода по цели та же серия заново не открывается
+            self._skip(conn, bid, expiry, "traded", "по этой экспирации сделка уже была (закрыта или без итога)", now_ms, res)
+            return
         row = conn.execute("SELECT COUNT(*) n FROM paper_trades WHERE book = ? AND status = 'open'", (bid,)).fetchone()
-        if conn.execute("SELECT 1 FROM paper_trades WHERE book = ? AND expiry = ? LIMIT 1", (bid, expiry)).fetchone():
-            return  # одна сделка на экспирацию: после выхода по цели та же серия заново не открывается
         lim = self.cfg.sig.max_cost_pct
         if is_cost_book(bid) and sig.is_costly(lim):
             have = "премии нет" if sig.cost_pct is None else f"издержки {sig.cost_pct:.0f}% премии"
@@ -771,6 +818,65 @@ def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] 
     return "\n".join(lines + fmt_rejects(rejects or {}))
 
 
+SKIP_CODES = {"traded": "экспирация уже торговалась", "cost": "издержки", "max_open": "лимит открытых", "total_risk": "лимит суммарного риска",
+              "qty": "размер", "data": "нет данных", "exit_window": "мало до экспирации"}
+KINDS = {"short": "короткий", "long": "длинный", "calendar": "календарь"}
+OUTCOMES = {"signal": "сигнал", "not_built": "не собрался", "none": "нет стратегии", "error": "ошибка"}
+
+
+def fmt_skips(sigs: list[dict], skips: list[dict], label: str) -> str:
+    """Почему книги без сделок: итоги расчёта сигналов по шагам и отказы книг по причинам."""
+    from .signals import STRATEGIES, TREND_NAMES
+    lines = [f"Бумажные книги — сигналы и отказы, {label}"]
+    if not sigs:
+        lines.append("Итогов расчёта сигналов за период нет (пишутся на каждом шаге книг с миграции 9)")
+    groups: dict[tuple, list[dict]] = {}
+    for r in sigs:
+        groups.setdefault((r["kind"], r["base"]), []).append(r)
+    for (kind, base), rows in sorted(groups.items(), key=lambda kv: (list(KINDS).index(kv[0][0])
+                                                                     if kv[0][0] in KINDS else 9, kv[0][1])):
+        cnt = {o: sum(1 for r in rows if r["outcome"] == o) for o in OUTCOMES}
+        lines.append(f"{KINDS.get(kind, kind)} {base}: шагов {len(rows)} — "
+                     + ", ".join(f"{OUTCOMES[o]} {n}" for o, n in cnt.items() if n))
+        sig = {}
+        for r in rows:
+            if r["outcome"] == "signal":
+                sig[r["strategy"]] = sig.get(r["strategy"], 0) + 1
+        if sig:
+            lines.append("   сигналы: " + ", ".join(f"{STRATEGIES.get(k, k)} {n}" for k, n in
+                                                    sorted(sig.items(), key=lambda kv: -kv[1])))
+        why: dict[str, list[dict]] = {}
+        for r in rows:
+            if r["outcome"] == "none":  # группа — режим IV, тренд и текст причины без чисел
+                k = (f"IV {r['regime'] or '—'}, тренд {TREND_NAMES.get(r['trend'], r['trend'] or '—')}, "
+                     + re.sub(r"[-+]?\d[\d.,]*", "N", r["reason"] or "-")[:70])
+            elif r["outcome"] == "not_built":
+                k = f"{STRATEGIES.get(r['strategy'], r['strategy'])} не собрался"
+            elif r["outcome"] == "error":
+                k = "ошибка"
+            else:
+                continue
+            why.setdefault(k, []).append(r)
+        for k, part in sorted(why.items(), key=lambda kv: -len(kv[1])):
+            lines.append(f"   {k}: {len(part)} — последняя причина: {part[-1]['reason'] or '-'}")
+    if skips:
+        lines.append("Отказы книг при сигнале (раз на книгу и экспирацию):")
+        by: dict[str, list[dict]] = {}
+        for r in skips:
+            by.setdefault(r["book"], []).append(r)
+        for book in sorted(by):
+            part = by[book]
+            codes = {}
+            for r in part:
+                codes[r["code"]] = codes.get(r["code"], 0) + 1
+            lines.append(f" {book}: " + ", ".join(f"{SKIP_CODES.get(c, c)} {n}" for c, n in codes.items())
+                         + f" — последняя ({utc(part[-1]['last_ts'] or part[-1]['ts'])} UTC): {part[-1]['expiry']} "
+                           f"{part[-1]['reason'] or ''}".rstrip())
+    elif sigs:
+        lines.append("Отказов книг при сигнале нет")
+    return "\n".join(lines)
+
+
 CSV_FIELDS = ("id", "book", "cost_pct", "horizon", "strategy", "base", "opened_ms", "closed_ms", "expiry", "far_expiry", "qty",
               "qty_cap", "entry_net", "entry_fees", "exit_net", "exit_fees", "max_profit", "max_loss", "im_regular",
               "pnl", "r_mult", "close_reason", "delivery_price", "tags", "fng", "funding", "oi_chg_24h")
@@ -793,6 +899,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--step", action="store_true", help="шаг: выходы, итоги, входы по текущим сигналам")
     g.add_argument("--status", action="store_true", help="открытые сделки")
     g.add_argument("--stats", nargs="?", const="30d", metavar="ПЕРИОД", help="итоги закрытых (по умолчанию 30d)")
+    g.add_argument("--skips", nargs="?", const="7d", metavar="ПЕРИОД",
+                   help="почему без сделок: итоги расчёта сигналов и отказы книг (по умолчанию 7d)")
     g.add_argument("--check-delivery-fees", action="store_true",
                    help="сверить формулу комиссии поставки с поставками в деньгах из журнала сделок")
     ap.add_argument("--csv", metavar="ФАЙЛ", help="со --stats: сделки в CSV")
@@ -800,6 +908,10 @@ def main(argv: list[str] | None = None) -> int:
     eng = PaperEngine(OptionsClient(), settings)
     if a.status:
         print(eng.status())
+        return 0
+    if a.skips:
+        start, end, label = parse_period([a.skips])
+        print(fmt_skips(*eng.skips(start, end), label))
         return 0
     if a.check_delivery_fees:
         conn = db.connect(settings.db_file)

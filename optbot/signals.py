@@ -826,7 +826,8 @@ class SignalEngine:
                 sig.profile = Profile(max_profit=math.nan, max_loss=debit, breakevens=[])  # риск одного страйка = дебет
                 self._tag_events(sig)
                 return sig
-        if built:
+        if built:  # условие есть, ноги не собрались — как у compute: стратегия без ног («не собрать»)
+            sig.strategy = "calendar"
             sig.no_signal = "инверсия IV есть, но календарь не собрался"
         elif best_ratio is None:
             sig.no_signal = "нет пары экспираций с разницей ≥ 7 дн."
