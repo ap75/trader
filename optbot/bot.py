@@ -85,6 +85,7 @@ from . import backup as backup_mod
 from . import paper as paper_mod
 from . import vol as vol_mod
 from .paper import PaperEngine
+from .perpbook import PerpBook
 from .linkid import parse_link_id
 from .journal import Journal, fmt_report, parse_period
 from .multileg import MultiLegExecutor, SymbolGuard, fmt_result, leg_side, precheck, quote_mid
@@ -289,6 +290,7 @@ class OptionsBot:
         self.journal = Journal(cfg)
         self.signals = SignalEngine(client, cfg)
         self.paper = PaperEngine(client, cfg, self.signals)  # бумажные книги E1: шаг после каждого среза
+        self.perp = PerpBook(client, cfg)                     # бумажная книга перпетуалов EMA 4h — тем же шагом
         self._paper_task: asyncio.Task | None = None
         self._fng_task: asyncio.Task | None = None
         self.sigjournal = SignalJournal(cfg)
@@ -895,6 +897,12 @@ class OptionsBot:
             (log.warning if res.errors else log.info)("Бумажные книги: %s", res)
         except Exception:
             log.exception("Бумажные книги: шаг не выполнен")
+        try:  # перпетуалы EMA 4h — тем же шагом, после опционных (сбой одних не мешает другим)
+            res = await asyncio.to_thread(self.perp.step)
+            if res.opened or res.closed or res.errors:
+                (log.warning if res.errors else log.info)("Перпетуалы: %s", res)
+        except Exception:
+            log.exception("Перпетуалы: шаг не выполнен")
 
     def _break_streaks(self, bases) -> None:
         for b in bases:

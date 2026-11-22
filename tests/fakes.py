@@ -60,6 +60,7 @@ class FakeHTTP:
                         "openInterest": "5",
                     }
         self.perp: dict[str, str] = {}         # symbol перпетуала -> markPrice
+        self.funding_hist: dict[str, list[tuple[int, float]]] = {}  # symbol -> [(метка, ставка)]
         self.klines: dict[tuple[str, str], list] = {}  # (symbol, interval) -> строки kline, от новых к старым
         self.books: dict[str, dict] = {}       # symbol -> {"a": [[px, sz]], "b": [...]}; иначе из тикера
         self.positions: list[dict] = []
@@ -151,6 +152,14 @@ class FakeHTTP:
         if symbol:
             return ok({"list": [self.tickers[symbol]] if symbol in self.tickers else []})
         return ok({"list": [t for s, t in self.tickers.items() if s.startswith(baseCoin + "-")]})
+
+    def get_funding_rate_history(self, category, symbol, startTime=None, endTime=None, limit=200):
+        self._rec("get_funding_rate_history", locals())
+        rows = [r for r in self.funding_hist.get(symbol, [])
+                if (startTime is None or r[0] >= startTime) and (endTime is None or r[0] <= endTime)]
+        rows = sorted(rows, reverse=True)[:limit]
+        return ok({"category": category, "list": [{"symbol": symbol, "fundingRate": str(r),
+                                                   "fundingRateTimestamp": str(t)} for t, r in rows]})
 
     def get_open_interest(self, category, symbol, intervalTime, limit=50, **kw):
         self._rec("get_open_interest", locals())

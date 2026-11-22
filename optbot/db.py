@@ -434,6 +434,56 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # 11: бумажная книга перпетуалов EMA 4h (perpbook.py)
+    [
+        """
+        CREATE TABLE perp_books (
+            id              TEXT PRIMARY KEY,  -- perp:<стратегия>:<актив>
+            base            TEXT    NOT NULL,
+            strategy        TEXT    NOT NULL,
+            capital         REAL    NOT NULL,  -- условный начальный капитал
+            cash            REAL    NOT NULL,  -- капитал с реализованным итогом (без переоценки позиции)
+            qty             REAL    NOT NULL,  -- подписанное количество (лонг > 0)
+            entry           REAL    NOT NULL,  -- цена входа (с проскальзыванием)
+            last_bar_ms     INTEGER NOT NULL,  -- open последней пройденной свечи
+            last_funding_ms INTEGER NOT NULL,  -- метка последнего учтённого фондирования
+            created_ms      INTEGER NOT NULL,
+            params          TEXT               -- JSON параметров (config/perp_ema.json)
+        )
+        """,
+        """
+        CREATE TABLE perp_trades (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            book      TEXT    NOT NULL,
+            base      TEXT    NOT NULL,
+            side      INTEGER NOT NULL,        -- 1 лонг, −1 шорт
+            status    TEXT    NOT NULL,        -- open | closed
+            opened_ms INTEGER NOT NULL,
+            entry_px  REAL    NOT NULL,
+            qty       REAL    NOT NULL,
+            risk      REAL    NOT NULL,        -- qty × 3·ATR при входе (для R)
+            fees      REAL    NOT NULL,
+            funding   REAL    NOT NULL,        -- получено (+) / уплачено (−)
+            pnl       REAL    NOT NULL,        -- цена − комиссии + фондирование (у открытой — без переоценки)
+            closed_ms INTEGER,
+            exit_px   REAL,
+            r_mult    REAL,
+            reason    TEXT
+        )
+        """,
+        "CREATE INDEX perp_trades_book ON perp_trades (book, status)",
+        """
+        CREATE TABLE perp_equity (
+            ts     INTEGER NOT NULL,
+            book   TEXT    NOT NULL,
+            equity REAL    NOT NULL,           -- cash + переоценка позиции по последней цене
+            cash   REAL    NOT NULL,
+            qty    REAL    NOT NULL,
+            price  REAL    NOT NULL,
+            PRIMARY KEY (ts, book)
+        )
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе

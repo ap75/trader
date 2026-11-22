@@ -997,6 +997,12 @@ def main(argv: list[str] | None = None) -> int:
         if a.csv:
             with open(a.csv, "w", encoding="utf-8", newline="") as f:
                 f.write(to_csv(rows))
+        try:  # книга перпетуалов — справочно рядом; её сбой не мешает итогам опционных книг
+            from .perpbook import PerpBook, fmt_stats as perp_stats
+            pb = PerpBook(eng.c, settings)
+            print("\n" + (perp_stats(pb.closed(start, end), label, pb.correlations(start, end)) if pb.p else pb.status()))
+        except Exception as e:
+            print(f"\nКниги перпетуалов: итоги не посчитаны — {e}")
         return 0
     if not settings.paper.enabled:
         print("PAPER_ENABLED=0 — бумажные книги выключены")

@@ -44,6 +44,7 @@
 .venv/bin/python -m optbot.sigjournal --evaluate | --stats 30d [--base BTC] [--csv f]   # журнал сигналов (на сервере)
 .venv/bin/python -m optbot.paper --status | --stats 30d [--csv f] | --skips 7d | --step | --check-delivery-fees   # книги E1 (на сервере)
 .venv/bin/python -m optbot.backup                # резервная копия БД сейчас (бот — раз в сутки, BACKUP_*)
+.venv/bin/python -m optbot.perpbook --status | --stats 30d | --step   # бумажная книга перпетуалов EMA 4h (на сервере)
 .venv/bin/python -m optbot.vol --show | --fit [--base BTC]   # прогноз HAR7: модели | докачать свечи и переоценить (на сервере)
 deploy/offsite/pull_backups.py --help            # компьютер: выгрузка копий с сервера, ротация 7/4/6 (таймер — deploy/README.md)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
@@ -86,5 +87,7 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 в сутки), оценки коэффициентов — `har_models` (раз в месяц), эталон — `config/har_reference.json` (копия из research:
 папки `research/` на сервере нет). Книги короткого горизонта «`…:har`» (и «`…:har:cost`») — решение по IV7/HAR7;
 итог шага — `paper_signals.kind = short_har`; журнал сигналов пишет `har7` и `har_strategy` в `metrics`.
+Книга перпетуалов EMA 4h (`perpbook.py`, research этап 3; параметры — `config/perp_ema.json`): `perp_books`,
+`perp_trades`, `perp_equity`; шаг — в задаче бумажных книг после опционных; только бумага, ордеров нет.
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

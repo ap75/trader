@@ -371,6 +371,19 @@ class OptionsClient:
                          interval=str(interval_min), end=int(end_ms), limit=min(limit, 1000))
         return sorted((int(k[0]), float(k[4])) for k in res.get("list", []))
 
+    def perp_ohlc(self, base: str, interval_min: int, limit: int = 1000) -> list[tuple[int, float, float, float, float]]:
+        """Последние свечи перпетуала BASEUSDT: [(начало, open, high, low, close)] от старых к новым; последняя —
+        текущая незакрытая."""
+        res = self._call(self.http.get_kline, category="linear", symbol=f"{base.upper()}USDT",
+                         interval=str(interval_min), limit=min(limit, 1000))
+        return sorted((int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in res.get("list", []))
+
+    def perp_funding_history(self, base: str, start_ms: int, end_ms: int, limit: int = 200) -> list[tuple[int, float]]:
+        """История фондирования BASEUSDT в [start_ms, end_ms]: [(метка, ставка)] (до limit, от новых)."""
+        res = self._call(self.http.get_funding_rate_history, category="linear", symbol=f"{base.upper()}USDT",
+                         startTime=int(start_ms), endTime=int(end_ms), limit=min(limit, 200))
+        return [(int(x["fundingRateTimestamp"]), float(x["fundingRate"])) for x in res.get("list", [])]
+
     def chain(self, base: str, expiry_code: str, strikes_around_atm: int = 6) -> dict:
         """Цепочка опционов: строки по страйкам вокруг ATM, с котировками и греками."""
         rows = self.tickers(base, expiry_code)

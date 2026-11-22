@@ -1,0 +1,14 @@
+{
+  "source": "research/reports/stage3/results.md — EMA 4h лонг/шорт, параметры последнего окна walk-forward (2026-07), без подбора; движок — research/rlab/backtest.py, rlab/config.py",
+  "strategy": "ema_4h_ls",
+  "interval_min": 240,
+  "fast": 10,
+  "slow": 200,
+  "atr_period": 20,
+  "risk_atr_mult": 3.0,
+  "risk_per_trade": 0.01,
+  "max_leverage": 2.0,
+  "capital_usdt": 10000,
+  "taker_fee": 0.00055,
+  "slippage": 0.0005
+}
