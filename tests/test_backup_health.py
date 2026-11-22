@@ -15,7 +15,7 @@ from optbot.bot import OptionsBot, check_config, config_warnings
 
 @pytest.fixture
 def bcfg(cfg, tmp_path):
-    return dataclasses.replace(cfg, backup_dir=str(tmp_path / "bk"), backup_keep_days=14)
+    return dataclasses.replace(cfg, backup_dir=str(tmp_path / "bk"), backup_keep_days=14, backup_compress=False)
 
 
 def test_backup_online_consistent_copy(bcfg):
@@ -230,3 +230,52 @@ def test_prune_ignores_other_db_with_same_prefix(bcfg):
     os.utime(other, (0, 0))
     backup.prune(bcfg)
     assert os.path.exists(other)
+
+
+def test_backup_compressed_restorable_and_pruned_with_plain(bcfg, tmp_path):
+    import gzip
+    import shutil
+    c = dataclasses.replace(bcfg, backup_compress=True)
+    conn = db.connect(c.db_file)
+    with conn:
+        conn.execute("INSERT INTO bot_state (key, value) VALUES ('x', '42')")
+    conn.close()
+    now = time.time()
+    plain = backup.backup(bcfg, now - 20 * 86400)                       # старая несжатая (до перехода)
+    os.utime(plain, (now - 20 * 86400, now - 20 * 86400))
+    path = backup.backup(c, now)
+    assert path.endswith(".db.gz") and not os.path.exists(plain)        # старая .db удалена по сроку
+    assert [f for f in os.listdir(c.backup_dir_abs) if "part" in f] == []
+    out = tmp_path / "restored.db"
+    with gzip.open(path, "rb") as fi, open(out, "wb") as fo:
+        shutil.copyfileobj(fi, fo)
+    r = sqlite3.connect(out)
+    assert r.execute("SELECT value FROM bot_state WHERE key='x'").fetchone()[0] == "42"
+    assert r.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    r.close()
+
+
+def test_backup_compress_failure_cleans_part(bcfg, monkeypatch):
+    c = dataclasses.replace(bcfg, backup_compress=True)
+    db.connect(c.db_file).close()
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(backup.shutil, "copyfileobj", boom)
+    with pytest.raises(OSError):
+        backup.backup(c)
+    assert os.listdir(c.backup_dir_abs) == []
+
+
+def test_backup_compressed_crc_checked(bcfg, monkeypatch):
+    c = dataclasses.replace(bcfg, backup_compress=True)
+    db.connect(c.db_file).close()
+    real = backup.shutil.copyfileobj
+
+    def corrupt(fi, fo, n):  # пишет не то: подменённый поток — проверка CRC при чтении ловит
+        real(fi, fo, n)
+        fo.fileobj.write(b"garbage")
+    monkeypatch.setattr(backup.shutil, "copyfileobj", corrupt)
+    with pytest.raises(Exception):
+        backup.backup(c)
+    assert os.listdir(c.backup_dir_abs) == []

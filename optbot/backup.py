@@ -1,14 +1,17 @@
 """Резервная копия базы SQLite: онлайн через sqlite3 backup API (не копирование файла — согласованный снимок
-при работающем боте, вместе с WAL), проверка копии (PRAGMA quick_check), хранение BACKUP_KEEP_DAYS дней.
+при работающем боте, вместе с WAL), проверка копии (PRAGMA quick_check), сжатие gzip (BACKUP_COMPRESS, файл
+.db.gz — восстановить: gunzip), хранение BACKUP_KEEP_DAYS дней.
 
 Бот делает копию раз в сутки в BACKUP_DAILY_UTC; вручную: python -m optbot.backup.
 Копия лежит на том же сервере (BACKUP_DIR) — забирать на свой компьютер (rsync/scp по расписанию, deploy/README.md).
 """
 from __future__ import annotations
 
-import glob
-import logging
 import contextlib
+import glob
+import gzip
+import logging
+import shutil
 import os
 import pathlib
 import sqlite3
@@ -43,9 +46,21 @@ def backup(cfg: Settings, now: float | None = None) -> str:
             src.close()
         if ok != "ok":
             raise RuntimeError(f"копия не прошла проверку: {ok}")
-        os.replace(tmp, dst)  # готовая копия появляется целиком
+        if cfg.backup_compress:  # проверена несжатая; сжатая — тоже через .part
+            dst += ".gz"
+            with open(tmp, "rb") as fi, open(tmp + ".gz", "wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) as fo:
+                    shutil.copyfileobj(fi, fo, 1 << 20)
+                raw.flush()
+                os.fsync(raw.fileno())  # сбой питания сразу после копии — не пустой .gz
+            with gzip.open(tmp + ".gz", "rb") as fc:  # прочитать целиком: проверка CRC сжатой копии
+                while fc.read(1 << 20):
+                    pass
+            os.replace(tmp + ".gz", dst)
+        else:
+            os.replace(tmp, dst)  # готовая копия появляется целиком
     finally:
-        for f in (tmp, tmp + "-journal", tmp + "-wal", tmp + "-shm"):  # сбой — недописанную копию не оставлять
+        for f in (tmp, tmp + ".gz", tmp + "-journal", tmp + "-wal", tmp + "-shm"):  # сбой — недописанное убрать
             with contextlib.suppress(FileNotFoundError):
                 os.remove(f)
     try:  # копия уже готова: сбой чистки — не «копия не сделана»
@@ -69,8 +84,9 @@ def prune(cfg: Settings, now: float | None = None) -> list[str]:
         if t is not None and now - t > 86400:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(f)
-    files = sorted((t, f) for f in glob.glob(os.path.join(cfg.backup_dir_abs, f"{name}-[0-9]*.db"))  # [0-9]: не задеть копии другой базы с тем же префиксом
-                   if (t := mtime(f)) is not None)
+    # [0-9]: не задеть копии другой базы с тем же префиксом; .db и .db.gz — общий счёт (переход на сжатие)
+    found = [f for pat in ("db", "db.gz") for f in glob.glob(os.path.join(cfg.backup_dir_abs, f"{name}-[0-9]*.{pat}"))]
+    files = sorted((t, f) for f in found if (t := mtime(f)) is not None)
     old = [f for t, f in files[:-1] if now - t > cfg.backup_keep_days * 86400]
     for f in old:
         with contextlib.suppress(FileNotFoundError):

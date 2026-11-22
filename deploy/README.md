@@ -52,13 +52,15 @@ rsync -av --exclude .venv --exclude data --include .env.example --exclude '.env*
 
 **Резервные копии.** Бот раз в сутки (`BACKUP_DAILY_UTC`, 03:20 UTC) делает копию базы через sqlite backup API
 (согласованный снимок при работающем боте, не копирование файла) в `~/trader/backups/`, проверяет её
-(`PRAGMA quick_check`), хранит `BACKUP_KEEP_DAYS` (14) дней; сбой — срочное администратору. Вручную:
+(`PRAGMA quick_check`), сжимает gzip (`.db.gz`, `BACKUP_COMPRESS`), хранит `BACKUP_KEEP_DAYS` (14) дней;
+сбой — срочное администратору. Вручную:
 `.venv/bin/python -m optbot.backup`. Копия на том же диске — забирать на свой компьютер по расписанию,
 например cron на компьютере (раз в сутки после 03:30 UTC):
 ```
 rsync -a --exclude '*.part*' ap@SERVER:trader/backups/ ~/trader-backups/   # недописанные .part — не брать
 ```
-Восстановление: остановить бот, положить копию как `data/market-<env>.db` (старый файл и `-wal`/`-shm` убрать),
+Восстановление: остановить бот, распаковать копию в `data/market-<env>.db`
+(`gunzip -c backups/market-demo-ГГГГММДД-ЧЧММ.db.gz > data/market-demo.db`; старые `-wal`/`-shm` убрать),
 запустить.
 
 **Внешний мониторинг.** О своём падении бот сообщить не может. healthchecks.io (бесплатно): создать проверку

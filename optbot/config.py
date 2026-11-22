@@ -277,6 +277,7 @@ class Settings:
     backup_daily_utc: tuple[int, int] | None = _hhmm("BACKUP_DAILY_UTC", "03:20")
     backup_dir: str = os.getenv("BACKUP_DIR", "backups").strip() or "backups"
     backup_keep_days: int = _int_in("BACKUP_KEEP_DAYS", 14, 1, 3650)
+    backup_compress: bool = _bool("BACKUP_COMPRESS", True)  # gzip (.db.gz): SQLite сжимается в разы
     # внешний мониторинг (healthchecks.io и т.п.): GET после каждого среза сборщика, сбой среза — <url>/fail
     healthcheck_url: str = os.getenv("HEALTHCHECK_URL", "").strip()
     # полная цепочка опционов в БД (история для проверок задним числом): раз в N мин (первый срез периода;
