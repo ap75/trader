@@ -313,6 +313,8 @@ class Settings:
     chain_keep_days: int = _int_in("CHAIN_KEEP_DAYS", 0, 0, 36500)
     # индекс страха и жадности (рыночный фон в карточке и журналах; пусто — не запрашивать)
     fng_url: str = os.getenv("FNG_URL", "https://api.alternative.me/fng/?limit=1").strip()
+    # безрисковая ставка для книги базиса (векселя США 3 мес., CSV без ключа) — раз в сутки; пусто — не брать
+    rf_url: str = os.getenv("RF_URL", "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTB3").strip()
     # календарь событий высокой важности (тег event): относительный путь — от корня проекта
     events_path: str = os.getenv("EVENTS_FILE", "events.csv").strip() or "events.csv"  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
 

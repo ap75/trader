@@ -238,6 +238,8 @@ def test_bot_runs_perp_after_paper(monkeypatch):
     bot = OptionsBot.__new__(OptionsBot)
     bot.paper = type("P", (), {"step": lambda self: calls.append("paper") or perpbook.StepResult(0)})()
     bot.perp = type("Q", (), {"step": lambda self: calls.append("perp") or perpbook.StepResult(0)})()
+    from optbot.basisbook import StepResult as BasisStep
+    bot.basis = type("B", (), {"step": lambda self: BasisStep(0)})()
     asyncio.run(bot._paper_job())
     assert calls == ["paper", "perp"]
 

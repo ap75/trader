@@ -45,6 +45,7 @@
 .venv/bin/python -m optbot.paper --status | --stats 30d [--csv f] | --skips 7d | --step | --check-delivery-fees   # книги E1 (на сервере)
 .venv/bin/python -m optbot.backup                # резервная копия БД сейчас (бот — раз в сутки, BACKUP_*)
 .venv/bin/python -m optbot.perpbook --status | --stats 30d | --step   # бумажная книга перпетуалов EMA 4h (на сервере)
+.venv/bin/python -m optbot.basisbook --status | --stats 30d | --step | --rf   # книга базиса BTC/ETH (+SOL наблюдение) | ставка FRED (на сервере)
 .venv/bin/python -m optbot.reports --books 30d [--horizon short] [--base BTC] [--csv f] | --stress   # отчёты E3 (на сервере)
 .venv/bin/python -m optbot.vol --show | --fit [--base BTC]   # прогноз HAR7: модели | докачать свечи и переоценить (на сервере)
 deploy/offsite/pull_backups.py --help            # компьютер: выгрузка копий с сервера, ротация 7/4/6 (таймер — deploy/README.md)
@@ -90,6 +91,9 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 итог шага — `paper_signals.kind = short_har`; журнал сигналов пишет `har7` и `har_strategy` в `metrics`.
 Книга перпетуалов EMA 4h (`perpbook.py`, research этап 3; параметры — `config/perp_ema.json`): `perp_books`,
 `perp_trades`, `perp_equity`; шаг — в задаче бумажных книг после опционных; только бумага, ордеров нет.
+Книга базиса (`basisbook.py`, спот лонг + перп шорт; параметры и ставка — `config/basis.json`): `basis_books`,
+`basis_events`, `basis_equity`; шаг — после перпетуалов; только бумага; SOL — «наблюдение» (вне Σ). Ставка «сверх
+ставки» — FRED DTB3 раз в сутки (`rates.py`, `RF_URL`, `bot_state` `rf:DTB3`; в тестах `RF_URL` пуст).
 Отчёты E3 (`reports.py`): `/books` (метрики книг и систем по `book_equity`/`perp_equity`), `/stress` (Black-76 по IV и
 underlying ног из `leg_marks`, бета ETH/SOL к BTC — по `perp_h1`), еженедельно `BOOKS_WEEKLY_UTC`; % — от `PAPER_CAPITAL_USDT`.
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).

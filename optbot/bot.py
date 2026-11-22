@@ -85,8 +85,10 @@ from . import backup as backup_mod
 from . import paper as paper_mod
 from . import vol as vol_mod
 from . import reports
+from . import rates
 from .paper import PaperEngine
 from .perpbook import PerpBook
+from .basisbook import BasisBook
 from .linkid import parse_link_id
 from .journal import Journal, fmt_report, parse_period
 from .multileg import MultiLegExecutor, SymbolGuard, fmt_result, leg_side, precheck, quote_mid
@@ -294,6 +296,7 @@ class OptionsBot:
         self.signals = SignalEngine(client, cfg)
         self.paper = PaperEngine(client, cfg, self.signals)  # бумажные книги E1: шаг после каждого среза
         self.perp = PerpBook(client, cfg)                     # бумажная книга перпетуалов EMA 4h — тем же шагом
+        self.basis = BasisBook(client, cfg)                   # бумажная книга базиса (спот + перп) — тем же шагом
         self._paper_task: asyncio.Task | None = None
         self._fng_task: asyncio.Task | None = None
         self.sigjournal = SignalJournal(cfg)
@@ -964,6 +967,12 @@ class OptionsBot:
                 (log.warning if res.errors else log.info)("Перпетуалы: %s", res)
         except Exception:
             log.exception("Перпетуалы: шаг не выполнен")
+        try:  # базис — дневные свечи; шаг дешёвый (между свечами — только капитал)
+            res = await asyncio.to_thread(self.basis.step)
+            if res.events or res.errors:
+                (log.warning if res.errors else log.info)("Базис: %s", res)
+        except Exception:
+            log.exception("Базис: шаг не выполнен")
 
     def _break_streaks(self, bases) -> None:
         for b in bases:
@@ -1694,6 +1703,24 @@ class OptionsBot:
         if res.drift:
             await self.admin_alert("har_drift", vol_mod.fmt_drift(res))
 
+    async def _rf_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
+        """Ставка векселей (FRED DTB3) для книги базиса: раз в сутки; старше 7 дней — администратору."""
+        def run():
+            conn = db.connect(self.cfg.db_file)
+            try:
+                return rates.update(conn, self.cfg)
+            finally:
+                conn.close()
+        try:
+            res = await asyncio.to_thread(run)
+        except Exception:
+            log.exception("Ставка: обновление не выполнено")
+            return
+        (log.warning if res.error or res.stale else log.info)("Ставка: %s", res)
+        if res.stale:
+            await self.admin_alert("rf_stale", f"Ставка векселей для книги базиса устарела: {res}. «Сверх ставки» "
+                                               f"в /books — по ней; проверьте RF_URL и доступ к FRED.")
+
     async def _ping_health(self, ok: bool) -> None:
         """Внешний мониторинг: пинг после среза (сбой среза — /fail). Пинги пропали — сервис сообщит сам."""
         url = self.cfg.healthcheck_url
@@ -2014,6 +2041,9 @@ class OptionsBot:
                 # HAR7: при старте (свечи и модель — сразу) и ежедневно; переоценка — раз в месяц
                 app.job_queue.run_once(self._vol_job, when=300, name="har_first")
                 app.job_queue.run_daily(self._vol_job, time=dtime(0, 50, tzinfo=timezone.utc), name="har")
+                if self.cfg.rf_url and self.cfg.paper.enabled:  # ставка для «сверх ставки» книги базиса
+                    app.job_queue.run_once(self._rf_job, when=360, name="rf_first")
+                    app.job_queue.run_daily(self._rf_job, time=dtime(14, 30, tzinfo=timezone.utc), name="rf")
                 if self.cfg.books_weekly_utc and self.cfg.paper.enabled:
                     d, h, m = self.cfg.books_weekly_utc
                     # PTB: 0 — воскресенье; у нас 0 — понедельник
@@ -2097,6 +2127,8 @@ def check_config(cfg: Settings) -> list[str]:
     if no_qty:  # лимит кол-ва на ордер обязателен для каждой монеты, иначе ордера без ограничения размера
         errors.append("Не задан лимит кол-ва на ордер: " + ", ".join(f"MAX_QTY_{c}" for c in no_qty)
                       + " (обязателен для каждой монеты из BASE_COINS)")
+    if cfg.rf_url and not cfg.rf_url.startswith("https://"):
+        errors.append("RF_URL: нужен https://-адрес (или пусто — ставка только из config/basis.json)")
     if cfg.fng_url and not cfg.fng_url.startswith("https://"):
         errors.append("FNG_URL: нужен https://-адрес (или пусто — без индекса страха и жадности)")
     if cfg.healthcheck_url and not cfg.healthcheck_url.startswith("https://"):

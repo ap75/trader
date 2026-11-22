@@ -1,0 +1,29 @@
+{
+  "source": "research/reports/basis/results.md — спот в лонг + перпетуал в шорт, «всегда», номинал 1x, перестройка с коридором 25% (опорный вариант) и защитой 1%; движок — research/rlab/backtest.py run_basis, rlab/config.py; SOL — только наблюдение (research: базис на SOL не сработал)",
+  "strategy": "spot_perp",
+  "bases": [
+    "BTC",
+    "ETH"
+  ],
+  "interval_min": 1440,
+  "notional": 1.0,
+  "rebalance_band": 0.25,
+  "max_basis_dev": 0.01,
+  "capital_usdt": 10000,
+  "spot_taker_fee": 0.001,
+  "perp_taker_fee": 0.00055,
+  "slippage": 0.0005,
+  "rf_annual": 0.0416,
+  "rf_note": "запасное значение: бот берёт ставку с FRED DTB3 раз в сутки (RF_URL); это — пока ни разу не получено",
+  "observe": [
+    "SOL"
+  ],
+  "observe_note": "наблюдение: книга ведётся, но в итоги базиса не входит (research: на SOL базис не сработал)",
+  "rf_date": "2026-11-19",
+  "worst_funding_week": {
+    "BTC": -0.006,
+    "ETH": -0.014,
+    "SOL": -0.256
+  },
+  "worst_funding_week_note": "research/reports/basis/results.md: худшие 7 дней фондирования для шорта (доля номинала): BTC 2021-07-26, ETH 2022-09-15, SOL 2022-11-15 (крах FTX)"
+}

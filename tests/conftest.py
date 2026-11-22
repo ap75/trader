@@ -21,6 +21,7 @@ os.environ.update(
     TELEGRAM_TRADER_IDS="10", TELEGRAM_VIEWER_IDS="20",
     ALLOW_ALL_GROUP_MEMBERS_VIEW="false", SENSITIVE_COMMANDS_DM_ONLY="true",
     FNG_URL="",  # без сети: индекс страха и жадности в тестах подменяется
+    RF_URL="",   # без сети: ставка FRED в тестах подменяется
 )
 
 import dataclasses  # noqa: E402

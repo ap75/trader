@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import math
 import statistics
 from dataclasses import dataclass, field
@@ -28,6 +29,7 @@ from .paper import (all_books, cost_rejects, fmt_rejects, fmt_versions, in_syste
                     leg_marks, signal_freq, summarize)
 from .perpbook import corr, daily_pnl
 
+log = logging.getLogger("optbot.reports")
 YEAR_MS = 365 * DAY_MS
 BETA_DAYS = 90
 BETA_MIN_DAYS = 30              # меньше общих дней — бета 1 (с пометкой)
@@ -145,6 +147,8 @@ class Stress:
     perp_capital: float = 0.0
     missing: list[str] = field(default_factory=list)                   # сделки без котировок / IV
     trades: int = 0
+    # книга базиса -> (номинал USDT, худшая историческая неделя фондирования: доля, потеря USDT, капитал, наблюдение)
+    basis: dict[str, tuple[float, float, float, float, bool]] = field(default_factory=dict)
 
 
 def stress(cfg: Settings = settings, now_ms: int | None = None, conn=None) -> Stress:
@@ -200,6 +204,20 @@ def stress(cfg: Settings = settings, now_ms: int | None = None, conn=None) -> St
             notional = b["qty"] * px["price"]
             res.perp[b["id"]] = [notional * bt * s for _, s, _ in SCENARIOS]
             res.perp_greeks.setdefault(b["base"], Greeks()).add(Greeks(b["qty"], notional))
+        try:
+            from .basisbook import is_observe, load_params
+            bp = load_params()
+            bbooks = conn.execute("SELECT * FROM basis_books ORDER BY id").fetchall()
+        except Exception:
+            bp, bbooks = None, []
+        for b in bbooks:
+            row = conn.execute("SELECT spot FROM basis_equity WHERE book = ? ORDER BY ts DESC LIMIT 1",
+                               (b["id"],)).fetchone()
+            wk = bp.worst_funding_week.get(b["base"])
+            if not b["qty"] or row is None or wk is None:
+                continue
+            notional = b["qty"] * row["spot"]
+            res.basis[b["id"]] = (notional, wk, notional * wk, b["capital"], is_observe(bp, b["id"]))
         return res
     finally:
         if own:
@@ -250,7 +268,7 @@ def fmt_stress(st: Stress, cfg: Settings = settings) -> str:
     bt = ", ".join(f"{b} β {v:.2f}" + ("" if n >= BETA_MIN_DAYS else f" (мало данных: {n} дн., взята 1)")
                    for b, (v, n) in st.betas.items() if b != "BTC")
     lines = [f"Стресс открытых бумажных позиций (мгновенно; ETH/SOL — по бете к BTC за {BETA_DAYS} дн.: {bt or '-'})"]
-    if not st.books and not st.perp:
+    if not st.books and not st.perp and not st.basis:
         lines.append(" открытых позиций нет")
     totals = system_totals(st, cfg)
     for title, lo, hi in (("Изменение PnL, USDT — отдельные сценарии (сдвиг BTC; IV — пункты у всех ног):", 0, N_SINGLE),
@@ -272,6 +290,17 @@ def fmt_stress(st: Stress, cfg: Settings = settings) -> str:
             lines.append(f"{'Σ перпетуалы':{W}}{_cells(tot[lo:hi])}")
             if st.perp_capital:
                 lines.append(f"{'  % от ' + f'{st.perp_capital:,.0f}':{W}}{_pcts(tot[lo:hi], st.perp_capital)}")
+    if st.basis:
+        lines.append("Базис (дельта-нейтрален — сдвиг цены ≈ 0): худшая историческая неделя фондирования для шорта "
+                     "(research), на текущий номинал:")
+        for book, (notional, wk, loss, cap_b, obs) in sorted(st.basis.items()):
+            lines.append(f" {book}{' [наблюдение]' if obs else ''}: номинал {notional:,.0f} × {wk:+.1%} = "
+                         f"{loss:+,.0f} USDT ({loss / cap_b:+.1%} капитала)")
+        main = [v for v in st.basis.values() if not v[4]]
+        if len(main) > 1:
+            tot, cap_t = sum(v[2] for v in main), sum(v[3] for v in main)
+            lines.append(f" Σ базис (без наблюдения): {tot:+,.0f} USDT ({tot / cap_t:+.1%} от {cap_t:,.0f}; худшие "
+                         "недели у монет — в разные даты)")
     if st.books or st.perp:
         lines.append(f"Σ — по системам (длинный горизонт — и в RV, и в HAR); % — от условного капитала; "
                      f"в скобках у книги — худший сценарий таблицы, % от {cap:,.0f}")
@@ -399,6 +428,8 @@ class BooksReport:
     open_lines: list[str]
     versions: list[str]
     rejects: list[str]
+    basis: list[dict] = field(default_factory=list)
+    basis_corr: dict[str, dict[str, tuple[float | None, int]]] = field(default_factory=dict)
 
 
 def books_report(start_ms: int, end_ms: int, label: str, cfg: Settings = settings, horizon: str | None = None,
@@ -468,9 +499,21 @@ def books_report(start_ms: int, end_ms: int, label: str, cfg: Settings = setting
                 mark = sum(t["mark_pnl"] if t["mark_pnl"] is not None else -t["entry_fees"] for t in part)
                 open_lines.append(f" {name}: {len(part)}, риск {sum(t['max_loss'] for t in part):.2f}, "
                                   f"по mark {mark:+.2f} USDT")
+        basis, basis_corr = [], {}
+        if horizon is None:
+            try:
+                basis = basis_rows(start_ms, end_ms, cfg, base, conn)
+                beq = _series(conn, BASIS_EQ_SQL, (), start_ms, end_ms)
+            except Exception:
+                log.exception("Отчёт книг: итоги базиса не посчитаны")
+                basis, beq = [], {}
+            for r_ in basis:
+                series = beq.get(r_["book"], [])
+                bd = dict(zip(*_days(series, start_ms))) if series else {}
+                basis_corr[r_["book"]] = {name: corr(bd, sd) for name, sd in sys_daily.items()}
         return BooksReport(label, rows, sys_rows, perp_rows, perp_corr, open_lines,
                            fmt_versions(closed if horizon in (None, "short") else [], freq if horizon in (None, "short") else None),
-                           fmt_rejects(rej))
+                           fmt_rejects(rej), basis, basis_corr)
     finally:
         if own:
             conn.close()
@@ -483,6 +526,113 @@ def _days(series: list[tuple[int, float]], start_ms: int) -> tuple[list[int], li
     pts = [(day0 - 1 if ts < start_ms else ts, v) for ts, v in series]
     d = daily_pnl([dict(ts=ts, book="x", v=v) for ts, v in pts], day0).get("x", {})
     return list(d.keys()), list(d.values())
+
+
+# ---------- книга базиса ----------
+# кривая — только с начала текущей книги (книгу начали заново после перерыва — старые точки не в счёт)
+BASIS_EQ_SQL = ("SELECT e.ts, e.book, e.equity v FROM basis_equity e JOIN basis_books b ON b.id = e.book "
+                "WHERE e.ts >= b.created_ms ORDER BY e.ts")
+def basis_rows(start_ms: int, end_ms: int, cfg: Settings = settings, base: str | None = None, conn=None,
+               rf: float | None = None) -> list[dict]:
+    """По книгам базиса за период: PnL (изменение капитала), фондирование, издержки, перестройки, годовых и сверх
+    ставки (rf — годовая; по умолчанию последняя с FRED, иначе из config/basis.json), просадка, Шарп и Шарп сверх
+    ставки, номинал / капитал книги на конец периода; observe — книга «наблюдение» (в итог базиса не входит)."""
+    from .basisbook import is_observe, load_params
+    own = conn is None
+    conn = conn or db.connect(cfg.db_file)
+    try:
+        try:
+            p = load_params()
+        except Exception:
+            p = None
+        rf_label = None
+        if rf is None:
+            try:
+                from . import rates
+                r_ = rates.current(conn)
+                rf, rf_label = r_.rate, r_.label()
+            except Exception:
+                log.exception("Ставка для базиса не прочитана — сверх ставки считаю от 0")
+                rf = 0.0
+        books = [dict(r) for r in conn.execute("SELECT * FROM basis_books ORDER BY id")
+                 if base is None or r["base"] == base]
+        eq = _series(conn, BASIS_EQ_SQL, (), start_ms, end_ms)
+        out = []
+        for b in books:
+            series = eq.get(b["id"], [])
+            ev = {r["kind"]: (r["n"], r["amt"]) for r in conn.execute(
+                "SELECT kind, COUNT(*) n, COALESCE(SUM(amount), 0) amt FROM basis_events WHERE book = ? AND ts >= ? "
+                "AND ts < ? GROUP BY kind", (b["id"], max(start_ms, b["created_ms"]), end_ms))}
+            first = series[0] if series else None
+            obs = is_observe(p, b["id"])
+            last = conn.execute("SELECT equity, qty, spot FROM basis_equity WHERE book = ? AND ts < ? AND ts >= ? "
+                                "ORDER BY ts DESC LIMIT 1", (b["id"], end_ms, b["created_ms"])).fetchone()
+            lev = last["qty"] * last["spot"] / last["equity"] if last and last["equity"] > 0 else None
+            if first is None:
+                out.append(dict(book=b["id"], days=0, pnl=0.0, capital=b["capital"], funding=0.0, costs=0.0,
+                                rebalances=0, skipped=0, ann=None, excess=None, rf=rf, rf_label=rf_label, dd=0.0,
+                                dd_pct=0.0, sharpe=None, sharpe_x=None, lev=lev, observe=obs, start_v=b["capital"]))
+                continue
+            if first[0] < start_ms:                     # точка до периода — от неё
+                start_v, t0 = first[1], start_ms
+            elif b["created_ms"] >= start_ms:           # книга начата в периоде — от капитала, с первого входа
+                ent = conn.execute("SELECT MIN(ts) FROM basis_events WHERE book = ? AND kind = 'enter' AND ts >= ?",
+                                   (b["id"], b["created_ms"])).fetchone()[0]
+                start_v, t0 = b["capital"], ent or b["created_ms"]
+            else:                                       # до периода точек нет (бот не работал) — от первой в периоде
+                start_v, t0 = first[1], first[0]
+            pnl = series[-1][1] - start_v
+            days = max((series[-1][0] - t0) / DAY_MS, 0.0)
+            c = curve_metrics(series, start_ms, b["capital"])
+            ann = pnl / start_v * 365 / days if days >= 1 and start_v > 0 else None   # на капитал в начале периода
+            dl = _days(series, start_ms)[1]
+            sx = None
+            if len(dl) >= MIN_RATIO_DAYS:
+                x = [v - start_v * rf / 365 for v in dl]
+                sd = statistics.pstdev(x)
+                sx = statistics.fmean(x) / sd * math.sqrt(365) if sd > 0 else None
+            out.append(dict(book=b["id"], days=days, pnl=pnl, capital=b["capital"],
+                            funding=ev.get("funding", (0, 0.0))[1],
+                            costs=ev.get("enter", (0, 0.0))[1] + ev.get("rebalance", (0, 0.0))[1],
+                            rebalances=ev.get("rebalance", (0, 0))[0], skipped=ev.get("skip", (0, 0))[0],
+                            ann=ann, excess=None if ann is None else ann - rf, rf=rf, rf_label=rf_label, dd=c["dd"],
+                            dd_pct=c["dd_pct"], sharpe=c["sharpe"], sharpe_x=sx, lev=lev, observe=obs,
+                            start_v=start_v))
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
+def fmt_basis(rows: list[dict], label: str, p=None) -> str:
+    head = "Книги базиса (спот лонг + перп шорт, бумага"
+    if p is not None:
+        head += f", номинал {p.notional:g}x, коридор {p.rebalance_band:.0%}"
+    lines = [head + f"), {label}:"]
+    if not rows:
+        lines.append(" ещё не начаты")
+    f2 = lambda x: "-" if x is None else f"{x:+.2f}"     # noqa: E731
+    pc = lambda x: "-" if x is None else f"{x:+.1%}"     # noqa: E731
+    for r in rows:
+        lev = "-" if r.get("lev") is None else f"{r['lev']:.2f}x"
+        lines.append(f" {r['book']}{' [наблюдение]' if r.get('observe') else ''}: PnL {r['pnl']:+.2f} "
+                     f"({r['pnl'] / (r.get('start_v') or r['capital']):+.2%} от капитала в начале периода) за "
+                     f"{r['days']:.1f} дн., номинал/капитал {lev}, "
+                     f"фондирование {r['funding']:+.2f}, издержки {r['costs']:+.2f}, перестроек {r['rebalances']}"
+                     + (f" (отложено {r['skipped']})" if r["skipped"] else "")
+                     + f"; годовых {pc(r['ann'])}, сверх ставки {r['rf']:.2%}: {pc(r['excess'])}; просадка "
+                     f"{r['dd']:+.2f} ({r['dd_pct']:+.2%}), Шарп {f2(r['sharpe'])}, сверх ставки {f2(r['sharpe_x'])}")
+    main = [r for r in rows if not r.get("observe")]
+    if len(main) > 1:
+        cap = sum(r["capital"] for r in main)
+        lines.append(f" Σ базис (без наблюдения): PnL {sum(r['pnl'] for r in main):+.2f} "
+                     f"({sum(r['pnl'] for r in main) / cap:+.2%} от {cap:,.0f}), фондирование "
+                     f"{sum(r['funding'] for r in main):+.2f}, издержки {sum(r['costs'] for r in main):+.2f}")
+    if rows and rows[0].get("rf_label"):
+        lines.append(f" ставка: {rows[0]['rf_label']}")
+    if any(r["days"] and r["days"] < 30 for r in rows):
+        lines.append(" годовых за короткий срок — грубая оценка (research: BTC/ETH ≈ +3…5% сверх ставки)")
+    return "\n".join(lines)
 
 
 def fmt_books(r: BooksReport, cfg: Settings = settings, filt: str = "") -> str:
@@ -509,6 +659,14 @@ def fmt_books(r: BooksReport, cfg: Settings = settings, filt: str = "") -> str:
             for pb, v in sorted(r.perp_corr.items()):
                 cells = ["-" if v[n][0] is None else f"{v[n][0]:+.2f}" for n in names]
                 lines.append(f" {pb}: " + " / ".join(cells) + f" ({max(x[1] for x in v.values())} дн.)")
+    if r.basis:
+        lines += fmt_basis(r.basis, r.label).splitlines()
+        names = sorted({n for v in r.basis_corr.values() for n in v})
+        if names and any(c is not None for v in r.basis_corr.values() for c, _ in v.values()):
+            lines.append("Корреляция дневных итогов базиса с системами опционных книг (" + " / ".join(names) + "):")
+            for bb, v in sorted(r.basis_corr.items()):
+                cells = ["-" if v[n][0] is None else f"{v[n][0]:+.2f}" for n in names]
+                lines.append(f" {bb}: " + " / ".join(cells) + f" ({max(x[1] for x in v.values())} дн.)")
     return "\n".join(lines)
 
 

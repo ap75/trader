@@ -374,8 +374,16 @@ class OptionsClient:
     def perp_ohlc(self, base: str, interval_min: int, limit: int = 1000) -> list[tuple[int, float, float, float, float]]:
         """Последние свечи перпетуала BASEUSDT: [(начало, open, high, low, close)] от старых к новым; последняя —
         текущая незакрытая."""
-        res = self._call(self.http.get_kline, category="linear", symbol=f"{base.upper()}USDT",
-                         interval=str(interval_min), limit=min(limit, 1000))
+        return self._ohlc("linear", base, interval_min, limit)
+
+    def spot_ohlc(self, base: str, interval_min: int, limit: int = 1000) -> list[tuple[int, float, float, float, float]]:
+        """То же для спота BASEUSDT."""
+        return self._ohlc("spot", base, interval_min, limit)
+
+    def _ohlc(self, category: str, base: str, interval_min: int, limit: int) -> list[tuple]:
+        iv = "D" if interval_min == 1440 else str(interval_min)      # у Bybit сутки — «D», не 1440
+        res = self._call(self.http.get_kline, category=category, symbol=f"{base.upper()}USDT",
+                         interval=iv, limit=min(limit, 1000))
         return sorted((int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in res.get("list", []))
 
     def perp_funding_history(self, base: str, start_ms: int, end_ms: int, limit: int = 200) -> list[tuple[int, float]]:

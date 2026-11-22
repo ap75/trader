@@ -484,6 +484,56 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # 12: бумажная книга базиса: спот в лонг + перпетуал в шорт (basisbook.py)
+    [
+        """
+        CREATE TABLE basis_books (
+            id              TEXT PRIMARY KEY,  -- basis:<стратегия>:<актив>
+            base            TEXT    NOT NULL,
+            capital         REAL    NOT NULL,  -- условный начальный капитал
+            cash            REAL    NOT NULL,  -- капитал с реализованным итогом (без переоценки ног)
+            qty             REAL    NOT NULL,  -- количество каждой ноги (спот лонг = перп шорт)
+            s_in            REAL    NOT NULL,  -- цена спота, от которой считается переоценка
+            p_in            REAL    NOT NULL,  -- цена перпа, от которой считается переоценка
+            last_bar_ms     INTEGER NOT NULL,  -- open последней пройденной дневной свечи
+            last_funding_ms INTEGER NOT NULL,
+            fees            REAL    NOT NULL DEFAULT 0,   -- всего комиссий (с начала книги)
+            funding         REAL    NOT NULL DEFAULT 0,   -- всего фондирования (получено +)
+            rebalances      INTEGER NOT NULL DEFAULT 0,
+            skipped         INTEGER NOT NULL DEFAULT 0,   -- перестроек отложено защитой (перп и спот разошлись)
+            owed_ms         INTEGER,           -- open, исполненный без фондирования с этой меткой (не пришло вовремя):
+            owed_qty        REAL,              -- его заплатит количество до этого open
+            owed_px         REAL,              -- по open перпа этой свечи
+            created_ms      INTEGER NOT NULL,
+            params          TEXT
+        )
+        """,
+        """
+        CREATE TABLE basis_events (            -- вход, перестройка, отложенная перестройка, фондирование
+            id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            book   TEXT    NOT NULL,
+            ts     INTEGER NOT NULL,
+            kind   TEXT    NOT NULL,           -- enter | rebalance | skip | funding
+            qty    REAL,                       -- количество после события
+            spot   REAL,
+            perp   REAL,
+            amount REAL                        -- фондирование (+ получено) или издержки (−)
+        )
+        """,
+        "CREATE INDEX basis_events_book ON basis_events (book, ts)",
+        """
+        CREATE TABLE basis_equity (
+            ts     INTEGER NOT NULL,
+            book   TEXT    NOT NULL,
+            equity REAL    NOT NULL,           -- cash + переоценка обеих ног по последним ценам
+            cash   REAL    NOT NULL,
+            qty    REAL    NOT NULL,
+            spot   REAL    NOT NULL,
+            perp   REAL    NOT NULL,
+            PRIMARY KEY (ts, book)
+        )
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе
