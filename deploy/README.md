@@ -36,7 +36,7 @@ cd ~/trader && git pull                                # обновление
 **Альтернатива — rsync с компьютера** (если на сервере нет доступа к GitHub). Из корня проекта на компьютере:
 ```
 rsync -av --exclude .venv --exclude data --include .env.example --exclude '.env*' --exclude .git \
-      --exclude __pycache__ ./ ap@SERVER:trader/
+      --exclude __pycache__ --exclude /backups ./ ap@SERVER:trader/
 ```
 Не трогает на сервере `.env`, `data/`, `.venv` и `.git`. Способы не смешивать: если сервер обновляется через
 `git pull`, rsync поверх него оставит рабочую копию с правками относительно последнего коммита — следующий
@@ -54,11 +54,39 @@ rsync -av --exclude .venv --exclude data --include .env.example --exclude '.env*
 (согласованный снимок при работающем боте, не копирование файла) в `~/trader/backups/`, проверяет её
 (`PRAGMA quick_check`), сжимает gzip (`.db.gz`, `BACKUP_COMPRESS`), хранит `BACKUP_KEEP_DAYS` (14) дней;
 сбой — срочное администратору. Вручную:
-`.venv/bin/python -m optbot.backup`. Копия на том же диске — забирать на свой компьютер по расписанию,
-например cron на компьютере (раз в сутки после 03:30 UTC):
+`.venv/bin/python -m optbot.backup`. Копия на том же диске — забирать на свой компьютер (ниже).
+
+**Копии на своём компьютере** (`deploy/offsite/`). Скрипт `pull_backups.py` (только стандартный Python) по ssh
+забирает с сервера `.db.gz` и хранит в `OPTBOT_BACKUP_DEST` (например `backups/` рабочей копии проекта —
+в `.gitignore`): `daily/` — 7 последних дней, `weekly/` — 4 последних
+воскресенья, `monthly/` — 6 последних первых чисел (дата из имени файла, UTC). Таймер systemd раз в сутки
+(06:00 UTC) с `Persistent=true`: компьютер был выключен — запуск при включении (до 10 попыток с паузой в минуту,
+пока поднимается сеть). Скачанное проверяется (gzip CRC и что внутри база SQLite); даты позже завтрашней
+(сбой часов сервера) не учитываются; два запуска в одну папку не мешают друг другу (блокировка).
+Сбой выгрузки виден только в `journalctl --user -u optbot-pull-backups` — чтобы узнать о нём, заведите отдельную
+проверку healthchecks.io (период 1 день, grace — сколько компьютер бывает выключен, например 3 дня) и впишите
+её адрес в `OPTBOT_BACKUP_HEALTHCHECK`: успех — пинг, сбой всех попыток — `/fail`. Сервер хранит 14 дней — пропущенные воскресенья и первые числа догружаются, если компьютер
+не был выключен дольше. Файл качается один раз (в другие папки — жёсткая ссылка), проверяется (gzip CRC) до того,
+как попасть в папки; старые удаляются только после успешной загрузки. Несжатые `.db` не забираются.
+
+Установка на компьютере (один раз), из корня проекта:
 ```
-rsync -a --exclude '*.part*' ap@SERVER:trader/backups/ ~/trader-backups/   # недописанные .part — не брать
+# 1. ключ без пароля только для копий (таймер работает без ssh-агента) и вход по нему
+ssh-keygen -t ed25519 -N "" -C optbot-backup -f ~/.ssh/optbot_backup
+ssh-copy-id -i ~/.ssh/optbot_backup.pub ap@SERVER
+ssh -i ~/.ssh/optbot_backup -o IdentitiesOnly=yes -o BatchMode=yes ap@SERVER ls trader/backups   # без пароля
+# 2. скрипт, настройки (адрес сервера — здесь, не в репозитории), таймер
+install -Dm755 deploy/offsite/pull_backups.py ~/.local/bin/optbot-pull-backups
+cp -n deploy/offsite/optbot-pull-backups.env.example ~/.config/optbot-pull-backups.env   # вписать сервер
+cp deploy/offsite/optbot-pull-backups.service deploy/offsite/optbot-pull-backups.timer ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now optbot-pull-backups.timer
+# 3. проверка: запустить сейчас и посмотреть итог
+systemctl --user start optbot-pull-backups && journalctl --user -u optbot-pull-backups -n 20
+ls -l backups/*/          # или своя OPTBOT_BACKUP_DEST
 ```
+Когда последний запуск и следующий: `systemctl --user list-timers optbot-pull-backups`. Вход по паролю ssh
+просит в терминале — у таймера не сработает (`BatchMode`): нужен именно ключ. После обновления скрипта в
+репозитории — повторить `install` из шага 2.
 Восстановление: остановить бот, распаковать копию в `data/market-<env>.db`
 (`gunzip -c backups/market-demo-ГГГГММДД-ЧЧММ.db.gz > data/market-demo.db`; старые `-wal`/`-shm` убрать),
 запустить.

@@ -1,0 +1,11 @@
+# Выгрузка резервных копий бота с сервера на этот компьютер (deploy/README.md, «Копии на своём компьютере»).
+[Unit]
+Description=Pull options-bot DB backups from the server
+
+[Service]
+Type=oneshot
+# зависшая без обрыва связи загрузка — не держать службу вечно (следующие запуски таймера не начнутся)
+TimeoutStartSec=3h
+EnvironmentFile=%h/.config/optbot-pull-backups.env
+# у user-юнитов нет network-online.target: сеть после включения ждём попытками (10 × 1 мин)
+ExecStart=/usr/bin/python3 %h/.local/bin/optbot-pull-backups --retries 10 --retry-wait 60

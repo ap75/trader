@@ -1,0 +1,12 @@
+# Раз в сутки после копии на сервере (03:20 UTC); Persistent — пропущенный запуск (компьютер был выключен)
+# выполняется при следующем включении.
+[Unit]
+Description=Daily pull of options-bot DB backups
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
