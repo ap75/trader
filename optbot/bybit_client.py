@@ -364,6 +364,13 @@ class OptionsClient:
         rows = sorted((int(k[0]), float(k[4])) for k in res.get("list", []))[:-1]
         return [(t, c) for t, c in rows if c > 0][-limit:]
 
+    def perp_klines(self, base: str, interval_min: int, end_ms: int, limit: int = 1000) -> list[tuple[int, float]]:
+        """Свечи перпетуала BASEUSDT, кончающиеся не позже end_ms: [(начало, close)] от старых к новых (до limit;
+        последняя может быть незакрытой — отбрасывает вызывающий). Для истории — листать назад по end_ms."""
+        res = self._call(self.http.get_kline, category="linear", symbol=f"{base.upper()}USDT",
+                         interval=str(interval_min), end=int(end_ms), limit=min(limit, 1000))
+        return sorted((int(k[0]), float(k[4])) for k in res.get("list", []))
+
     def chain(self, base: str, expiry_code: str, strikes_around_atm: int = 6) -> dict:
         """Цепочка опционов: строки по страйкам вокруг ATM, с котировками и греками."""
         rows = self.tickers(base, expiry_code)

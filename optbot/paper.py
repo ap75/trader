@@ -70,23 +70,46 @@ REASONS = {"take": "цель по прибыли", "stop": "стоп", "time": "
 
 
 COST_SUFFIX = ":cost"  # книга с фильтром издержек SIG_MAX_COST_PCT (рядом — та же без фильтра)
+HAR_TAG = ":har"       # короткий горизонт с решением по IV7/HAR7 (рядом — та же по IV7/RV7); id …:har[:cost]
 
 
-def book_id(horizon: str, strategy: str, base: str, cost: bool = False) -> str:
-    return f"{horizon}:{strategy}:{base}" + (COST_SUFFIX if cost else "")
+def book_id(horizon: str, strategy: str, base: str, cost: bool = False, har: bool = False) -> str:
+    return f"{horizon}:{strategy}:{base}" + (HAR_TAG if har else "") + (COST_SUFFIX if cost else "")
 
 
 def is_cost_book(book: str) -> bool:
     return book.endswith(COST_SUFFIX)
 
 
-def all_books(cfg: Settings) -> list[tuple[str, str, str, str, bool]]:
-    """[(id, горизонт, стратегия, актив, с фильтром издержек)] — активы PAPER_BASES, которые есть в BASE_COINS.
-    Фильтр выключен (SIG_MAX_COST_PCT=0) — книг «:cost» нет."""
+def is_har_book(book: str) -> bool:
+    return book.split(":")[3:4] == ["har"]
+
+
+def version_name(book: str) -> str:
+    """Версия книги: прогноз RV и фильтр издержек."""
+    return ("HAR" if is_har_book(book) else "RV") + (", с фильтром издержек" if is_cost_book(book) else "")
+
+
+def in_system(book: str, har: bool, cost: bool) -> bool:
+    """Книга входит в систему (короткий RV или короткий HAR + общий длинный горизонт, с фильтром издержек или без)."""
+    return is_cost_book(book) == cost and (book.startswith("long:") or is_har_book(book) == har)
+
+
+def system_risk(open_rows: list, book: str) -> float:
+    """Занятый риск для лимита PAPER_MAX_TOTAL_RISK_USDT при входе в book. Системы RV и HAR параллельны и делят
+    длинный горизонт: короткая книга — риск своей системы; длинная — худшая из двух (входит в обе)."""
+    cost = is_cost_book(book)
+    hars = (False, True) if book.startswith("long:") else (is_har_book(book),)
+    return max(sum(r["max_loss"] for r in open_rows if in_system(r["book"], h, cost)) for h in hars)
+
+
+def all_books(cfg: Settings) -> list[tuple[str, str, str, str, bool, bool]]:
+    """[(id, горизонт, стратегия, актив, HAR, с фильтром издержек)] — активы PAPER_BASES, которые есть в BASE_COINS.
+    Фильтр выключен (SIG_MAX_COST_PCT=0) — книг «:cost» нет; «:har» — только короткий горизонт."""
     bases = [b for b in cfg.paper.bases if b in cfg.base_coins]
     variants = (False, True) if cfg.sig.max_cost_pct else (False,)
-    return [(book_id(h, s, b, v), h, s, b, v) for b in bases for h, ss in BOOK_STRATEGIES.items() for s in ss
-            for v in variants]
+    return [(book_id(h, s, b, v, hr), h, s, b, hr, v) for b in bases for h, ss in BOOK_STRATEGIES.items() for s in ss
+            for hr in ((False, True) if h == "short" else (False,)) for v in variants]
 
 
 # ---------- издержки ----------
@@ -204,7 +227,7 @@ class PaperEngine:
     def _ensure_books(self, conn, now_ms: int) -> None:
         with conn:
             conn.executemany("INSERT OR IGNORE INTO books (id, horizon, strategy, base, created_ms, cost_filter) "
-                             "VALUES (?,?,?,?,?,?)", [(i, h, s, b, now_ms, int(v)) for i, h, s, b, v in all_books(self.cfg)])
+                             "VALUES (?,?,?,?,?,?)", [(i, h, s, b, now_ms, int(v)) for i, h, s, b, _, v in all_books(self.cfg)])
 
     def _signals(self, now_ms: int, res: StepResult, outcomes: list[tuple]) -> dict[str, dict[str, Signal]]:
         """Сигналы по активам: короткий и длинный горизонты и календарь — по одному запросу к бирже на актив.
@@ -217,7 +240,7 @@ class PaperEngine:
             except Exception as e:
                 log.warning("Бумажные книги: данные %s — %s", base, e)
                 res.errors.append(f"данные {base}: {e}")
-                for key in ("short", "long", "calendar"):
+                for key in ("short", "short_har", "long", "calendar"):
                     outcomes.append((now_ms, base, key, "error", None, None, None, f"данные: {e}"[:300]))
                 continue
             by_book, got = {}, {}
@@ -226,6 +249,9 @@ class PaperEngine:
             ex_l = self.pc.exit_days_long + pad if self.pc.exit_days_long else 0
             ex_c = self.pc.calendar_exit_h / 24 + pad
             for key, fn in (("short", lambda: self.engine.compute(base, horizon="short", market=mk, min_dte=ex_s)),
+                            ("short_har", lambda: self.engine.compute(
+                                base, horizon="short", market=mk, min_dte=ex_s, vol="har",
+                                metrics=got["short"].metrics if "short" in got else None)),
                             ("long", lambda: self.engine.compute(base, horizon="long", market=mk, min_dte=ex_l)),
                             ("calendar", lambda: self.engine.calendar_signal(
                                 base, market=mk, metrics=got["long"].metrics if "long" in got else None,
@@ -244,7 +270,7 @@ class PaperEngine:
                                       None if outcome == "signal" else (sig.no_signal or "")[:300]))
                 if sig.strategy and sig.legs:  # обе версии книги: без фильтра и с фильтром издержек
                     for x in books:
-                        if x[1:4] == (sig.horizon, sig.strategy, base):
+                        if x[1:4] == (sig.horizon, sig.strategy, base) and x[4] == (key == "short_har"):
                             by_book[x[0]] = sig
             out[base] = by_book
         return out
@@ -365,7 +391,8 @@ class PaperEngine:
                        rv30=m.rv30, pctl=m.pctl, pctl_used=m.enough_history and m.pctl is not None,
                        history_days=m.history_days, history_stale=m.history_stale, regime=sig.regime,
                        trend=m.trend.direction, ema_gap_pct=m.trend.gap_pct, exp_iv=sig.exp_iv, dte=sig.dte,
-                       reasons=sig.reasons, **(m.ctx.as_dict() if m.ctx else {}))
+                       reasons=sig.reasons, rv1=m.rv1, har7=m.har7, har_src=m.har_src, vol_model=m.vol_model,
+                       **(m.ctx.as_dict() if m.ctx else {}))
         events = [dict(ts=e.ts_ms, name=e.name) for e in sig.events]
         over, tid = None, None
         with conn:
@@ -377,9 +404,10 @@ class PaperEngine:
             if conn.execute("SELECT COUNT(*) FROM paper_trades WHERE book = ? AND status = 'open'",
                             (bid,)).fetchone()[0] >= pc.max_open_per_book:
                 return  # параллельный шаг успел открыть — лимит книги
-            # лимит — на каждую версию книг отдельно (с фильтром и без — два параллельных эксперимента)
-            used = conn.execute("SELECT COALESCE(SUM(max_loss), 0) FROM paper_trades WHERE status = 'open' AND "
-                                "(book LIKE ?) = ?", ("%" + COST_SUFFIX, int(is_cost_book(bid)))).fetchone()[0]
+            # лимит — на каждую систему отдельно: с фильтром и без; короткий RV и короткий HAR — каждый вместе
+            # с длинным горизонтом (иначе HAR получал бы весь лимит, а RV делил его с длинными — нечестно)
+            used = system_risk(conn.execute(
+                "SELECT book, max_loss FROM paper_trades WHERE status = 'open'").fetchall(), bid)
             if pc.max_total_risk_usdt > 0 and used + risk > pc.max_total_risk_usdt + 1e-9:
                 over = (f"риск открытых {used:.2f} + {risk:.2f} > PAPER_MAX_TOTAL_RISK_USDT="
                         f"{pc.max_total_risk_usdt:g}")
@@ -618,18 +646,20 @@ class PaperEngine:
         conn = self._db()
         try:
             rows = conn.execute("SELECT * FROM paper_trades WHERE status = 'open' ORDER BY book, id").fetchall()
-            total = sum(r["max_loss"] for r in rows)
         finally:
             conn.close()
         if not rows:
             return "Открытых бумажных сделок нет"
         lim = f" из {self.pc.max_total_risk_usdt:g}" if self.pc.max_total_risk_usdt else ""
         parts = []
-        for name, flt in (("без фильтра", False), ("с фильтром издержек", True)):
-            part = [r for r in rows if is_cost_book(r["book"]) == flt]
-            if part:  # лимит суммарного риска — на каждую версию книг отдельно
+        for name, har, cost in (("RV", False, False), ("RV, с фильтром издержек", False, True),
+                                ("HAR", True, False), ("HAR, с фильтром издержек", True, True)):
+            part = [r for r in rows if in_system(r["book"], har, cost)]
+            # лимит суммарного риска — на систему; длинный горизонт входит и в RV, и в HAR
+            if part and (har is False or any(is_har_book(r["book"]) for r in part)):
                 parts.append(f"{name} {len(part)}, риск {sum(r['max_loss'] for r in part):.2f}{lim}")
-        lines = [f"Открытые бумажные сделки: {len(rows)} — " + "; ".join(parts) + " USDT"]
+        lines = [f"Открытые бумажные сделки: {len(rows)} — " + "; ".join(parts) + " USDT"
+                 + (" (длинный горизонт — в обеих системах)" if any(is_har_book(r["book"]) for r in rows) else "")]
         for r in rows:
             mark = "" if r["mark_pnl"] is None else f", по mark {r['mark_pnl']:+.2f}"
             tag = f" [{r['tags']}]" if r["tags"] else ""
@@ -653,6 +683,16 @@ class PaperEngine:
                                   "AND opened_ms < ? GROUP BY book", ("%" + COST_SUFFIX, start_ms, end_ms)):
                 out.setdefault(r["book"], [0, 0])[1] = r["n"]
             return {k: (v[0], v[1]) for k, v in out.items()}
+        finally:
+            conn.close()
+
+    def signal_freq(self, start_ms: int, end_ms: int) -> dict[tuple[str, str], tuple[int, int]]:
+        """Короткий горизонт по шагам книг: {(short | short_har, актив): (шагов с собранным сигналом, шагов)}."""
+        conn = self._db()
+        try:
+            return {(r["kind"], r["base"]): (r["n"], r["steps"]) for r in conn.execute(
+                "SELECT kind, base, SUM(outcome = 'signal') n, COUNT(*) steps FROM paper_signals WHERE ts >= ? "
+                "AND ts < ? AND kind IN ('short', 'short_har') GROUP BY kind, base", (start_ms, end_ms))}
         finally:
             conn.close()
 
@@ -771,9 +811,35 @@ def _metrics(r: dict) -> dict:
         return {}
 
 
-def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] | None = None) -> str:
+def fmt_versions(rows: list[dict], freq: dict[tuple[str, str], tuple[int, int]] | None) -> list[str]:
+    """Короткий горизонт: RV против HAR — итоги закрытых по версиям книг и частота сигналов по шагам."""
+    short = [r for r in rows if r.get("horizon") == "short" and r.get("status", "closed") != "void"]
+    if not short and not freq:
+        return []
+    lines = ["Короткий горизонт: решение по IV7/RV7 против IV7/HAR7 (те же пороги):"]
+    for name in ("RV", "HAR", "RV, с фильтром издержек", "HAR, с фильтром издержек"):
+        part = [r for r in short if version_name(r["book"]) == name]
+        if part:
+            s = summarize(part)
+            avg = "-" if s["avg_r"] is None else f"{s['avg_r']:+.2f}"
+            lines.append(f" {name}: {s['n']} сд., прибыльных {s['wins']}, PnL {s['pnl']:+.2f}, ΣR {s['sum_r']:+.2f}, "
+                         f"ср. R {avg}")
+    if freq:
+        lines.append(" Частота сигналов (шагов с собранным сигналом):")
+        for base in sorted({b for _, b in freq}):
+            cells = []
+            for kind, name in (("short", "RV"), ("short_har", "HAR")):
+                n, steps = freq.get((kind, base), (0, 0))
+                cells.append(f"{name} {n} из {steps}" + (f" ({100 * n / steps:.0f}%)" if steps else ""))
+            lines.append(f"  {base}: " + " · ".join(cells))
+    return lines
+
+
+def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] | None = None,
+              freq: dict[tuple[str, str], tuple[int, int]] | None = None) -> str:
     if not rows:
-        return "\n".join([f"Бумажные книги, {label}: закрытых сделок нет", *fmt_rejects(rejects or {})])
+        return "\n".join([f"Бумажные книги, {label}: закрытых сделок нет", *fmt_versions([], freq),
+                          *fmt_rejects(rejects or {})])
     rows = [{"status": "closed", **r} for r in rows]
     void = [r for r in rows if r["status"] == "void"]
     rows = [r for r in rows if r["status"] != "void"]
@@ -789,12 +855,12 @@ def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] 
 
     for tag, part in (("без event", [r for r in rows if not r["tags"]]),
                       ("с event", [r for r in rows if r["tags"]]),
-                      ("книги без фильтра издержек", [r for r in rows if not is_cost_book(r["book"])]),
-                      ("книги с фильтром издержек", [r for r in rows if is_cost_book(r["book"])])):
+                      *((f"книги {v}", [r for r in rows if version_name(r["book"]) == v])
+                        for v in ("RV", "RV, с фильтром издержек", "HAR", "HAR, с фильтром издержек"))):
         if part:
             lines.append(line(tag, part))
-    # фон — только книги без фильтра: «:cost» — те же входы, иначе одна сделка считалась бы дважды
-    plain = [r for r in rows if not is_cost_book(r["book"])]
+    # фон — только книги RV без фильтра: «:cost» и «:har» — часто те же входы, иначе сделка считалась бы дважды
+    plain = [r for r in rows if version_name(r["book"]) == "RV"]
     ctx = {r["id"]: _metrics(r) for r in plain}
     for title, order, key in (
             ("По индексу страха и жадности (на входе, книги без фильтра):", FNG_ORDER,
@@ -815,12 +881,12 @@ def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] 
                      f" {book}: только с event")
         if any(r["tags"] for r in part):
             lines.append(line(f"{book} [event]", [r for r in part if r["tags"]]))
-    return "\n".join(lines + fmt_rejects(rejects or {}))
+    return "\n".join(lines + fmt_versions(rows, freq) + fmt_rejects(rejects or {}))
 
 
 SKIP_CODES = {"traded": "экспирация уже торговалась", "cost": "издержки", "max_open": "лимит открытых", "total_risk": "лимит суммарного риска",
               "qty": "размер", "data": "нет данных", "exit_window": "мало до экспирации"}
-KINDS = {"short": "короткий", "long": "длинный", "calendar": "календарь"}
+KINDS = {"short": "короткий", "short_har": "короткий (HAR)", "long": "длинный", "calendar": "календарь"}
 OUTCOMES = {"signal": "сигнал", "not_built": "не собрался", "none": "нет стратегии", "error": "ошибка"}
 
 
@@ -879,7 +945,7 @@ def fmt_skips(sigs: list[dict], skips: list[dict], label: str) -> str:
 
 CSV_FIELDS = ("id", "book", "cost_pct", "horizon", "strategy", "base", "opened_ms", "closed_ms", "expiry", "far_expiry", "qty",
               "qty_cap", "entry_net", "entry_fees", "exit_net", "exit_fees", "max_profit", "max_loss", "im_regular",
-              "pnl", "r_mult", "close_reason", "delivery_price", "tags", "fng", "funding", "oi_chg_24h")
+              "pnl", "r_mult", "close_reason", "delivery_price", "tags", "fng", "funding", "oi_chg_24h", "rv7", "har7")
 
 
 def to_csv(rows: list[dict]) -> str:
@@ -924,7 +990,10 @@ def main(argv: list[str] | None = None) -> int:
     if a.stats:
         start, end, label = parse_period([a.stats])
         rows = eng.closed(start, end)
-        print(fmt_stats(rows, label, eng.cost_rejects(start, end)))
+        print(fmt_stats(rows, label, eng.cost_rejects(start, end), eng.signal_freq(start, end)))
+        from .sigjournal import SignalJournal, fmt_har
+        sj = SignalJournal(settings)
+        print("\n" + fmt_har(sj.har_outcomes(sj.rows(start, end))))
         if a.csv:
             with open(a.csv, "w", encoding="utf-8", newline="") as f:
                 f.write(to_csv(rows))

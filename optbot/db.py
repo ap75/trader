@@ -411,6 +411,29 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # 10: прогноз RV7 по HAR (vol.py): история часовых свечей перпетуала и ежемесячные оценки коэффициентов
+    [
+        """
+        CREATE TABLE perp_h1 (
+            base  TEXT    NOT NULL,
+            ts    INTEGER NOT NULL,            -- начало часовой свечи BASEUSDT (linear), мс
+            close REAL    NOT NULL,
+            PRIMARY KEY (base, ts)
+        ) WITHOUT ROWID
+        """,
+        """
+        CREATE TABLE har_models (
+            base        TEXT    NOT NULL,
+            horizon     INTEGER NOT NULL,      -- дней (7)
+            fitted_ms   INTEGER NOT NULL,      -- когда оценена (действует с этого момента)
+            b0 REAL NOT NULL, b1 REAL NOT NULL, b2 REAL NOT NULL, b3 REAL NOT NULL,
+            s2          REAL    NOT NULL,      -- дисперсия остатков обучения
+            n           INTEGER NOT NULL,      -- моментов обучения
+            data_end_ms INTEGER,               -- последняя свеча обучения
+            PRIMARY KEY (base, horizon, fitted_ms)
+        )
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе

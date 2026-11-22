@@ -140,7 +140,8 @@ def test_entry_sizes_by_risk_budget_and_tracks_legs(make_client, pcfg, fake):
     conn = db.connect(pcfg.db_file)
     tracked = {r["symbol"]: r["reason"] for r in conn.execute("SELECT * FROM tracked_symbols")}
     assert set(tracked) == {l.symbol for l in sig.legs} and set(tracked.values()) == {f"book:{t['id']}"}
-    assert conn.execute("SELECT COUNT(*) FROM books").fetchone()[0] == 2 * 3 * (6 + 7)   # с фильтром и без
+    # с фильтром и без × (короткий: RV и HAR — 6 стратегий × 2; длинный: 7)
+    assert conn.execute("SELECT COUNT(*) FROM books").fetchone()[0] == 2 * 3 * (6 * 2 + 7)
     conn.close()
 
 
@@ -740,7 +741,7 @@ def test_stats_split_by_cost_variant():
     rows = [dict(id=1, book="short:bull_put:BTC", tags=None, pnl=1.0, r_mult=0.1, status="closed"),
             dict(id=2, book="short:bull_put:BTC:cost", tags=None, pnl=2.0, r_mult=0.2, status="closed")]
     text = paper.fmt_stats(rows, "x")
-    assert "книги без фильтра издержек: 1" in text and "книги с фильтром издержек: 1" in text
+    assert "книги RV: 1" in text and "книги RV, с фильтром издержек: 1" in text
 
 
 # ---------- комиссия поставки: сверка с биржей ----------
@@ -811,7 +812,7 @@ def test_status_risk_per_variant(make_client, pcfg, fake):
     s2.cost_pct = 1.0
     pe.step(NOW, {"BTC": {"short:bull_put:BTC": s1, "short:iron_condor:BTC:cost": s2}})
     st = pe.status()
-    assert "без фильтра 1" in st and "с фильтром издержек 1" in st
+    assert "RV 1, риск" in st and "RV, с фильтром издержек 1" in st
 
 
 def test_delivery_check_grouped_and_skipped_when_paper_off(cfg):

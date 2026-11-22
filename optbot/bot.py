@@ -83,6 +83,7 @@ from . import db
 from .collector import Collector, seconds_to_next_slot
 from . import backup as backup_mod
 from . import paper as paper_mod
+from . import vol as vol_mod
 from .paper import PaperEngine
 from .linkid import parse_link_id
 from .journal import Journal, fmt_report, parse_period
@@ -653,7 +654,9 @@ class OptionsBot:
                 raise ValueError("Формат: /signals_stats [BASE] [ПЕРИОД] [csv], например /signals_stats BTC 30d")
         start, end, label = parse_period(period or ["30d"])
         rows = await asyncio.to_thread(self.sigjournal.rows, start, end, base)
-        await self.reply(update, f"{env_banner(self.cfg.env)}\n\n{fmt_stats(compute_stats(rows, label, base))}")
+        har = await asyncio.to_thread(self.sigjournal.har_outcomes, rows)
+        books = await asyncio.to_thread(self.sigjournal.books_summary, start, end, base)
+        await self.reply(update, f"{env_banner(self.cfg.env)}\n\n{fmt_stats(compute_stats(rows, label, base), har, books)}")
         if want_csv:
             # имена запросивших — только трейдеру в личке: в группе файл увидят и зрители
             data = await asyncio.to_thread(self.sigjournal.csv_bytes, start, end, base,
@@ -1610,6 +1613,18 @@ class OptionsBot:
             log.exception("Резервная копия БД не сделана")
             await self.admin_alert("backup", f"Резервная копия БД не сделана: {e}")
 
+    async def _vol_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
+        """HAR7: докачать часовые свечи; в новом месяце — переоценить; расхождение с эталоном — администратору."""
+        try:
+            res = await asyncio.to_thread(self.signals.vol.refit, self.c)
+        except Exception:
+            log.exception("HAR: переоценка не выполнена")
+            return
+        if res.fitted or res.errors:
+            (log.warning if res.errors else log.info)("%s", res)
+        if res.drift:
+            await self.admin_alert("har_drift", vol_mod.fmt_drift(res))
+
     async def _ping_health(self, ok: bool) -> None:
         """Внешний мониторинг: пинг после среза (сбой среза — /fail). Пинги пропали — сервис сообщит сам."""
         url = self.cfg.healthcheck_url
@@ -1925,6 +1940,9 @@ class OptionsBot:
                     app.job_queue.run_daily(self._backup_job, time=dtime(h, m, tzinfo=timezone.utc), name="backup")
                     log.info("Резервная копия БД: ежедневно в %02d:%02d UTC в %s (хранить %d дн.)", h, m,
                              self.cfg.backup_dir_abs, self.cfg.backup_keep_days)
+                # HAR7: при старте (свечи и модель — сразу) и ежедневно; переоценка — раз в месяц
+                app.job_queue.run_once(self._vol_job, when=300, name="har_first")
+                app.job_queue.run_daily(self._vol_job, time=dtime(0, 50, tzinfo=timezone.utc), name="har")
             if self.cfg.journal_enabled:
                 # при старте (догрузить пропущенное, пока бот был выключен) и далее по расписанию
                 app.job_queue.run_repeating(self._sync_job, interval=self.cfg.journal_sync_min * 60, first=10,

@@ -167,6 +167,8 @@ class FakeHTTP:
             step = int(interval) * 60_000
             cur = int(time.time() * 1000) // step * step
             rows = kline_rows([65000 * (1.005 if i % 2 else 1) for i in range(1000)], int(interval), cur + 1)
+        if kw.get("end") is not None:   # листание истории назад (vol.update_candles)
+            rows = [r for r in rows if int(r[0]) <= int(kw["end"])]
         return ok({"symbol": symbol, "category": category, "list": rows[:limit]})
 
     def get_orderbook(self, category, symbol, limit=25):

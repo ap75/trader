@@ -5,6 +5,8 @@
   соседними экспирациями (короче суток не берутся — шумят);
 - RV7 / RV14 — реализованная волатильность по закрытиям часовых свечей перпетуала BASEUSDT (годовая, без
   вычитания среднего; только доходности соседних свечей — пропуск не превращается в «часовой» скачок);
+- HAR7 — прогноз RV на 7 дней (vol.py, research этап 6) по RV1/RV7/RV30; в карточке — IV7/RV7 и IV7/HAR7.
+  Решение сигнала — по IV7/RV7; бумажные книги «:har» — по IV7/HAR7 с теми же порогами (vol_model="har");
 - IV percentile — место текущей IV7 в истории сборщика за SIG_LOOKBACK_DAYS; истории меньше
   SIG_MIN_HISTORY_DAYS — «мало истории», решение только по IV/RV;
 - ожидаемое движение до экспирации S·IV·√t и цена ATM-стрэддла;
@@ -42,7 +44,7 @@ import threading
 from decimal import Decimal
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import db
 from .bybit_client import OptionsClient, group_by_strike, option_intrinsic, parse_option_symbol, spread_pct
@@ -50,6 +52,7 @@ from .collector import _f, expiry_metrics
 from .config import Settings, SignalSettings, settings
 from .context import MarketContext, fear_greed, fmt_context, perp_funding, perp_oi_change
 from .events import calendar as events_calendar
+from .vol import VolModels
 from .fmt import DAY_MS, env_banner, money, num, pct, px, short_symbol, utc
 
 log = logging.getLogger("optbot.signals")
@@ -460,6 +463,14 @@ class Metrics:
     iv30: float | None = None
     rv30: float | None = None
     ctx: MarketContext | None = None   # фондирование, OI, страх/жадность — справочно, на выбор не влияет
+    rv1: float | None = None
+    har7: float | None = None          # прогноз RV на 7 дней (HAR, vol.py)
+    har_src: str | None = None         # fit — оценка по истории | reference — эталон research
+    vol_model: str = "rv"              # rv — решение по IV7/RV7; har — по IV7/HAR7 (книги «:har», короткий горизонт)
+
+    @property
+    def har(self) -> bool:
+        return self.vol_model == "har" and self.horizon != "long"
 
     @property
     def iv(self) -> float | None:
@@ -467,11 +478,11 @@ class Metrics:
 
     @property
     def rv(self) -> float | None:
-        return self.rv30 if self.horizon == "long" else self.rv7
+        return self.rv30 if self.horizon == "long" else self.har7 if self.har else self.rv7
 
     @property
     def iv_name(self) -> str:
-        return ("IV30", "RV30") if self.horizon == "long" else ("IV7", "RV7")
+        return ("IV30", "RV30") if self.horizon == "long" else ("IV7", "HAR7") if self.har else ("IV7", "RV7")
 
     @property
     def rv_rising(self) -> float | None:
@@ -607,7 +618,7 @@ class Market:
     ctx: MarketContext | None = None   # рыночный фон (справочно)
 
 
-RV_HOURS = 30 * 24 + 1   # часовые свечи: RV7, RV14 и RV30 одним запросом (лимит kline — 1000)
+RV_HOURS = 30 * 24 + 2   # часовые свечи: RV7, RV14 и RV30 (720 доходностей) одним запросом (лимит kline — 1000)
 
 
 class SignalEngine:
@@ -617,6 +628,7 @@ class SignalEngine:
         self.history = IV7History(cfg.db_file, cfg.sig.target_days)
         self.history_long = IV7History(cfg.db_file, cfg.sig.long_target_days)  # IV30 (E1)
         self.events = events_calendar(cfg.events_file)
+        self.vol = VolModels(cfg)
         self._reloaded: dict[str, float] = {}  # актив -> когда справочник перечитан из-за нового символа
 
     def _fetch(self, base: str) -> tuple[list[dict], dict, list, list, MarketContext]:
@@ -671,11 +683,18 @@ class SignalEngine:
         iv = const_maturity_iv([(x["dte"], x["atm_iv"]) for x in mk.exp_m.values()], target)
         m.rv7 = realized_vol_window(mk.h1, 3_600_000, 7 * DAY_MS)
         m.rv14 = realized_vol_window(mk.h1, 3_600_000, 14 * DAY_MS)
+        m.rv30 = realized_vol_window(mk.h1, 3_600_000, 30 * DAY_MS)
+        m.rv1 = realized_vol_window(mk.h1, 3_600_000, DAY_MS)
         if long:
             m.iv30 = iv
-            m.rv30 = realized_vol_window(mk.h1, 3_600_000, 30 * DAY_MS)
         else:
             m.iv7 = iv
+            try:  # прогноз — справочно для карточки и для книг «:har»; сбой не ломает сигнал по RV7
+                model = self.vol.get(mk.base)
+                if model is not None:
+                    m.har7, m.har_src = model.forecast(m.rv1, m.rv7, m.rv30), model.source
+            except Exception:
+                log.exception("HAR7 %s не посчитан", mk.base)
         m.trend = trend_of([c for _, c in mk.h4], sc.ema_fast, sc.ema_slow, sc.trend_pct)
 
         hist = (self.history_long if long else self.history).get(mk.base, mk.now_ms - sc.lookback_days * DAY_MS)
@@ -707,8 +726,12 @@ class SignalEngine:
                 log.exception("Календарь событий не прочитан")
 
     def compute(self, base: str, now_ms: int | None = None, horizon: str = "short",
-                market: Market | None = None, min_dte: float = 0.0) -> Signal:
-        """min_dte — экспирации не ближе (бумажные книги: срок раннего выхода — иначе выход сразу после входа)."""
+                market: Market | None = None, min_dte: float = 0.0, vol: str = "rv",
+                metrics: Metrics | None = None) -> Signal:
+        """min_dte — экспирации не ближе (бумажные книги: срок раннего выхода — иначе выход сразу после входа).
+        vol="har" — короткий горизонт по IV7/HAR7 (книги «:har»); metrics — уже посчитанные по тому же market."""
+        if vol not in ("rv", "har"):
+            raise ValueError(f"vol {vol!r}: rv или har")
         if horizon not in HORIZONS:
             raise ValueError(f"горизонт {horizon!r}: short или long")
         sc = self.cfg.sig
@@ -717,7 +740,7 @@ class SignalEngine:
         dte_min, dte_max = (sc.long_dte_min, sc.long_dte_max) if long else (sc.dte_min, sc.dte_max)
         dte_min = max(dte_min, min_dte)
         target = sc.long_target_days if long else sc.target_days
-        m = self.metrics(mk, horizon)
+        m = replace(metrics if metrics is not None else self.metrics(mk, horizon), vol_model=vol)
         cls = classify_iv(m, sc)
         strategy, why = choose(m, sc, cls)
         sig = Signal(metrics=m, strategy=strategy, reasons=why, regime=cls[0], horizon=horizon)
@@ -919,7 +942,8 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
     if m.horizon == "long":
         lines.append(f" IV30 {pc(m.iv30)} · RV30 {pc(m.rv30)} · RV14 {pc(m.rv14)}")
     else:
-        lines.append(f" IV7 {pc(m.iv7)} · RV7 {pc(m.rv7)} · RV14 {pc(m.rv14)}")
+        lines.append(f" IV7 {pc(m.iv7)} · RV7 {pc(m.rv7)} · HAR7 {pc(m.har7)} · RV14 {pc(m.rv14)}")
+        lines.append(" " + ratios(m))
     if m.pctl is None:
         hist = "истории нет"
     else:
@@ -937,6 +961,30 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
     lines.append("\nЦены — по исполнимой стороне (покупка ask, продажа bid), без комиссий. "
                  "Не торговый совет: решение за трейдером.")
     return "\n".join(lines)
+
+
+def ratios(m: Metrics) -> str:
+    """«IV7/RV7 … · IV7/HAR7 …» — оба отношения (решение карточки — по первому; книги «:har» — по второму)."""
+    def r(a, b):
+        return f"{a / b:.2f}" if a and b else "-"
+    src = " (HAR — эталон research)" if m.har_src == "reference" else ""
+    return f"IV7/RV7 {r(m.iv7, m.rv7)} · IV7/HAR7 {r(m.iv7, m.har7)}{src}"
+
+
+def har_decision(m: Metrics, sc: SignalSettings) -> str | None:
+    """Стратегия, которую выбрала бы версия «:har» (IV7/HAR7, те же пороги) при тех же метриках; HAR7 нет — None."""
+    if m.horizon == "long" or not m.har7:
+        return None
+    return choose(replace(m, vol_model="har"), sc)[0]
+
+
+def metrics_from_json(base: str, ts_ms: int, d: dict) -> Metrics:
+    """Метрики короткого горизонта из JSON журнала сигналов (для расчёта «:har» задним числом)."""
+    t = Trend(d.get("trend"), gap_pct=d.get("ema_gap_pct") or 0.0, slope_pct=0.0)
+    return Metrics(base=base, ts_ms=ts_ms, iv7=d.get("iv7"), rv7=d.get("rv7"), rv14=d.get("rv14"), pctl=d.get("pctl"),
+                   history_days=d.get("history_days") or 0.0, enough_history=bool(d.get("enough_history")),
+                   history_stale=bool(d.get("history_stale")), trend=t, rv1=d.get("rv1"), rv30=d.get("rv30"),
+                   har7=d.get("har7"), har_src=d.get("har_src"))
 
 
 def signal_key(sig: Signal) -> str | None:

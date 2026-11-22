@@ -34,7 +34,7 @@ from .context import FNG_ORDER, FUNDING_ORDER, fng_bucket, funding_bucket
 from .config import SIG_LONG_FIELDS, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
 from .journal import Journal, load_delivery_prices, nearest_price, parse_period, price_window
-from .signals import STRATEGIES, Leg, Signal, payoff
+from .signals import STRATEGIES, Leg, Signal, har_decision, metrics_from_json, payoff
 
 log = logging.getLogger("optbot.sigjournal")
 
@@ -172,7 +172,10 @@ class SignalJournal:
                 metrics = dict(iv7=m.iv7, rv7=m.rv7, rv14=m.rv14, pctl=m.pctl, history_days=m.history_days,
                                enough_history=m.enough_history, history_stale=m.history_stale,
                                trend=m.trend.direction, ema_gap_pct=m.trend.gap_pct, exp_iv=sig.exp_iv,
-                               dte=sig.dte, straddle=sig.straddle,
+                               dte=sig.dte, straddle=sig.straddle, rv1=m.rv1, rv30=m.rv30, har7=m.har7,
+                               har_src=m.har_src,
+                               # что выбрала бы версия «:har» (IV7/HAR7, те же пороги) — для сравнения в --stats
+                               har_strategy=har_decision(m, self.cfg.sig) if m.horizon != "long" else None,
                                **(m.ctx.as_dict() if m.ctx else {}))  # рыночный фон — для разбивки итогов
                 cur = conn.execute(
                     "INSERT INTO signals (ts, last_shown_ms, base, strategy, regime, trend, expiry, expiry_ms, legs_key, "
@@ -385,6 +388,72 @@ class SignalJournal:
         finally:
             conn.close()
 
+    def har_outcomes(self, rows: list[dict]) -> list[dict]:
+        """Сигналы с итогом: открыла бы их версия «:har»? Записанные до HAR7 — задним числом: RV1/RV7/RV30 по
+        часовым свечам perp_h1 до момента сигнала, модель — действовавшая тогда (нет — эталон), те же пороги.
+        -> [{id, base, pnl, strategy, har_strategy, har7, known, retro}]"""
+        from . import vol
+        out = []
+        conn = None
+        fits: dict[tuple[str, int], object] = {}   # (актив, месяц) -> модель по свечам до него (не из будущего)
+        ref = None
+        try:
+            for r in rows:
+                if r["settled_ms"] is None or r["pnl"] is None:
+                    continue
+                d = _ctx_of(r)
+                if d.get("iv7") is None:      # длинный горизонт (IV30) — версии «:har» нет
+                    continue
+                o = dict(id=r["id"], base=r["base"], pnl=r["pnl"], strategy=r["strategy"], har7=d.get("har7"),
+                         har_strategy=d.get("har_strategy"), known="har_strategy" in d and d.get("har7") is not None,
+                         retro=False)
+                if not o["known"]:
+                    try:
+                        if conn is None:
+                            conn = self._db()
+                        candles = vol.load_candles(conn, r["base"], r["ts"] - 31 * DAY_MS, r["ts"])
+                        rv1, rv7, rv30 = vol.rv_at(candles, r["ts"])
+                        model = vol.model_at(conn, r["base"], r["ts"])
+                        if model is None:  # оценки тогда не было — как бот: на всей истории до начала того месяца
+                            k = (r["base"], vol.month_start(r["ts"]))
+                            if k not in fits:
+                                fits[k] = vol.fit(r["base"], vol.load_candles(conn, r["base"], hi_ms=k[1]), k[1])
+                            model = fits[k]
+                        if model is None:  # истории для оценки нет — эталон (оценён и на будущем: помечается)
+                            ref = ref if ref is not None else vol.load_reference()
+                            model = ref.get(r["base"])
+                            o["insample"] = model is not None
+                        har7 = model.forecast(rv1, rv7, rv30) if model else None
+                        if har7:
+                            m = metrics_from_json(r["base"], r["ts"], {**d, "har7": har7})
+                            o.update(har7=har7, har_strategy=har_decision(m, self.cfg.sig), known=True, retro=True)
+                    except Exception as e:
+                        log.warning("Сигналы: HAR7 задним числом #%s — %s", r["id"], e)
+                out.append(o)
+        finally:
+            if conn is not None:
+                conn.close()
+        return out
+
+    def books_summary(self, start_ms: int, end_ms: int, base: str | None = None) -> dict[str, dict]:
+        """Бумажные книги короткого горизонта, закрытые за период (с комиссиями): {версия: summarize}."""
+        from .paper import summarize, version_name
+        conn = self._db()
+        try:
+            q = ("SELECT book, pnl, r_mult FROM paper_trades WHERE status = 'closed' AND horizon = 'short' "
+                 "AND closed_ms >= ? AND closed_ms < ?")
+            a: list = [start_ms, end_ms]
+            if base:
+                q += " AND base = ?"
+                a.append(base.upper())
+            rows = [dict(r) for r in conn.execute(q, a)]
+        finally:
+            conn.close()
+        out: dict[str, list] = {}
+        for r in rows:
+            out.setdefault(version_name(r["book"]), []).append(r)
+        return {k: summarize(v) for k, v in out.items()}
+
     def unannounced(self) -> list[dict]:
         """Итоги, о которых группы ещё не знают — кем бы ни посчитаны (бот или `--evaluate`)."""
         conn = self._db()
@@ -492,11 +561,50 @@ def _pct(a: int, b: int) -> str:
     return f"{a} из {b} ({a / b:.0%})" if b else "-"
 
 
-def fmt_stats(st: Stats) -> str:
+def fmt_har(outs: list[dict]) -> str:
+    """Сколько прибыльных (и убыточных) сигналов открыла бы версия «:har» — та же стратегия по IV7/HAR7."""
+    head = ("Версия :har (решение по IV7/HAR7, те же пороги; сравнивается выбор стратегии — сборку ног и "
+            "экономику стрэддла по HAR7 не проверяет) — по сигналам с итогом")
+    if not outs:
+        return head + ": сигналов с итогом нет"
+    lines = [head + ":"]
+    for name, part in (("прибыльных", [o for o in outs if o["pnl"] > 0]), ("убыточных", [o for o in outs if o["pnl"] <= 0])):
+        known = [o for o in part if o["known"]]
+        same = [o for o in known if o["har_strategy"] == o["strategy"]]
+        if part:
+            pnl = sum(o["pnl"] for o in same)
+            lines.append(f" {name} {len(part)}: открыла бы {len(same)} из {len(known)}"
+                         + (f" (их итог {pnl:+,.2f} USDT)" if same else "")
+                         + (f", HAR7 не посчитать {len(part) - len(known)}" if len(known) < len(part) else ""))
+    retro = sum(o["retro"] for o in outs)
+    if (ins := sum(o.get("insample", False) for o in outs)):
+        lines.append(f" из них по эталону research (истории для оценки не хватило; эталон знает будущее): {ins}")
+    if retro:
+        lines.append(f" задним числом (сигнал записан до HAR7): {retro} — по свечам perp_h1 и модели, оценённой на "
+                     "истории до месяца сигнала")
+    return "\n".join(lines)
+
+
+def fmt_books(books: dict[str, dict], label: str) -> str:
+    """Итоги бумажных книг короткого горизонта рядом с журналом сигналов (там без комиссий, здесь — с ними)."""
+    head = f"Бумажные книги, короткий горизонт, закрытые за {label} (с комиссиями)"
+    if not books:
+        return head + ": закрытых нет"
+    lines = [head + ":"]
+    for v in ("RV", "HAR", "RV, с фильтром издержек", "HAR, с фильтром издержек"):
+        if (s := books.get(v)):
+            avg = "-" if s["avg_r"] is None else f"{s['avg_r']:+.2f}"
+            lines.append(f" {v}: {s['n']} сд., прибыльных {s['wins']}, PnL {s['pnl']:+,.2f} USDT, ΣR {s['sum_r']:+.2f}, "
+                         f"ср. R {avg}")
+    return "\n".join(lines)
+
+
+def fmt_stats(st: Stats, har: list[dict] | None = None, books: dict[str, dict] | None = None) -> str:
     t = st.total
     head = f"Сигналы{' ' + st.base.upper() if st.base else ''} за {st.label}: {t.n}"
     if not t.n:
-        return head + "\nСигналов с ногами за период нет."
+        tail = ([fmt_har(har)] if har is not None else []) + ([fmt_books(books, st.label)] if books is not None else [])
+        return "\n\n".join([head + "\nСигналов с ногами за период нет.", *tail])
     extra = (f", экспирация прошла, итог ещё не посчитан {t.pending_price}" if t.pending_price else "") + \
         (f", без цены поставки {t.void}" if t.void else "")
     lines = [head + f" (итог есть у {t.settled}, ждут экспирации {t.n - t.settled - t.void - t.pending_price}"
@@ -525,6 +633,10 @@ def fmt_stats(st: Stats) -> str:
         table("По индексу страха и жадности (на момент сигнала)", st.by_fng, {}, FNG_ORDER)
     if set(st.by_funding) - {"нет данных"}:
         table("По фондированию перпетуала", st.by_funding, {}, FUNDING_ORDER)
+    if har is not None:
+        lines.append("\n" + fmt_har(har))
+    if books is not None:
+        lines.append("\n" + fmt_books(books, st.label))
     lines.append("\nR — доля макс. риска; итог на экспирации по ценам входа на исполнимой стороне, без комиссий. "
                  "Просадка — худший промежуточный итог при закрытии по bid/ask.")
     return "\n".join(lines)
@@ -560,7 +672,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{settings.env}] {settings.db_file}: {res}")
         return 1 if res.errors else 0
     start, end, label = parse_period([a.stats])
-    print(fmt_stats(compute_stats(sj.rows(start, end, a.base), label, a.base)))
+    rows = sj.rows(start, end, a.base)
+    print(fmt_stats(compute_stats(rows, label, a.base), sj.har_outcomes(rows), sj.books_summary(start, end, a.base)))
     if a.csv:
         with open(a.csv, "wb") as f:
             f.write(sj.csv_bytes(start, end, a.base))
