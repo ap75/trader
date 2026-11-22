@@ -47,7 +47,8 @@
 .venv/bin/python -m optbot.perpbook --status | --stats 30d | --step   # бумажная книга перпетуалов EMA 4h (на сервере)
 .venv/bin/python -m optbot.basisbook --status | --stats 30d | --step | --rf   # книга базиса BTC/ETH (+SOL наблюдение) | ставка FRED (на сервере)
 .venv/bin/python -m optbot.reports --books 30d [--horizon short] [--base BTC] [--csv f] | --stress   # отчёты E3 (на сервере)
-.venv/bin/python -m optbot.vol --show | --fit [--base BTC]   # прогноз HAR7: модели | докачать свечи и переоценить (на сервере)
+.venv/bin/python -m optbot.vol --show | --fit [--base BTC]   # прогноз HAR7/HAR30: модели | докачать свечи и переоценить (на сервере)
+.venv/bin/python -m optbot.dvol --update | --show   # DVOL Deribit для перцентиля IV30 BTC/ETH: докачать | что есть (на сервере)
 deploy/offsite/pull_backups.py --help            # компьютер: выгрузка копий с сервера, ротация 7/4/6 (таймер — deploy/README.md)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
@@ -77,7 +78,8 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 путь сделки — по `leg_marks`, итог — по `delivery_prices`. Кнопка «Выставить» — `multileg.py` (ноги IOC, сначала покупки),
 итог исполнения — таблица `signal_executions`, ордера — `order_links` с `source=signal`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
 Бумажные книги E1 (`paper.py`, шаг после каждого среза): `books`, `paper_trades`, `book_equity`, `paper_skips`
-(отказы книг: первый `ts`, последний `last_ts`), `paper_signals` (итог расчёта сигнала на каждом шаге, `--skips`);
+(отказы книг: первый `ts`, последний `last_ts`), `paper_signals` (итог расчёта сигнала на каждом шаге, `--skips`; у `not_built` в `reason` — отказ по каждой
+экспирации окна, с кредитом/дебетом и шириной спреда);
 каждая книга — в двух версиях: без фильтра издержек и `…:cost` (`SIG_MAX_COST_PCT`);
 ноги — на слежение (`tracked_symbols`, reason `book:<id>`); длинный горизонт и календарь — `signals.py`
 (`horizon="long"`, `calendar_signal`); тег event — `events.csv` (`events.py`, дописывать вперёд).
@@ -89,6 +91,13 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 в сутки), оценки коэффициентов — `har_models` (раз в месяц), эталон — `config/har_reference.json` (копия из research:
 папки `research/` на сервере нет). Книги короткого горизонта «`…:har`» (и «`…:har:cost`») — решение по IV7/HAR7;
 итог шага — `paper_signals.kind = short_har`; журнал сигналов пишет `har7` и `har_strategy` в `metrics`.
+HAR30 (тот же `vol.py`, `har_models.horizon = 30`) — книги длинного горизонта BTC/ETH «`long:…:har30`» (и
+«`…:har30:cost`», без календаря; решение по IV30/HAR30; `paper_signals.kind = long_har30`); своя система HAR30
+(`paper.in_system(book, "har30", cost)`), системы RV и HAR не меняются. Перцентиль IV30 BTC/ETH, пока своей истории
+меньше года, — по DVOL Deribit (`dvol.py`, таблица `dvol_h1`, докачка раз в сутки, `DVOL_URL`; в тестах пуст):
+IV30 / k против DVOL за `SIG_LOOKBACK_DAYS`, k — медиана IV30/DVOL (иначе `dvol.REF_RATIO`); `metrics.pctl_src = dvol`.
+В решения — только при `DVOL_PCTL_ENABLED=1` (по умолчанию 0: справочно, `metrics.dvol_pctl`); включённый флаг
+входит в версию порогов журнала сигналов (`cfg_version`), выключенный — нет.
 Книга перпетуалов EMA 4h (`perpbook.py`, research этап 3; параметры — `config/perp_ema.json`): `perp_books`,
 `perp_trades`, `perp_equity`; шаг — в задаче бумажных книг после опционных; только бумага, ордеров нет.
 Книга базиса (`basisbook.py`, спот лонг + перп шорт; параметры и ставка — `config/basis.json`): `basis_books`,

@@ -1,21 +1,22 @@
-"""Прогноз реализованной волатильности на 7 дней — HAR (research/reports/stage6; копия эталона — config/).
+"""Прогноз реализованной волатильности на 7 и 30 дней — HAR (research/reports/stage6; копия эталона — config/).
 
-Модель (как в research): log V7(D) = b0 + b1·log RV1 + b2·log RV7 + b3·log RV30, V и RV — дисперсии в годовых
+HAR7 — короткий горизонт (книги «:har»), HAR30 — длинный (книги «:har30», BTC/ETH; research этап 7).
+Модель (как в research): log V_h(D) = b0 + b1·log RV1 + b2·log RV7 + b3·log RV30, V и RV — дисперсии в годовых
 (часовые лог-доходности перпетуала BASEUSDT, без вычитания среднего, ×8760); прогноз дисперсии — exp(ŷ + s²/2)
-(s² — дисперсия остатков обучения), HAR7 = √.
+(s² — дисперсия остатков обучения), HAR_h = √.
 
 Переоценка (как в research, `last_fit`): МНК по каждой монете на всех моментах D = 00:00 UTC с известной целью
-(D + 7 дн ≤ сейчас), расширяющееся окно, не меньше MIN_TRAIN моментов. Дисперсия дня — среднее r² часовых
+(D + h дн ≤ сейчас), расширяющееся окно, не меньше MIN_TRAIN моментов. Дисперсия дня — среднее r² часовых
 доходностей свечей 00:00…23:00 UTC × 8760, только между соседними свечами; день без 24 доходностей — пропуск;
 окно RV_h и цель — только при всех днях окна. История часовых свечей — таблица perp_h1 (докачивается с Bybit).
-Раз в месяц (бот: при первом проходе в новом месяце) — новая строка har_models; коэффициенты отличаются от эталона
+Раз в месяц (бот: при первом проходе в новом месяце) — новая строка har_models на каждый горизонт; коэффициенты отличаются от эталона
 config/har_reference.json больше чем на DRIFT_PCT% — предупреждение администратору. Модели ещё нет — эталон.
 
 В сигнале (signals.py) признаки — RV1, RV7, RV30 по последним часовым свечам, как бот считает RV сейчас
 (скользящие окна до последней закрытой свечи).
 
     python -m optbot.vol --fit [--base BTC]    # докачать свечи и переоценить сейчас
-    python -m optbot.vol --show                # модели в работе, расхождение с эталоном, текущий HAR7
+    python -m optbot.vol --show                # модели в работе, расхождение с эталоном, текущие HAR7 и HAR30
 """
 from __future__ import annotations
 
@@ -38,6 +39,8 @@ from .fmt import DAY_MS, HOUR_MS
 log = logging.getLogger("optbot.vol")
 
 HORIZON = 7                  # дней — короткий горизонт сигналов
+LONG_HORIZON = 30            # дней — длинный горизонт (HAR30, книги «:har30»)
+HORIZONS = (HORIZON, LONG_HORIZON)
 LAGS = (1, 7, 30)
 MIN_TRAIN = 365              # моментов обучения (research: MIN_TRAIN)
 DRIFT_PCT = 10               # расхождение коэффициента с эталоном больше — предупреждение
@@ -243,49 +246,52 @@ def month_start(ms: int) -> int:
 @dataclass
 class RefitResult:
     fitted: list[HarModel] = field(default_factory=list)
-    drift: list[tuple[str, float]] = field(default_factory=list)      # (актив, %) — больше DRIFT_PCT
+    drift: list[tuple[str, float]] = field(default_factory=list)      # («BTC HAR30», %) — больше DRIFT_PCT
     errors: list[str] = field(default_factory=list)
     candles: int = 0
 
     def __str__(self) -> str:
         parts = [f"свечей +{self.candles}"]
-        parts += [f"{m.base}: b={'/'.join(f'{x:+.3f}' for x in m.b)} s²={m.s2:.3f} n={m.n}" for m in self.fitted]
+        parts += [f"{m.base} HAR{m.horizon}: b={'/'.join(f'{x:+.3f}' for x in m.b)} s²={m.s2:.3f} n={m.n}"
+                  for m in self.fitted]
         parts += [f"{b}: расхождение с эталоном {d:.0f}%" for b, d in self.drift]
         parts += [f"ошибка: {e}" for e in self.errors]
         return "HAR: " + "; ".join(parts)
 
 
 class VolModels:
-    """Модели HAR7 по активам для сигналов: последняя оценка из БД, иначе эталон; кэш на CACHE_S."""
+    """Модели HAR по активам и горизонтам (7, 30 дн.) для сигналов: последняя оценка из БД, иначе эталон;
+    кэш на CACHE_S."""
     CACHE_S = 600
 
     def __init__(self, cfg: Settings = settings):
         self.cfg = cfg
-        self.ref = load_reference()
-        self._cache: dict[str, tuple[float, HarModel | None]] = {}
+        self.refs = {h: load_reference(horizon=h) for h in HORIZONS}
+        self.ref = self.refs[HORIZON]
+        self._cache: dict[tuple[str, int], tuple[float, HarModel | None]] = {}
         self._refit_lock = threading.Lock()   # задача при старте и ежедневная не качают и не оценивают дважды
 
-    def get(self, base: str) -> HarModel | None:
+    def get(self, base: str, horizon: int = HORIZON) -> HarModel | None:
         base = base.upper()
-        hit = self._cache.get(base)
+        hit = self._cache.get((base, horizon))
         if hit and time.monotonic() - hit[0] < self.CACHE_S:
             return hit[1]
         m = None
         try:
             conn = db.connect(self.cfg.db_file)
             try:
-                m = model_at(conn, base)
+                m = model_at(conn, base, horizon=horizon)
             finally:
                 conn.close()
         except (sqlite3.Error, OSError) as e:
-            log.warning("HAR: модель %s не прочитана из БД — %s (эталон)", base, e)
-        m = m or self.ref.get(base)
-        self._cache[base] = (time.monotonic(), m)
+            log.warning("HAR%d: модель %s не прочитана из БД — %s (эталон)", horizon, base, e)
+        m = m or self.refs.get(horizon, {}).get(base)
+        self._cache[(base, horizon)] = (time.monotonic(), m)
         return m
 
     def refit(self, client, bases: list[str] | None = None, now_ms: int | None = None,
               force: bool = False) -> RefitResult:
-        """Докачать свечи и, если в этом месяце оценки ещё не было (или force), переоценить."""
+        """Докачать свечи и, если в этом месяце оценки ещё не было (или force), переоценить (оба горизонта)."""
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         res = RefitResult()
         if not self._refit_lock.acquire(blocking=False):
@@ -301,54 +307,59 @@ class VolModels:
         try:
             for base in bases or self.cfg.base_coins:
                 base = base.upper()
-                try:
-                    try:  # сбой докачки (10016 у биржи) — оценка по уже сохранённой истории; докачка — в следующий раз
-                        res.candles += update_candles(conn, client, base, now_ms)
-                    except Exception as e:
-                        log.warning("HAR: %s — свечи не докачаны: %s", base, e)
-                        res.errors.append(f"{base}: свечи не докачаны — {e}")
-                    cur = model_at(conn, base)
-                    if not force and cur is not None and cur.fitted_ms >= month_start(now_ms):
-                        continue
-                    m = fit(base, load_candles(conn, base), now_ms)
-                    if m is None:
-                        res.errors.append(f"{base}: мало истории (< {MIN_TRAIN} дней) — остаётся эталон")
-                        continue
-                    save_model(conn, m)
-                    res.fitted.append(m)
-                    if (ref := self.ref.get(base)) is not None and (d := drift_pct(m, ref)) > DRIFT_PCT:
-                        res.drift.append((base, d))
-                    self._cache.pop(base, None)
+                try:  # сбой докачки (10016 у биржи) — оценка по уже сохранённой истории; докачка — в следующий раз
+                    res.candles += update_candles(conn, client, base, now_ms)
                 except Exception as e:
-                    log.exception("HAR: %s не переоценён", base)
-                    res.errors.append(f"{base}: {e}")
+                    log.warning("HAR: %s — свечи не докачаны: %s", base, e)
+                    res.errors.append(f"{base}: свечи не докачаны — {e}")
+                candles = None
+                for h in HORIZONS:
+                    try:
+                        cur = model_at(conn, base, horizon=h)
+                        if not force and cur is not None and cur.fitted_ms >= month_start(now_ms):
+                            continue
+                        if candles is None:
+                            candles = load_candles(conn, base)
+                        m = fit(base, candles, now_ms, h)
+                        if m is None:
+                            res.errors.append(f"{base} HAR{h}: мало истории (< {MIN_TRAIN} дней) — остаётся эталон")
+                            continue
+                        save_model(conn, m)
+                        res.fitted.append(m)
+                        if (ref := self.refs[h].get(base)) is not None and (d := drift_pct(m, ref)) > DRIFT_PCT:
+                            res.drift.append((f"{base} HAR{h}", d))
+                        self._cache.pop((base, h), None)
+                    except Exception as e:
+                        log.exception("HAR%d: %s не переоценён", h, base)
+                        res.errors.append(f"{base} HAR{h}: {e}")
         finally:
             conn.close()
         return res
 
-    def describe(self, base: str) -> str:
-        m = self.get(base)
+    def describe(self, base: str, horizon: int = HORIZON) -> str:
+        m = self.get(base, horizon)
         if m is None:
-            return f"{base}: модели нет (ни оценки, ни эталона)"
-        ref = self.ref.get(base.upper())
+            return f"{base} HAR{horizon}: модели нет (ни оценки, ни эталона)"
+        ref = self.refs.get(horizon, {}).get(base.upper())
         src = (f"оценка {time.strftime('%Y-%m-%d', time.gmtime(m.fitted_ms / 1000))}, n={m.n}" if m.source == "fit"
                else "эталон research")
         d = f", расхождение с эталоном {drift_pct(m, ref):.1f}%" if ref and m.source == "fit" else ""
-        return f"{base}: b={'/'.join(f'{x:+.3f}' for x in m.b)} s²={m.s2:.3f} ({src}{d})"
+        return f"{base} HAR{horizon}: b={'/'.join(f'{x:+.3f}' for x in m.b)} s²={m.s2:.3f} ({src}{d})"
 
 
 def fmt_drift(res: RefitResult) -> str:
-    return ("HAR7: коэффициенты новой оценки отличаются от эталона research больше чем на "
+    return ("HAR: коэффициенты новой оценки отличаются от эталона research больше чем на "
             f"{DRIFT_PCT}%: " + ", ".join(f"{b} {d:.0f}%" for b, d in res.drift)
-            + ". Сигналы :har используют новую оценку; проверьте данные (python -m optbot.vol --show).")
+            + ". Книги :har (HAR7) и :har30 (HAR30) используют новую оценку; проверьте данные "
+              "(python -m optbot.vol --show).")
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-    ap = argparse.ArgumentParser(prog="python -m optbot.vol", description="Прогноз RV7 (HAR)")
+    ap = argparse.ArgumentParser(prog="python -m optbot.vol", description="Прогноз RV7 и RV30 (HAR)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--fit", action="store_true", help="докачать часовые свечи и переоценить сейчас")
-    g.add_argument("--show", action="store_true", help="модели в работе и текущий HAR7")
+    g.add_argument("--show", action="store_true", help="модели в работе и текущие HAR7, HAR30")
     ap.add_argument("--base", help="только этот актив")
     a = ap.parse_args(argv)
     from .bybit_client import OptionsClient
@@ -362,17 +373,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if res.errors else 0
     c = OptionsClient(settings)
     for b in bases:
-        line = vm.describe(b)
+        line = "\n".join(vm.describe(b, h) for h in HORIZONS)
         try:
             from .signals import RV_HOURS
             h1 = c.perp_closes(b, 60, RV_HOURS)
             rv = rv_at(h1, int(time.time() * 1000))
-            m = vm.get(b)
-            har = m.forecast(*rv) if m else None
-            line += ("\n  RV1/RV7/RV30 " + " / ".join("-" if x is None else f"{x * 100:.1f}%" for x in rv)
-                     + (f" → HAR7 {har * 100:.1f}%" if har else " → HAR7 -"))
+            line += "\n  RV1/RV7/RV30 " + " / ".join("-" if x is None else f"{x * 100:.1f}%" for x in rv)
+            for h in HORIZONS:
+                m = vm.get(b, h)
+                har = m.forecast(*rv) if m else None
+                line += f" → HAR{h} {har * 100:.1f}%" if har else f" → HAR{h} -"
         except Exception as e:
-            line += f"\n  текущий HAR7 не посчитан: {e}"
+            line += f"\n  текущий HAR не посчитан: {e}"
         print(line)
     return 0
 

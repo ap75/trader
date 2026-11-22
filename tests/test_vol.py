@@ -131,11 +131,15 @@ def test_refit_monthly_drift_and_fallback(cfg, make_client, fake):
     _history(fake, "BTC", days=500)
     fake.klines[("ETHUSDT", "60")] = kline_rows([100.0] * 48, 60, NOW)
     res = vm.refit(c, ["BTC", "ETH"], NOW)
-    assert [m.base for m in res.fitted] == ["BTC"]
-    assert any("ETH" in e and "мало истории" in e for e in res.errors)
+    assert [(m.base, m.horizon) for m in res.fitted] == [("BTC", 7), ("BTC", 30)]
+    assert any("ETH HAR7" in e and "мало истории" in e for e in res.errors)
+    assert any("ETH HAR30" in e and "мало истории" in e for e in res.errors)
     assert vm.get("BTC").source == "fit" and vm.get("ETH").source == "reference"
+    assert vm.get("BTC", 30).source == "fit" and vm.get("BTC", 30).horizon == 30
+    assert vm.get("ETH", 30).source == "reference" and vm.get("ETH", 30).b == tuple(vol.load_reference(horizon=30)["ETH"].b)
     # волатильность без памяти — коэффициенты далеки от эталона: предупреждение
-    assert res.drift and res.drift[0][0] == "BTC" and "BTC" in vol.fmt_drift(res)
+    assert res.drift and res.drift[0][0] == "BTC HAR7" and "BTC HAR7" in vol.fmt_drift(res)
+    assert "BTC HAR30" in str(res)
     assert vm.refit(c, ["BTC"], NOW + DAY_MS).fitted == []        # тот же месяц — не переоценивает
     assert vm.refit(c, ["BTC"], NOW + DAY_MS, force=True).fitted
     assert vm.refit(c, ["BTC"], NOW + 20 * DAY_MS).fitted          # новый месяц (декабрь)
@@ -242,7 +246,8 @@ def test_paper_har_books(make_client, cfg, tmp_path, market):
                                journal_enabled=True, max_order_qty={"BTC": 0, "ETH": 0, "SOL": 0},
                                max_position={"BTC": 0, "ETH": 0, "SOL": 0})
     ids = [x[0] for x in paper.all_books(pcfg)]
-    assert "short:iron_condor:BTC:har" in ids and not any(i.startswith("long:") and ":har" in i for i in ids)
+    assert "short:iron_condor:BTC:har" in ids and not any(i.startswith("long:") and i.endswith(":har") for i in ids)
+    assert "long:iron_condor:BTC:har30" in ids and not any(i.startswith("long:calendar") and "har30" in i for i in ids)
     assert paper.is_har_book("short:iron_condor:BTC:har:cost") and paper.is_cost_book("short:iron_condor:BTC:har:cost")
     assert paper.version_name("short:iron_condor:BTC:har:cost") == "HAR, с фильтром издержек"
     pe = paper.PaperEngine(make_client(pcfg), pcfg)
@@ -362,4 +367,94 @@ def test_refit_fits_stored_history_when_download_fails(cfg, make_client, fake, m
         raise RuntimeError("10016: svc error: Get kline failed")
     monkeypatch.setattr(c, "perp_klines", boom)
     res = vol.VolModels(cfg).refit(c, ["BTC"], NOW)
-    assert [m.base for m in res.fitted] == ["BTC"] and any("не докачаны" in e for e in res.errors)
+    assert [m.horizon for m in res.fitted] == [7, 30] and any("не докачаны" in e for e in res.errors)
+
+
+# ---------- HAR30 и книги «:har30» (research этап 7) ----------
+@pytest.fixture
+def long_market(fake):
+    from tests.test_paper import FAR, FAR_MS
+    set_chain(fake, iv=0.6, exp=FAR, exp_ms=FAR_MS, step=1000)
+    set_klines(fake, rv=0.4)
+    return fake
+
+
+def test_long_har30_decision_and_card(cfg, make_client, long_market):
+    eng = SignalEngine(make_client(cfg), cfg)
+    rv = eng.compute("BTC", NOW, horizon="long")
+    m = rv.metrics
+    assert m.har30 == pytest.approx(vol.load_reference(horizon=30)["BTC"].forecast(m.rv1, m.rv7, m.rv30))
+    assert m.har30 != pytest.approx(vol.load_reference()["BTC"].forecast(m.rv1, m.rv7, m.rv30))   # не HAR7
+    assert m.rv == m.rv30 and "IV30/RV30 = " in rv.reasons[0]                # решение карточки — по RV30
+    har = eng.compute("BTC", NOW, horizon="long", vol="har", metrics=m)
+    assert har.metrics.rv == m.har30 and har.metrics.iv_name == ("IV30", "HAR30") and "IV30/HAR30 = " in har.reasons[0]
+    assert har.strategy == rv.strategy == "iron_condor"                       # IV30/HAR30 тоже > 1.15
+    text = fmt_signal(rv, "demo")
+    assert "HAR30" in text and "IV30/RV30" in text and "IV30/HAR30" in text
+    # IV30/HAR30 = 1.05 — по HAR30 IV обычная: сигнала нет, по RV30 — кондор
+    from optbot.signals import choose
+    assert choose(dataclasses.replace(m, har30=m.iv30 / 1.05, vol_model="har"), cfg.sig)[0] is None
+    # модели нет — по HAR30 сигнала нет, RV30 работает
+    eng.vol.get = lambda base, horizon=7: None
+    eng.vol._cache.clear()
+    s = eng.compute("BTC", NOW, horizon="long", vol="har")
+    assert s.metrics.har30 is None and s.strategy is None and "HAR30" in s.no_signal
+    assert eng.compute("BTC", NOW, horizon="long").strategy == "iron_condor"
+
+
+def test_har30_books_system_and_versions(make_client, cfg, tmp_path, long_market):
+    from optbot.config import PaperSettings
+    from optbot import reports
+    ev = tmp_path / "events.csv"
+    ev.write_text("# пусто\n")
+    pcfg = dataclasses.replace(cfg, paper=PaperSettings(enabled=True, bases=("BTC", "SOL")), events_path=str(ev),
+                               journal_enabled=True, max_order_qty={"BTC": 0, "ETH": 0, "SOL": 0},
+                               max_position={"BTC": 0, "ETH": 0, "SOL": 0})
+    ids = [x[0] for x in paper.all_books(pcfg)]
+    assert "long:iron_condor:BTC:har30" in ids and "long:iron_condor:BTC:har30:cost" in ids
+    assert not any("SOL:har30" in i for i in ids) and "long:calendar:BTC" in ids
+    assert "long:calendar:BTC:har30" not in ids
+    pe = paper.PaperEngine(make_client(pcfg), pcfg)
+    pe.step(NOW)
+    conn = db.connect(pcfg.db_file)
+    books = {r["book"] for r in conn.execute("SELECT book FROM paper_trades")}
+    kinds = {(r["kind"], r["base"]) for r in conn.execute("SELECT kind, base FROM paper_signals")}
+    met = json.loads(conn.execute("SELECT metrics FROM paper_trades WHERE book = 'long:iron_condor:BTC:har30'")
+                     .fetchone()["metrics"])
+    conn.close()
+    assert {"long:iron_condor:BTC", "long:iron_condor:BTC:har30"} <= books
+    assert ("long_har30", "BTC") in kinds and ("long_har30", "SOL") not in kinds
+    assert met["vol_model"] == "har" and met["har30"] > 0 and met["rv"] == pytest.approx(met["har30"])
+    # системы: :har30 — только в HAR30; длинная RV-книга — в RV и HAR, не в HAR30
+    b30 = "long:iron_condor:BTC:har30"
+    assert paper.in_system(b30, "har30", False) and not paper.in_system(b30, False, False)
+    assert not paper.in_system(b30, True, False) and not paper.in_system(b30, "har30", True)
+    assert not paper.in_system("long:iron_condor:BTC", "har30", False)
+    assert paper.in_system("long:iron_condor:BTC", True, False) and paper.in_system("long:iron_condor:BTC", False, False)
+    assert paper.version_name(b30 + ":cost") == "HAR30, с фильтром издержек"
+    rows = [dict(book="long:iron_condor:BTC", max_loss=300), dict(book=b30, max_loss=200),
+            dict(book="short:bull_put:BTC", max_loss=100), dict(book=b30 + ":cost", max_loss=50)]
+    assert paper.system_risk(rows, b30) == 200 and paper.system_risk(rows, "long:iron_condor:BTC") == 400
+    names = [n for n, *_ in reports.systems(pcfg)]
+    assert [n for n in names if "фильтр" not in n] == ["RV", "HAR", "HAR30"] and "HAR30, с фильтром издержек" in names
+    assert "HAR30" in pe.status()
+    # сравнение версий длинного горизонта и частота сигналов
+    freq = pe.signal_freq(0, NOW + 1)
+    assert freq[("long", "BTC")] == (1, 1) and freq[("long_har30", "BTC")] == (1, 1)
+    text = paper.fmt_stats([], "7d", None, freq)
+    assert "IV30/RV30 против IV30/HAR30" in text and "RV 1 из 1 (100%) · HAR30 1 из 1 (100%)" in text
+    assert "SOL: RV" not in text.split("IV30/HAR30")[-1]                        # SOL без :har30 — не сравнивается
+    closed = [dict(book="long:bull_put:BTC", horizon="long", pnl=1.0, r_mult=0.1, status="closed"),
+              dict(book="long:bull_put:BTC:har30", horizon="long", pnl=-1.0, r_mult=-0.1, status="closed"),
+              dict(book="long:bull_put:SOL", horizon="long", pnl=5.0, r_mult=0.5, status="closed")]
+    v = "\n".join(paper.fmt_versions(closed, {}))
+    assert " RV: 1 сд." in v and " HAR30: 1 сд." in v and "PnL +5.00" not in v
+    assert paper.fmt_versions([closed[2]], {}) == []                             # без :har30 — раздела нет
+    rep = reports.fmt_books(reports.books_report(0, NOW + 1, "7d", pcfg))
+    assert "HAR30" in rep
+
+
+def test_refit_describe_har30(cfg):
+    vm = vol.VolModels(cfg)
+    assert vm.describe("BTC", 30).startswith("BTC HAR30: b=") and "эталон research" in vm.describe("BTC", 30)
+    assert vm.get("BTC", 30).b == tuple(vol.load_reference(horizon=30)["BTC"].b)

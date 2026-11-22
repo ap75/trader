@@ -141,7 +141,8 @@ def test_entry_sizes_by_risk_budget_and_tracks_legs(make_client, pcfg, fake):
     tracked = {r["symbol"]: r["reason"] for r in conn.execute("SELECT * FROM tracked_symbols")}
     assert set(tracked) == {l.symbol for l in sig.legs} and set(tracked.values()) == {f"book:{t['id']}"}
     # с фильтром и без × (короткий: RV и HAR — 6 стратегий × 2; длинный: 7)
-    assert conn.execute("SELECT COUNT(*) FROM books").fetchone()[0] == 2 * 3 * (6 * 2 + 7)
+    # 3 актива × (6 коротких × RV/HAR + 7 длинных) + у BTC/ETH 6 длинных :har30 — × с фильтром и без
+    assert conn.execute("SELECT COUNT(*) FROM books").fetchone()[0] == 2 * (3 * (6 * 2 + 7) + 2 * 6)
     conn.close()
 
 
@@ -1010,3 +1011,32 @@ def test_settlement_with_day_start_delivery_time(make_client, pcfg, fake):
     assert t["close_reason"] == "expiry" and t["delivery_price"] == 61000
     pe2 = eng(make_client, pcfg)                                      # второй раз — из БД (окно с начала дня)
     assert pe2._delivery_price(db.connect(pcfg.db_file), "BTC", EXP_MS) == 61000
+
+
+def test_outcome_reason_lists_rejected_expiries():
+    m = Metrics(base="BTC", ts_ms=NOW)
+    sig = Signal(metrics=m, strategy="bear_call", reasons=[],
+                 no_signal="ни на одной экспирации окна стратегия не собралась",
+                 rejected=["27NOV26: кредит 50 = 2.5% ширины 2000 < 10%", "04DEC26: нога без bid/ask"])
+    r = paper.outcome_reason(sig)
+    assert r == ("ни на одной экспирации окна стратегия не собралась; ✗ 27NOV26: кредит 50 = 2.5% ширины 2000 < 10%; "
+                 "✗ 04DEC26: нога без bid/ask")
+    sig.rejected = [f"E{i}: " + "x" * 100 for i in range(50)]
+    assert len(paper.outcome_reason(sig)) == paper.REASON_MAX and paper.outcome_reason(sig).endswith("…")
+    assert paper.outcome_reason(Signal(metrics=m, strategy=None, reasons=[], no_signal="нет")) == "нет"
+
+
+def test_step_logs_rejections_per_expiry(make_client, pcfg, fake):
+    set_chain(fake, iv=0.6)
+    set_klines(fake, rv=0.4)
+    pe = eng(make_client, dataclasses.replace(pcfg, sig=dataclasses.replace(pcfg.sig, min_credit_ratio=0.9)))
+    pe.step(NOW)
+    conn = db.connect(pcfg.db_file)
+    r = conn.execute("SELECT reason FROM paper_signals WHERE kind = 'short' AND outcome = 'not_built'").fetchone()
+    conn.close()
+    assert r and "не собралась" in r["reason"] and f"✗ {EXP}: кредит " in r["reason"]
+    assert "ширины" in r["reason"] and "< 90%" in r["reason"]
+    conn = db.connect(pcfg.db_file)
+    none = [x["reason"] for x in conn.execute("SELECT reason FROM paper_signals WHERE outcome = 'none'")]
+    conn.close()
+    assert all("✗" not in (x or "") for x in none)                    # у «нет сигнала» — только итог

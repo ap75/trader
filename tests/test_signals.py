@@ -277,12 +277,12 @@ def test_leg_issue():
 
 def test_check_economics():
     check_economics("bull_put", [L("P", 60000, -1, 300), L("P", 58000, +1, 100)], SC)  # 200 ≥ 10% × 2000
-    with pytest.raises(NoTrade, match="кредит"):
+    with pytest.raises(NoTrade, match=r"кредит 50(\.00)? = 2\.5% ширины 2000 < 10%"):   # кредит и ширина — в причине
         check_economics("bull_put", [L("P", 60000, -1, 150), L("P", 58000, +1, 100)], SC)
-    with pytest.raises(NoTrade, match="кредита нет"):
+    with pytest.raises(NoTrade, match="кредита нет.*кредит -50.*, ширина 2000"):
         check_economics("bull_put", [L("P", 60000, -1, 100), L("P", 58000, +1, 150)], SC)
     check_economics("bull_call", [L("C", 65000, 1, 1000), L("C", 67000, -1, 300)], SC)    # 700 ≤ 60% × 2000
-    with pytest.raises(NoTrade, match="дебет"):
+    with pytest.raises(NoTrade, match=r"дебет 1300(\.0+)? = 65\.0% ширины 2000 > 60%"):
         check_economics("bull_call", [L("C", 65000, 1, 1500), L("C", 67000, -1, 200)], SC)
     check_economics("long_straddle", [L("C", 65000, 1, 1500), L("P", 65000, 1, 1500)], SC)
     check_economics("long_straddle", [L("C", 65000, 1, 1500), L("P", 65000, 1, 1500)], SC, fair_rv=3000)

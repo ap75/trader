@@ -22,6 +22,7 @@ os.environ.update(
     ALLOW_ALL_GROUP_MEMBERS_VIEW="false", SENSITIVE_COMMANDS_DM_ONLY="true",
     FNG_URL="",  # без сети: индекс страха и жадности в тестах подменяется
     RF_URL="",   # без сети: ставка FRED в тестах подменяется
+    DVOL_URL="",  # без сети: DVOL Deribit в тестах подменяется
 )
 
 import dataclasses  # noqa: E402

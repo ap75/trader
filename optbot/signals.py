@@ -29,7 +29,10 @@ IV низкая: pctl ≤ SIG_PCTL_LOW при IV7 ≤ RV7·SIG_IV_RV_HIGH, ил�
 
 Длинный горизонт (эксперимент E1, бумажные книги; horizon="long"): окно SIG_LONG_DTE_MIN…MAX (14–45 дн.),
 IV30 (SIG_LONG_TARGET_DAYS) против RV30; RV14/RV30 ≥ SIG_RV14_RV30_MAX — волатильность растёт, премию не продаём;
-percentile IV30 — только при истории ≥ IV_PCT_MIN_DAYS (до этого — по IV30/RV30, «мало истории»).
+percentile IV30 — только при истории ≥ IV_PCT_MIN_DAYS (до этого — по IV30/RV30, «мало истории»). BTC/ETH, пока
+своей истории IV30 меньше года, — по истории DVOL Deribit (dvol.py, research этап 7.4): место IV30 / k в DVOL за
+SIG_LOOKBACK_DAYS, k — медиана IV30 / DVOL. HAR30 — прогноз RV на 30 дней (vol.py); бумажные книги «:har30»
+(BTC/ETH) — решение по IV30/HAR30 с теми же порогами (vol_model="har", horizon="long").
 Календарный спред (`calendar_signal`): ATM IV ближней (SIG_CAL_NEAR_DTE_MIN…MAX) / дальней (длинное окно) ≥
 SIG_CALENDAR_INVERSION и тренд боковой — продажа ближней ATM, покупка дальней того же страйка; риск = дебет.
 Событие высокой важности (EVENTS_FILE) до ближней экспирации — тег event (статистика — отдельно).
@@ -46,14 +49,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
-from . import db
+from . import db, dvol
 from .bybit_client import OptionsClient, group_by_strike, option_intrinsic, parse_option_symbol, spread_pct
 from .collector import _f, expiry_metrics
 from .config import Settings, SignalSettings, settings
 from .context import MarketContext, fear_greed, fmt_context, perp_funding, perp_oi_change
 from .events import calendar as events_calendar
-from .vol import VolModels
-from .fmt import DAY_MS, env_banner, money, num, pct, px, short_symbol, utc
+from .vol import LONG_HORIZON, VolModels
+from .fmt import DAY_MS, HOUR_MS, env_banner, money, num, pct, px, short_symbol, utc
 
 log = logging.getLogger("optbot.signals")
 
@@ -434,12 +437,13 @@ def check_economics(strategy: str, legs: list[Leg], sc: SignalSettings, fair_rv:
     width = spread_width(legs)
     if strategy in CREDIT:
         if net <= 0:
-            raise NoTrade("кредита нет (по исполнимым ценам)")
+            raise NoTrade(f"кредита нет (по исполнимым ценам): кредит {px(net, dash=False)}"
+                          + (f", ширина {num(width)}" if width else ""))
         if width and net < sc.min_credit_ratio * width:
-            raise NoTrade(f"кредит {px(net)} < {sc.min_credit_ratio:.0%} ширины {num(width)}")
+            raise NoTrade(f"кредит {px(net)} = {net / width:.1%} ширины {num(width)} < {sc.min_credit_ratio:.0%}")
     elif width:  # дебетовые вертикали
         if -net > sc.max_debit_ratio * width:
-            raise NoTrade(f"дебет {px(-net)} > {sc.max_debit_ratio:.0%} ширины {num(width)}")
+            raise NoTrade(f"дебет {px(-net)} = {-net / width:.1%} ширины {num(width)} > {sc.max_debit_ratio:.0%}")
     elif strategy == "long_straddle" and fair_rv is not None and -net > fair_rv:
         raise NoTrade(f"стрэддл {px(-net)} дороже справедливой цены по {rv_name} {px(fair_rv)}")
 
@@ -466,11 +470,17 @@ class Metrics:
     rv1: float | None = None
     har7: float | None = None          # прогноз RV на 7 дней (HAR, vol.py)
     har_src: str | None = None         # fit — оценка по истории | reference — эталон research
-    vol_model: str = "rv"              # rv — решение по IV7/RV7; har — по IV7/HAR7 (книги «:har», короткий горизонт)
+    vol_model: str = "rv"              # rv — по IV/RV; har — короткий по IV7/HAR7 (книги «:har»),
+    #                                    длинный по IV30/HAR30 (книги «:har30»)
+    har30: float | None = None         # прогноз RV на 30 дней (HAR, vol.py) — длинный горизонт
+    pctl_src: str | None = None        # None — своя история сборщика; dvol — история DVOL Deribit (dvol.py)
+    dvol_pctl: float | None = None     # pctl IV30 по DVOL (и при DVOL_PCTL_ENABLED=0 — справочно, не в решении)
+    dvol_ratio: float | None = None    # k = IV30 / DVOL, по которому IV30 переведена в шкалу DVOL
+    dvol_ratio_src: str | None = None  # own — медиана по своим срезам | research — оценка этапа 7.4
 
     @property
     def har(self) -> bool:
-        return self.vol_model == "har" and self.horizon != "long"
+        return self.vol_model == "har"
 
     @property
     def iv(self) -> float | None:
@@ -478,11 +488,15 @@ class Metrics:
 
     @property
     def rv(self) -> float | None:
-        return self.rv30 if self.horizon == "long" else self.har7 if self.har else self.rv7
+        if self.horizon == "long":
+            return self.har30 if self.har else self.rv30
+        return self.har7 if self.har else self.rv7
 
     @property
     def iv_name(self) -> str:
-        return ("IV30", "RV30") if self.horizon == "long" else ("IV7", "HAR7") if self.har else ("IV7", "RV7")
+        if self.horizon == "long":
+            return ("IV30", "HAR30") if self.har else ("IV30", "RV30")
+        return ("IV7", "HAR7") if self.har else ("IV7", "RV7")
 
     @property
     def rv_rising(self) -> float | None:
@@ -629,6 +643,7 @@ class SignalEngine:
         self.history_long = IV7History(cfg.db_file, cfg.sig.long_target_days)  # IV30 (E1)
         self.events = events_calendar(cfg.events_file)
         self.vol = VolModels(cfg)
+        self._own_first: dict[str, int] = {}   # актив -> первый срез сборщика (своя история IV30 — с него)
         self._reloaded: dict[str, float] = {}  # актив -> когда справочник перечитан из-за нового символа
 
     def _fetch(self, base: str) -> tuple[list[dict], dict, list, list, MarketContext]:
@@ -687,6 +702,12 @@ class SignalEngine:
         m.rv1 = realized_vol_window(mk.h1, 3_600_000, DAY_MS)
         if long:
             m.iv30 = iv
+            try:  # HAR30 — справочно в карточке и для книг «:har30»; сбой не ломает сигнал по RV30
+                model = self.vol.get(mk.base, LONG_HORIZON)
+                if model is not None:
+                    m.har30, m.har_src = model.forecast(m.rv1, m.rv7, m.rv30), model.source
+            except Exception:
+                log.exception("HAR30 %s не посчитан", mk.base)
         else:
             m.iv7 = iv
             try:  # прогноз — справочно для карточки и для книг «:har»; сбой не ломает сигнал по RV7
@@ -698,7 +719,9 @@ class SignalEngine:
         m.trend = trend_of([c for _, c in mk.h4], sc.ema_fast, sc.ema_slow, sc.trend_pct)
 
         hist = (self.history_long if long else self.history).get(mk.base, mk.now_ms - sc.lookback_days * DAY_MS)
-        if hist:
+        if long and self._dvol_pctl(m, iv, hist) and sc.dvol_pctl_enabled:
+            pass
+        elif hist:
             m.history_n = len(hist)
             m.history_last_ms = hist[-1][0]
             # не размах, а покрытие — часы, в которые были срезы: пропуски в сборе не выдают себя за историю,
@@ -710,6 +733,51 @@ class SignalEngine:
             if iv is not None:
                 m.pctl = percentile([v for _, v in hist], iv)
         return m
+
+    def _dvol_pctl(self, m: Metrics, iv: float | None, own: list[tuple[int, float]]) -> bool:
+        """Перцентиль IV30 по истории DVOL (BTC/ETH, своей истории меньше dvol.OWN_DAYS): dvol_pctl и k в m;
+        при DVOL_PCTL_ENABLED ещё pctl и поля истории (решение). Не применимо (нет DVOL, устарел, своя история уже
+        длинная) — False, как раньше."""
+        base, now = m.base, m.ts_ms
+        if base not in dvol.BASES:
+            return False
+        try:
+            conn = db.connect(self.cfg.db_file)
+            try:
+                if base not in self._own_first:
+                    first = conn.execute("SELECT MIN(ts) t FROM snapshots WHERE base = ?", (base,)).fetchone()["t"]
+                    if first is not None:   # пусто — спросить снова в следующий раз
+                        self._own_first[base] = first
+                first = self._own_first.get(base)
+                if first is not None and now - first >= dvol.OWN_DAYS * DAY_MS:
+                    return False
+                dv = dvol.bars(conn, base, now - self.cfg.sig.lookback_days * DAY_MS, now)
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("DVOL %s не прочитан — перцентиль по своей истории", base)
+            return False
+        if not dv:
+            return False
+        last = max(dv) + HOUR_MS
+        if now - last > dvol.STALE_MS:
+            log.info("DVOL %s устарел (последнее значение %s UTC) — перцентиль по своей истории", base, utc(last))
+            return False
+        k, _, src = dvol.ratio(own, dv, base)
+        if not k:
+            return False
+        m.dvol_ratio, m.dvol_ratio_src = k, src
+        m.dvol_pctl = percentile(list(dv.values()), iv / k) if iv is not None else None
+        if not self.cfg.sig.dvol_pctl_enabled:
+            return True                     # справочно: решение — по своей истории
+        m.pctl_src = "dvol"
+        m.history_n = len(dv)
+        m.history_last_ms = last
+        m.history_days = len(dv) / 24
+        m.history_stale = False
+        m.enough_history = m.history_days >= self.cfg.sig.iv_pct_min_days
+        m.pctl = m.dvol_pctl
+        return True
 
     def _tag_events(self, sig: Signal) -> None:
         """Собранный сигнал: тег event и оценка издержек."""
@@ -729,7 +797,8 @@ class SignalEngine:
                 market: Market | None = None, min_dte: float = 0.0, vol: str = "rv",
                 metrics: Metrics | None = None) -> Signal:
         """min_dte — экспирации не ближе (бумажные книги: срок раннего выхода — иначе выход сразу после входа).
-        vol="har" — короткий горизонт по IV7/HAR7 (книги «:har»); metrics — уже посчитанные по тому же market."""
+        vol="har" — по IV7/HAR7 (короткий, книги «:har») или IV30/HAR30 (длинный, книги «:har30»);
+        metrics — уже посчитанные по тому же market."""
         if vol not in ("rv", "har"):
             raise ValueError(f"vol {vol!r}: rv или har")
         if horizon not in HORIZONS:
@@ -940,7 +1009,8 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
 
     lines.append("\nМетрики:")
     if m.horizon == "long":
-        lines.append(f" IV30 {pc(m.iv30)} · RV30 {pc(m.rv30)} · RV14 {pc(m.rv14)}")
+        lines.append(f" IV30 {pc(m.iv30)} · RV30 {pc(m.rv30)} · HAR30 {pc(m.har30)} · RV14 {pc(m.rv14)}")
+        lines.append(" " + ratios(m))
     else:
         lines.append(f" IV7 {pc(m.iv7)} · RV7 {pc(m.rv7)} · HAR7 {pc(m.har7)} · RV14 {pc(m.rv14)}")
         lines.append(" " + ratios(m))
@@ -952,7 +1022,13 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
         flag = f" — история устарела (последний срез {utc(m.history_last_ms)} UTC)"
     else:
         flag = "" if m.enough_history else " — мало истории"
-    lines.append(f" {hist} ({m.history_days:.1f} дн., {m.history_n} срезов){flag}")
+    if m.pctl_src == "dvol":
+        src = "своя медиана" if m.dvol_ratio_src == "own" else "оценка research"
+        lines.append(f" {hist} по DVOL Deribit ({m.history_days:.1f} дн.; IV30/DVOL {m.dvol_ratio:.3f} — {src}){flag}")
+    else:
+        ref = (f" · по DVOL {m.dvol_pctl:.0f} — справочно (DVOL_PCTL_ENABLED=0)"
+               if m.dvol_pctl is not None else "")
+        lines.append(f" {hist} ({m.history_days:.1f} дн., {m.history_n} срезов){flag}{ref}")
     if t.direction:
         lines.append(f" тренд 4h: {TREND_NAMES[t.direction]} · EMA {num(round(t.ema_fast))}/{num(round(t.ema_slow))}")
     if (bg := fmt_context(m.ctx)):
@@ -964,10 +1040,13 @@ def fmt_signal(sig: Signal, env: str, head: str = "") -> str:
 
 
 def ratios(m: Metrics) -> str:
-    """«IV7/RV7 … · IV7/HAR7 …» — оба отношения (решение карточки — по первому; книги «:har» — по второму)."""
+    """«IV7/RV7 … · IV7/HAR7 …» (длинный — IV30/RV30 и IV30/HAR30) — оба отношения (решение карточки — по первому;
+    книги «:har» и «:har30» — по второму)."""
     def r(a, b):
         return f"{a / b:.2f}" if a and b else "-"
     src = " (HAR — эталон research)" if m.har_src == "reference" else ""
+    if m.horizon == "long":
+        return f"IV30/RV30 {r(m.iv30, m.rv30)} · IV30/HAR30 {r(m.iv30, m.har30)}{src}"
     return f"IV7/RV7 {r(m.iv7, m.rv7)} · IV7/HAR7 {r(m.iv7, m.har7)}{src}"
 
 

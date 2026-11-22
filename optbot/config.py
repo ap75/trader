@@ -144,6 +144,9 @@ class SignalSettings:
     rv14_rv30_max: float = _float_in("SIG_RV14_RV30_MAX", 1.25, 1, 5)
     # percentile IV30 — только при истории ≥ N дн. (до этого решение по IV30/RV30, с пометкой)
     iv_pct_min_days: float = _float_in("IV_PCT_MIN_DAYS", 30, 1, 365)
+    # percentile IV30 BTC/ETH по DVOL Deribit (dvol.py) — в решения; выключен — DVOL докачивается и pctl по нему
+    # только справочно (карточка, metrics). Включение меняет версию порогов журнала сигналов (cfg_version)
+    dvol_pctl_enabled: bool = _bool("DVOL_PCTL_ENABLED", False)
     # Календарный спред: ATM IV ближней / дальней ≥ k (инверсия) и тренд боковой
     calendar_inversion: float = _float_in("SIG_CALENDAR_INVERSION", 1.10, 1, 3)
     cal_near_dte_min: float = _float_in("SIG_CAL_NEAR_DTE_MIN", _SIG_PAIRS["cal_near_dte_min"], 1, 60)  # ближняя нога
@@ -315,6 +318,8 @@ class Settings:
     fng_url: str = os.getenv("FNG_URL", "https://api.alternative.me/fng/?limit=1").strip()
     # безрисковая ставка для книги базиса (векселя США 3 мес., CSV без ключа) — раз в сутки; пусто — не брать
     rf_url: str = os.getenv("RF_URL", "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTB3").strip()
+    # DVOL Deribit (публичный API без ключа) — история для перцентиля IV30 BTC/ETH, ежедневно; пусто — не качать
+    dvol_url: str = os.getenv("DVOL_URL", "https://www.deribit.com/api/v2/public/get_volatility_index_data").strip()
     # календарь событий высокой важности (тег event): относительный путь — от корня проекта
     events_path: str = os.getenv("EVENTS_FILE", "events.csv").strip() or "events.csv"  # один экземпляр: SIG_* читаются при импорте, предупреждения — один раз
 

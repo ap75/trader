@@ -25,7 +25,8 @@ from dataclasses import dataclass, field
 from . import db
 from .config import Settings, settings
 from .fmt import DAY_MS
-from .paper import (all_books, cost_rejects, fmt_rejects, fmt_versions, in_system, is_cost_book, is_har_book,
+from .paper import (all_books, cost_rejects, fmt_rejects, fmt_versions, in_system, is_cost_book, is_har30_book,
+                    is_har_book,
                     leg_marks, signal_freq, summarize)
 from .perpbook import corr, daily_pnl
 
@@ -54,13 +55,20 @@ def leg_iv_shift(kind: str, price_shock: float, dv: float, put_mult: float) -> f
 TG_LIMIT = 3900                 # сообщение <pre> — с запасом до 4096
 
 
-def systems(cfg: Settings, present=()) -> list[tuple[str, bool, bool]]:
-    """[(имя, HAR, с фильтром издержек)] — по книгам из all_books и по книгам с данными (present: id), чтобы
-    выключенная в настройках версия со сделками не выпала из итогов."""
+def systems(cfg: Settings, present=()) -> list[tuple[str, bool | str, bool]]:
+    """[(имя, HAR: False | True | "har30", с фильтром издержек)] — по книгам из all_books и по книгам с данными
+    (present: id), чтобы выключенная в настройках версия со сделками не выпала из итогов. HAR30 — только книги
+    :har30 (длинный горизонт BTC/ETH)."""
     books = all_books(cfg)
-    hars = (False, True) if any(b[4] for b in books) or any(is_har_book(b) for b in present) else (False,)
+    ids = [b[0] for b in books] + list(present)
+    hars: list = [False]
+    if any(is_har_book(b) for b in ids):
+        hars.append(True)
+    if any(is_har30_book(b) for b in ids):
+        hars.append("har30")
     costs = (False, True) if any(b[5] for b in books) or any(is_cost_book(b) for b in present) else (False,)
-    return [(("HAR" if h else "RV") + (", с фильтром издержек" if c else ""), h, c) for h in hars for c in costs]
+    name = {False: "RV", True: "HAR", "har30": "HAR30"}
+    return [(name[h] + (", с фильтром издержек" if c else ""), h, c) for h in hars for c in costs]
 
 
 # ---------- Black-76 ----------
@@ -302,7 +310,8 @@ def fmt_stress(st: Stress, cfg: Settings = settings) -> str:
             lines.append(f" Σ базис (без наблюдения): {tot:+,.0f} USDT ({tot / cap_t:+.1%} от {cap_t:,.0f}; худшие "
                          "недели у монет — в разные даты)")
     if st.books or st.perp:
-        lines.append(f"Σ — по системам (длинный горизонт — и в RV, и в HAR); % — от условного капитала; "
+        lines.append(f"Σ — по системам (длинный горизонт — и в RV, и в HAR; :har30 — система HAR30); "
+                     f"% — от условного капитала; "
                      f"в скобках у книги — худший сценарий таблицы, % от {cap:,.0f}")
     if st.missing:
         lines.append("Без оценки (нет котировки или IV ноги в последнем срезе): " + ", ".join(st.missing))
@@ -512,7 +521,8 @@ def books_report(start_ms: int, end_ms: int, label: str, cfg: Settings = setting
                 bd = dict(zip(*_days(series, start_ms))) if series else {}
                 basis_corr[r_["book"]] = {name: corr(bd, sd) for name, sd in sys_daily.items()}
         return BooksReport(label, rows, sys_rows, perp_rows, perp_corr, open_lines,
-                           fmt_versions(closed if horizon in (None, "short") else [], freq if horizon in (None, "short") else None),
+                           fmt_versions(closed, {k: v for k, v in freq.items()
+                                                 if horizon is None or k[0].split("_")[0] == horizon}),
                            fmt_rejects(rej), basis, basis_corr)
     finally:
         if own:
@@ -642,7 +652,7 @@ def fmt_books(r: BooksReport, cfg: Settings = settings, filt: str = "") -> str:
     lines.append("Открытые:" if r.open_lines else "Открытых сделок нет")
     lines += r.open_lines
     if r.systems:
-        lines.append("По системам (длинный горизонт — и в RV, и в HAR):")
+        lines.append("По системам (длинный горизонт — и в RV, и в HAR; книги :har30 — система HAR30):")
         lines += [x.line() for x in r.systems]
     if r.rows:
         lines.append("По книгам:")

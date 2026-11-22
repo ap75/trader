@@ -26,6 +26,10 @@ BASE_COINS).
 
 Тег event — событие высокой важности (EVENTS_FILE) до (ближней) экспирации: статистика — отдельно.
 
+Версии книг: «…:har» — короткий горизонт по IV7/HAR7 (рядом — та же по IV7/RV7); «…:har30» — длинный горизонт
+BTC/ETH (HAR30_BASES, без календаря) по IV30/HAR30 (research этап 7). Системы (итоги, лимит риска): RV — короткие RV
+и длинные; HAR — короткие :har и те же длинные; HAR30 — только книги :har30 (длинные RV-книги не трогает).
+
 Запуск:
     python -m optbot.paper --step                 шаг вручную (на сервере; бот делает его после среза)
     python -m optbot.paper --status               открытые сделки по книгам
@@ -71,10 +75,15 @@ REASONS = {"take": "цель по прибыли", "stop": "стоп", "time": "
 
 COST_SUFFIX = ":cost"  # книга с фильтром издержек SIG_MAX_COST_PCT (рядом — та же без фильтра)
 HAR_TAG = ":har"       # короткий горизонт с решением по IV7/HAR7 (рядом — та же по IV7/RV7); id …:har[:cost]
+HAR30_TAG = ":har30"   # длинный горизонт по IV30/HAR30 (рядом — та же по IV30/RV30); id long:…:har30[:cost]
+HAR30_BASES = ("BTC", "ETH")   # research этап 7: DVOL/HAR30 — только BTC и ETH
+HAR_KEYS = ("short_har", "long_har30")   # итоги расчёта (paper_signals.kind) для версий по HAR
 
 
 def book_id(horizon: str, strategy: str, base: str, cost: bool = False, har: bool = False) -> str:
-    return f"{horizon}:{strategy}:{base}" + (HAR_TAG if har else "") + (COST_SUFFIX if cost else "")
+    """har — у короткого горизонта «:har» (HAR7), у длинного «:har30» (HAR30)."""
+    tag = (HAR30_TAG if horizon == "long" else HAR_TAG) if har else ""
+    return f"{horizon}:{strategy}:{base}" + tag + (COST_SUFFIX if cost else "")
 
 
 def is_cost_book(book: str) -> bool:
@@ -82,34 +91,57 @@ def is_cost_book(book: str) -> bool:
 
 
 def is_har_book(book: str) -> bool:
+    """Короткая книга «:har» (HAR7); длинные «:har30» — is_har30_book."""
     return book.split(":")[3:4] == ["har"]
+
+
+def is_har30_book(book: str) -> bool:
+    return book.split(":")[3:4] == ["har30"]
 
 
 def version_name(book: str) -> str:
     """Версия книги: прогноз RV и фильтр издержек."""
-    return ("HAR" if is_har_book(book) else "RV") + (", с фильтром издержек" if is_cost_book(book) else "")
+    v = "HAR30" if is_har30_book(book) else "HAR" if is_har_book(book) else "RV"
+    return v + (", с фильтром издержек" if is_cost_book(book) else "")
 
 
-def in_system(book: str, har: bool, cost: bool) -> bool:
-    """Книга входит в систему (короткий RV или короткий HAR + общий длинный горизонт, с фильтром издержек или без)."""
-    return is_cost_book(book) == cost and (book.startswith("long:") or is_har_book(book) == har)
+def in_system(book: str, har: bool | str, cost: bool) -> bool:
+    """Книга входит в систему: har=False — RV (короткий RV + длинный), True — HAR (короткий :har + тот же длинный),
+    "har30" — HAR30 (только длинные :har30); с фильтром издержек или без."""
+    if is_cost_book(book) != cost:
+        return False
+    if is_har30_book(book) or har == "har30":
+        return is_har30_book(book) and har == "har30"
+    return book.startswith("long:") or is_har_book(book) == har
 
 
 def system_risk(open_rows: list, book: str) -> float:
     """Занятый риск для лимита PAPER_MAX_TOTAL_RISK_USDT при входе в book. Системы RV и HAR параллельны и делят
-    длинный горизонт: короткая книга — риск своей системы; длинная — худшая из двух (входит в обе)."""
+    длинный горизонт: короткая книга — риск своей системы; длинная — худшая из двух (входит в обе); :har30 —
+    своя система HAR30."""
     cost = is_cost_book(book)
-    hars = (False, True) if book.startswith("long:") else (is_har_book(book),)
+    if is_har30_book(book):
+        hars: tuple = ("har30",)
+    else:
+        hars = (False, True) if book.startswith("long:") else (is_har_book(book),)
     return max(sum(r["max_loss"] for r in open_rows if in_system(r["book"], h, cost)) for h in hars)
+
+
+def har_variants(horizon: str, strategy: str, base: str) -> tuple[bool, ...]:
+    """Версии книги по прогнозу: короткий — RV и :har; длинный BTC/ETH (кроме календаря) — RV и :har30."""
+    if horizon == "short" or horizon == "long" and base in HAR30_BASES and strategy != "calendar":
+        return False, True
+    return (False,)
 
 
 def all_books(cfg: Settings) -> list[tuple[str, str, str, str, bool, bool]]:
     """[(id, горизонт, стратегия, актив, HAR, с фильтром издержек)] — активы PAPER_BASES, которые есть в BASE_COINS.
-    Фильтр выключен (SIG_MAX_COST_PCT=0) — книг «:cost» нет; «:har» — только короткий горизонт."""
+    Фильтр выключен (SIG_MAX_COST_PCT=0) — книг «:cost» нет; «:har» — короткий горизонт, «:har30» — длинный
+    BTC/ETH без календаря."""
     bases = [b for b in cfg.paper.bases if b in cfg.base_coins]
     variants = (False, True) if cfg.sig.max_cost_pct else (False,)
     return [(book_id(h, s, b, v, hr), h, s, b, hr, v) for b in bases for h, ss in BOOK_STRATEGIES.items() for s in ss
-            for hr in ((False, True) if h == "short" else (False,)) for v in variants]
+            for hr in har_variants(h, s, b) for v in variants]
 
 
 # ---------- издержки ----------
@@ -240,7 +272,8 @@ class PaperEngine:
             except Exception as e:
                 log.warning("Бумажные книги: данные %s — %s", base, e)
                 res.errors.append(f"данные {base}: {e}")
-                for key in ("short", "short_har", "long", "calendar"):
+                for key in ("short", "short_har", "long", *(("long_har30",) if base in HAR30_BASES else ()),
+                            "calendar"):
                     outcomes.append((now_ms, base, key, "error", None, None, None, f"данные: {e}"[:300]))
                 continue
             by_book, got = {}, {}
@@ -253,6 +286,11 @@ class PaperEngine:
                                 base, horizon="short", market=mk, min_dte=ex_s, vol="har",
                                 metrics=got["short"].metrics if "short" in got else None)),
                             ("long", lambda: self.engine.compute(base, horizon="long", market=mk, min_dte=ex_l)),
+                            *((("long_har30", lambda: self.engine.compute(
+                                base, horizon="long", market=mk, min_dte=ex_l, vol="har",
+                                metrics=got["long"].metrics if "long" in got else None)),)
+                              if base in HAR30_BASES and any(x[3] == base and x[1] == "long" and x[4] for x in books)
+                              else ()),
                             ("calendar", lambda: self.engine.calendar_signal(
                                 base, market=mk, metrics=got["long"].metrics if "long" in got else None,
                                 min_near_dte=ex_c))):
@@ -267,10 +305,11 @@ class PaperEngine:
                 outcome = "signal" if strategy and sig.legs else "not_built" if strategy else "none"
                 outcomes.append((now_ms, base, key, outcome, strategy, sig.regime,
                                       sig.metrics.trend.direction if sig.metrics else None,
-                                      None if outcome == "signal" else (sig.no_signal or "")[:300]))
+                                      None if outcome == "signal" else outcome_reason(sig) if outcome == "not_built"
+                                      else (sig.no_signal or "")[:300]))
                 if sig.strategy and sig.legs:  # обе версии книги: без фильтра и с фильтром издержек
                     for x in books:
-                        if x[1:4] == (sig.horizon, sig.strategy, base) and x[4] == (key == "short_har"):
+                        if x[1:4] == (sig.horizon, sig.strategy, base) and x[4] == (key in HAR_KEYS):
                             by_book[x[0]] = sig
             out[base] = by_book
         return out
@@ -391,7 +430,9 @@ class PaperEngine:
                        rv30=m.rv30, pctl=m.pctl, pctl_used=m.enough_history and m.pctl is not None,
                        history_days=m.history_days, history_stale=m.history_stale, regime=sig.regime,
                        trend=m.trend.direction, ema_gap_pct=m.trend.gap_pct, exp_iv=sig.exp_iv, dte=sig.dte,
-                       reasons=sig.reasons, rv1=m.rv1, har7=m.har7, har_src=m.har_src, vol_model=m.vol_model,
+                       reasons=sig.reasons, rv1=m.rv1, har7=m.har7, har30=m.har30, har_src=m.har_src,
+                       vol_model=m.vol_model, pctl_src=m.pctl_src, dvol_pctl=m.dvol_pctl,
+                       dvol_ratio=m.dvol_ratio,
                        **(m.ctx.as_dict() if m.ctx else {}))
         events = [dict(ts=e.ts_ms, name=e.name) for e in sig.events]
         over, tid = None, None
@@ -421,7 +462,8 @@ class PaperEngine:
                      sig.far_expiry_ms, json.dumps(legs), qty, raw, cap, net, fees,
                      prof1 * qty if prof1 is not None else None, risk, im, sig.forward, sig.em,
                      ",".join(sig.tags) or None, json.dumps(events), _json(metrics),
-                     _json({**asdict(pc), "sig_max_cost_pct": self.cfg.sig.max_cost_pct}),
+                     _json({**asdict(pc), "sig_max_cost_pct": self.cfg.sig.max_cost_pct,
+                            "dvol_pctl_enabled": self.cfg.sig.dvol_pctl_enabled}),
                      sig.cost_pct))
                 tid = cur.lastrowid
                 for exp_ms in {l["expiry_ms"] for l in legs}:
@@ -638,10 +680,11 @@ class PaperEngine:
         lim = f" из {self.pc.max_total_risk_usdt:g}" if self.pc.max_total_risk_usdt else ""
         parts = []
         for name, har, cost in (("RV", False, False), ("RV, с фильтром издержек", False, True),
-                                ("HAR", True, False), ("HAR, с фильтром издержек", True, True)):
+                                ("HAR", True, False), ("HAR, с фильтром издержек", True, True),
+                                ("HAR30", "har30", False), ("HAR30, с фильтром издержек", "har30", True)):
             part = [r for r in rows if in_system(r["book"], har, cost)]
             # лимит суммарного риска — на систему; длинный горизонт входит и в RV, и в HAR
-            if part and (har is False or any(is_har_book(r["book"]) for r in part)):
+            if part and (har is not True or any(is_har_book(r["book"]) for r in part)):
                 parts.append(f"{name} {len(part)}, риск {sum(r['max_loss'] for r in part):.2f}{lim}")
         lines = [f"Открытые бумажные сделки: {len(rows)} — " + "; ".join(parts) + " USDT"
                  + (" (длинный горизонт — в обеих системах)" if any(is_har_book(r["book"]) for r in rows) else "")]
@@ -664,7 +707,7 @@ class PaperEngine:
             conn.close()
 
     def signal_freq(self, start_ms: int, end_ms: int) -> dict[tuple[str, str], tuple[int, int]]:
-        """Короткий горизонт по шагам книг: {(short | short_har, актив): (шагов с собранным сигналом, шагов)}."""
+        """По шагам книг: {(short | short_har | long | long_har30, актив): (шагов с собранным сигналом, шагов)}."""
         conn = self._db()
         try:
             return signal_freq(conn, start_ms, end_ms)
@@ -680,6 +723,18 @@ class PaperEngine:
                 (start_ms, end_ms))]
         finally:
             conn.close()
+
+
+REASON_MAX = 2000   # символов причины в paper_signals.reason
+
+
+def outcome_reason(sig: Signal) -> str:
+    """Причина «не собрался» для paper_signals: итог и отказ по каждой экспирации окна (кредит / дебет и ширина
+    спреда — в тексте отказа экономики), через «; ». У «нет сигнала» — только итог (иначе календарь писал бы на
+    каждом шаге все пары экспираций)."""
+    parts = [sig.no_signal or ""] + [f"✗ {r}" for r in sig.rejected]
+    text = "; ".join(p for p in parts if p)
+    return text if len(text) <= REASON_MAX else text[:REASON_MAX - 1] + "…"
 
 
 def cost_rejects(conn, start_ms: int, end_ms: int) -> dict[str, tuple[int, int]]:
@@ -699,7 +754,8 @@ def signal_freq(conn, start_ms: int, end_ms: int) -> dict[tuple[str, str], tuple
     """См. PaperEngine.signal_freq — на открытом соединении."""
     return {(r["kind"], r["base"]): (r["n"], r["steps"]) for r in conn.execute(
         "SELECT kind, base, SUM(outcome = 'signal') n, COUNT(*) steps FROM paper_signals WHERE ts >= ? "
-        "AND ts < ? AND kind IN ('short', 'short_har') GROUP BY kind, base", (start_ms, end_ms))}
+        "AND ts < ? AND kind IN ('short', 'short_har', 'long', 'long_har30') GROUP BY kind, base",
+        (start_ms, end_ms))}
 
 
 def leg_marks(conn, symbols: list[str], now_ms: int) -> dict[str, dict]:
@@ -825,27 +881,49 @@ def _metrics(r: dict) -> dict:
         return {}
 
 
+VERSIONS = (  # (горизонт, заголовок, [(версия, итог расчёта в paper_signals)])
+    ("short", "Короткий горизонт: решение по IV7/RV7 против IV7/HAR7 (те же пороги):",
+     (("RV", "short"), ("HAR", "short_har"))),
+    ("long", "Длинный горизонт BTC/ETH (без календаря): решение по IV30/RV30 против IV30/HAR30 (те же пороги):",
+     (("RV", "long"), ("HAR30", "long_har30"))),
+)
+
+
 def fmt_versions(rows: list[dict], freq: dict[tuple[str, str], tuple[int, int]] | None) -> list[str]:
-    """Короткий горизонт: RV против HAR — итоги закрытых по версиям книг и частота сигналов по шагам."""
-    short = [r for r in rows if r.get("horizon") == "short" and r.get("status", "closed") != "void"]
-    if not short and not freq:
-        return []
-    lines = ["Короткий горизонт: решение по IV7/RV7 против IV7/HAR7 (те же пороги):"]
-    for name in ("RV", "HAR", "RV, с фильтром издержек", "HAR, с фильтром издержек"):
-        part = [r for r in short if version_name(r["book"]) == name]
-        if part:
-            s = summarize(part)
-            avg = "-" if s["avg_r"] is None else f"{s['avg_r']:+.2f}"
-            lines.append(f" {name}: {s['n']} сд., прибыльных {s['wins']}, PnL {s['pnl']:+.2f}, ΣR {s['sum_r']:+.2f}, "
-                         f"ср. R {avg}")
-    if freq:
-        lines.append(" Частота сигналов (шагов с собранным сигналом):")
-        for base in sorted({b for _, b in freq}):
-            cells = []
-            for kind, name in (("short", "RV"), ("short_har", "HAR")):
-                n, steps = freq.get((kind, base), (0, 0))
-                cells.append(f"{name} {n} из {steps}" + (f" ({100 * n / steps:.0f}%)" if steps else ""))
-            lines.append(f"  {base}: " + " · ".join(cells))
+    """RV против HAR: итоги закрытых по версиям книг и частота сигналов по шагам — короткий горизонт (HAR7)
+    и длинный BTC/ETH (HAR30; раздел — когда есть книги :har30 или их шаги)."""
+    lines: list[str] = []
+    freq = freq or {}
+    for hz, title, vers in VERSIONS:
+        part_rows = [r for r in rows if r.get("horizon", r["book"].split(":")[0]) == hz
+                     and r.get("status", "closed") != "void"]
+        hf = {k: v for k, v in freq.items() if k[0] in {kind for _, kind in vers}}
+        if hz == "long":
+            # сравнимы только книги, у которых есть версия :har30: BTC/ETH без календаря
+            part_rows = [r for r in part_rows if r["book"].split(":")[2] in HAR30_BASES
+                         and r["book"].split(":")[1] != "calendar"]
+            if not any(is_har30_book(r["book"]) for r in part_rows) and not any(k[0] == "long_har30" for k in hf):
+                continue
+            hf = {k: v for k, v in hf.items() if k[1] in HAR30_BASES}
+        if not part_rows and not hf:
+            continue
+        lines.append(title)
+        for sfx in ("", ", с фильтром издержек"):
+            for name in (v + sfx for v, _ in vers):
+                part = [r for r in part_rows if version_name(r["book"]) == name]
+                if part:
+                    s = summarize(part)
+                    avg = "-" if s["avg_r"] is None else f"{s['avg_r']:+.2f}"
+                    lines.append(f" {name}: {s['n']} сд., прибыльных {s['wins']}, PnL {s['pnl']:+.2f}, "
+                                 f"ΣR {s['sum_r']:+.2f}, ср. R {avg}")
+        if hf:
+            lines.append(" Частота сигналов (шагов с собранным сигналом):")
+            for base in sorted({b for _, b in hf}):
+                cells = []
+                for name, kind in vers:
+                    n, steps = hf.get((kind, base), (0, 0))
+                    cells.append(f"{name} {n} из {steps}" + (f" ({100 * n / steps:.0f}%)" if steps else ""))
+                lines.append(f"  {base}: " + " · ".join(cells))
     return lines
 
 
@@ -900,7 +978,8 @@ def fmt_stats(rows: list[dict], label: str, rejects: dict[str, tuple[int, int]] 
 
 SKIP_CODES = {"traded": "экспирация уже торговалась", "cost": "издержки", "max_open": "лимит открытых", "total_risk": "лимит суммарного риска",
               "qty": "размер", "data": "нет данных", "exit_window": "мало до экспирации"}
-KINDS = {"short": "короткий", "short_har": "короткий (HAR)", "long": "длинный", "calendar": "календарь"}
+KINDS = {"short": "короткий", "short_har": "короткий (HAR)", "long": "длинный", "long_har30": "длинный (HAR30)",
+         "calendar": "календарь"}
 OUTCOMES = {"signal": "сигнал", "not_built": "не собрался", "none": "нет стратегии", "error": "ошибка"}
 
 
@@ -959,7 +1038,8 @@ def fmt_skips(sigs: list[dict], skips: list[dict], label: str) -> str:
 
 CSV_FIELDS = ("id", "book", "cost_pct", "horizon", "strategy", "base", "opened_ms", "closed_ms", "expiry", "far_expiry", "qty",
               "qty_cap", "entry_net", "entry_fees", "exit_net", "exit_fees", "max_profit", "max_loss", "im_regular",
-              "pnl", "r_mult", "close_reason", "delivery_price", "tags", "fng", "funding", "oi_chg_24h", "rv7", "har7")
+              "pnl", "r_mult", "close_reason", "delivery_price", "tags", "fng", "funding", "oi_chg_24h", "rv7", "har7",
+              "rv30", "har30", "pctl", "pctl_src")
 
 
 def to_csv(rows: list[dict]) -> str:

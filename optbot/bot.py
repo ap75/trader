@@ -84,6 +84,7 @@ from .collector import Collector, seconds_to_next_slot
 from . import backup as backup_mod
 from . import paper as paper_mod
 from . import vol as vol_mod
+from . import dvol as dvol_mod
 from . import reports
 from . import rates
 from .paper import PaperEngine
@@ -1692,7 +1693,7 @@ class OptionsBot:
             await self.admin_alert("backup", f"Резервная копия БД не сделана: {e}")
 
     async def _vol_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
-        """HAR7: докачать часовые свечи; в новом месяце — переоценить; расхождение с эталоном — администратору."""
+        """HAR7 и HAR30: докачать часовые свечи; в новом месяце — переоценить; расхождение с эталоном — администратору."""
         try:
             res = await asyncio.to_thread(self.signals.vol.refit, self.c)
         except Exception:
@@ -1720,6 +1721,25 @@ class OptionsBot:
         if res.stale:
             await self.admin_alert("rf_stale", f"Ставка векселей для книги базиса устарела: {res}. «Сверх ставки» "
                                                f"в /books — по ней; проверьте RF_URL и доступ к FRED.")
+
+    async def _dvol_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
+        """DVOL Deribit (перцентиль IV30 BTC/ETH): раз в сутки; последнее значение старше 3 дней — администратору."""
+        def run():
+            conn = db.connect(self.cfg.db_file)
+            try:
+                return dvol_mod.update(conn, self.cfg)
+            finally:
+                conn.close()
+        try:
+            res = await asyncio.to_thread(run)
+        except Exception:
+            log.exception("DVOL: докачка не выполнена")
+            return
+        (log.warning if res.errors or res.stale else log.info)("%s", res)
+        if res.stale:
+            await self.admin_alert("dvol_stale", f"DVOL Deribit устарел ({', '.join(res.stale)}): {res}. Перцентиль "
+                                                 f"IV30 — снова по своей короткой истории; проверьте DVOL_URL и доступ "
+                                                 f"к Deribit (python -m optbot.dvol --update).")
 
     async def _ping_health(self, ok: bool) -> None:
         """Внешний мониторинг: пинг после среза (сбой среза — /fail). Пинги пропали — сервис сообщит сам."""
@@ -2038,12 +2058,16 @@ class OptionsBot:
                     app.job_queue.run_daily(self._backup_job, time=dtime(h, m, tzinfo=timezone.utc), name="backup")
                     log.info("Резервная копия БД: ежедневно в %02d:%02d UTC в %s (хранить %d дн.)", h, m,
                              self.cfg.backup_dir_abs, self.cfg.backup_keep_days)
-                # HAR7: при старте (свечи и модель — сразу) и ежедневно; переоценка — раз в месяц
+                # HAR7 и HAR30: при старте (свечи и модели — сразу) и ежедневно; переоценка — раз в месяц
                 app.job_queue.run_once(self._vol_job, when=300, name="har_first")
                 app.job_queue.run_daily(self._vol_job, time=dtime(0, 50, tzinfo=timezone.utc), name="har")
                 if self.cfg.rf_url and self.cfg.paper.enabled:  # ставка для «сверх ставки» книги базиса
                     app.job_queue.run_once(self._rf_job, when=360, name="rf_first")
                     app.job_queue.run_daily(self._rf_job, time=dtime(14, 30, tzinfo=timezone.utc), name="rf")
+                if self.cfg.dvol_url and any(b in self.cfg.base_coins for b in dvol_mod.BASES):
+                    # история DVOL для перцентиля IV30 BTC/ETH: при старте и ежедневно
+                    app.job_queue.run_once(self._dvol_job, when=240, name="dvol_first")
+                    app.job_queue.run_daily(self._dvol_job, time=dtime(0, 35, tzinfo=timezone.utc), name="dvol")
                 if self.cfg.books_weekly_utc and self.cfg.paper.enabled:
                     d, h, m = self.cfg.books_weekly_utc
                     # PTB: 0 — воскресенье; у нас 0 — понедельник
@@ -2127,6 +2151,8 @@ def check_config(cfg: Settings) -> list[str]:
     if no_qty:  # лимит кол-ва на ордер обязателен для каждой монеты, иначе ордера без ограничения размера
         errors.append("Не задан лимит кол-ва на ордер: " + ", ".join(f"MAX_QTY_{c}" for c in no_qty)
                       + " (обязателен для каждой монеты из BASE_COINS)")
+    if cfg.dvol_url and not cfg.dvol_url.startswith("https://"):
+        errors.append("DVOL_URL: нужен https://-адрес (или пусто — перцентиль IV30 только по своей истории)")
     if cfg.rf_url and not cfg.rf_url.startswith("https://"):
         errors.append("RF_URL: нужен https://-адрес (или пусто — ставка только из config/basis.json)")
     if cfg.fng_url and not cfg.fng_url.startswith("https://"):

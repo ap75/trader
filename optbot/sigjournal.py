@@ -48,8 +48,12 @@ REGIMES = {"high": "IV высокая", "low": "IV низкая"}
 
 
 def cfg_version(cfg: Settings) -> tuple[str, str]:
-    """(хеш, JSON) порогов SIG_*: статистику можно разбить по версии настроек."""
-    raw = json.dumps({k: v for k, v in asdict(cfg.sig).items() if k not in SIG_LONG_FIELDS}, sort_keys=True)
+    """(хеш, JSON) порогов SIG_*: статистику можно разбить по версии настроек. DVOL_PCTL_ENABLED — только
+    включённый (выключенный не меняет прежнюю версию; включение — новая версия, --stats делит период)."""
+    d = {k: v for k, v in asdict(cfg.sig).items() if k not in SIG_LONG_FIELDS}
+    if not d.get("dvol_pctl_enabled"):
+        d.pop("dvol_pctl_enabled", None)
+    raw = json.dumps(d, sort_keys=True)
     return hashlib.sha1(raw.encode()).hexdigest()[:8], raw
 
 
@@ -173,7 +177,8 @@ class SignalJournal:
                                enough_history=m.enough_history, history_stale=m.history_stale,
                                trend=m.trend.direction, ema_gap_pct=m.trend.gap_pct, exp_iv=sig.exp_iv,
                                dte=sig.dte, straddle=sig.straddle, rv1=m.rv1, rv30=m.rv30, har7=m.har7,
-                               har_src=m.har_src,
+                               har_src=m.har_src, iv30=m.iv30, har30=m.har30, pctl_src=m.pctl_src,
+                               dvol_pctl=m.dvol_pctl, dvol_ratio=m.dvol_ratio,
                                # что выбрала бы версия «:har» (IV7/HAR7, те же пороги) — для сравнения в --stats
                                har_strategy=har_decision(m, self.cfg.sig) if m.horizon != "long" else None,
                                **(m.ctx.as_dict() if m.ctx else {}))  # рыночный фон — для разбивки итогов

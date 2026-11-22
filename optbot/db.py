@@ -534,6 +534,17 @@ MIGRATIONS: list[list[str]] = [
         )
         """,
     ],
+    # 13: DVOL Deribit (dvol.py) — история для перцентиля IV30 BTC/ETH, пока своей истории меньше года
+    [
+        """
+        CREATE TABLE dvol_h1 (
+            base  TEXT    NOT NULL,
+            ts    INTEGER NOT NULL,            -- начало часового бара, мс (значение известно с ts + 1 ч)
+            close REAL    NOT NULL,            -- DVOL в конце часа, доля годовых (0.45)
+            PRIMARY KEY (base, ts)
+        )
+        """,
+    ],
 ]
 
 _migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе
