@@ -5,7 +5,7 @@
 на слежение в сборщике (leg_marks каждые COLLECTOR_INTERVAL_MIN) до экспирации.
 
 Итог (задача бота с периодом сверки журнала JOURNAL_SYNC_MIN, по умолчанию час, и `--evaluate`): после экспирации по цене поставки (delivery_prices журнала сделок,
-±1 ч; нет — запрос market/new-delivery-price) — PnL выплаты на позицию по исполнимым ценам входа и по mid,
+journal.nearest_price: ±1 ч или 00:00 UTC дня экспирации; нет — запрос market/new-delivery-price) — PnL выплаты на позицию по исполнимым ценам входа и по mid,
 в долях риска R = PnL / макс. риск. По котировкам ног из leg_marks — худший промежуточный PnL при закрытии
 по исполнимой стороне (длинные — по bid, короткие — по ask) и по mark, и первый момент, когда исполнимый PnL
 достиг половины макс. прибыли (у стрэддла без потолка — половины риска). Комиссии не учитываются.
@@ -33,7 +33,7 @@ from .collector import track
 from .context import FNG_ORDER, FUNDING_ORDER, fng_bucket, funding_bucket
 from .config import SIG_LONG_FIELDS, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
-from .journal import Journal, load_delivery_prices, nearest_price, parse_period
+from .journal import Journal, load_delivery_prices, nearest_price, parse_period, price_window
 from .signals import STRATEGIES, Leg, Signal, payoff
 
 log = logging.getLogger("optbot.sigjournal")
@@ -234,8 +234,8 @@ class SignalJournal:
             if not due:
                 return res
             # только нужное окно цен, а не вся таблица
-            lo = min(x["expiry_ms"] for x in due) - HOUR_MS
-            hi = max(x["expiry_ms"] for x in due) + HOUR_MS
+            lo = min(price_window(x["expiry_ms"])[0] for x in due)
+            hi = max(price_window(x["expiry_ms"])[1] for x in due)
             prices = load_delivery_prices(conn, lo_ms=lo, hi_ms=hi)
             fetched: dict[str, bool] = {}   # актив -> запрос к бирже прошёл и вернул цены
             jr = Journal(self.cfg)

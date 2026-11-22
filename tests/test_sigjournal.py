@@ -830,3 +830,25 @@ def test_signals_stats_period_words_from_parse_period(b):
     tg = TG()
     run(b.cmd_signals_stats(tg.upd(VIEWER), tg.ctx("today")))
     assert "за сегодня" in tg.last()
+
+
+
+def test_evaluate_price_at_day_start(cfg, sig):
+    """Bybit new-delivery-price: deliveryTime — 00:00 UTC дня поставки, а не 08:00 (сверено на demo)."""
+    from optbot.fmt import DAY_MS
+    sj = SignalJournal(cfg)
+    sid = sj.record(sig, now_ms=NOW)
+    _set_price(cfg, 65000, t=EXP_MS // DAY_MS * DAY_MS)
+    _set_price(cfg, 1, t=EXP_MS // DAY_MS * DAY_MS - DAY_MS)           # прошлый день — не берётся
+    assert sj.evaluate(now_ms=EXP_MS + 3600_000).settled == 1
+    assert q(cfg, "SELECT delivery_price FROM signals WHERE id = ?", sid)[0]["delivery_price"] == 65000
+
+
+def test_nearest_price_rules():
+    from optbot.fmt import DAY_MS, HOUR_MS
+    from optbot.journal import nearest_price
+    t = 20 * DAY_MS + 8 * HOUR_MS
+    assert nearest_price([(t + 30 * 60_000, 2.0), (20 * DAY_MS, 1.0)], t) == 2.0    # ±1 ч — приоритет
+    assert nearest_price([(20 * DAY_MS, 1.0)], t) == 1.0                              # 00:00 того же дня
+    assert nearest_price([(20 * DAY_MS + 3 * HOUR_MS, 1.0)], t) is None              # не начало дня и не ±1 ч
+    assert nearest_price([(21 * DAY_MS, 1.0)], t) is None

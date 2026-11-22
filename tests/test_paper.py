@@ -996,3 +996,16 @@ def test_skips_excludes_reject_later_opened(make_client, pcfg, fake):
     pe.step(NOW + 1, {"BTC": {"short:bull_put:BTC:cost": s2}})
     assert pe.skips(0, NOW + 2)[1] == []                             # как в --stats: не отказ
     assert len(pe.skips(0, NOW + 1)[1]) == 1                         # в окне до открытия — ещё отказ
+
+
+
+def test_settlement_with_day_start_delivery_time(make_client, pcfg, fake):
+    set_chain(fake)
+    pe = eng(make_client, pcfg)
+    step(pe, NOW, bull_put(fake))
+    fake.delivery_px["BTC"] = [{"deliveryPrice": "61000", "deliveryTime": str(EXP_MS // DAY_MS * DAY_MS)}]
+    pe.step(EXP_MS + 3600_000, {})
+    t = trades(pcfg)[0]
+    assert t["close_reason"] == "expiry" and t["delivery_price"] == 61000
+    pe2 = eng(make_client, pcfg)                                      # второй раз — из БД (окно с начала дня)
+    assert pe2._delivery_price(db.connect(pcfg.db_file), "BTC", EXP_MS) == 61000

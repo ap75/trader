@@ -52,7 +52,7 @@ from .collector import track
 from .context import FNG_ORDER, FUNDING_ORDER, fng_bucket, funding_bucket
 from .config import PaperSettings, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
-from .journal import Journal, load_delivery_prices, nearest_price, parse_period
+from .journal import Journal, load_delivery_prices, nearest_price, parse_period, price_window
 from .signals import STRATEGIES, Leg, Signal, SignalEngine, option_fee, profile
 
 log = logging.getLogger("optbot.paper")
@@ -520,7 +520,7 @@ class PaperEngine:
 
     def _delivery_price(self, conn, base: str, expiry_ms: int) -> float | None:
         """Цена поставки: из БД, нет — из ответа биржи (один запрос на актив за шаг, ответ — для всех экспираций)."""
-        prices = load_delivery_prices(conn, base, expiry_ms - HOUR_MS, expiry_ms + HOUR_MS)
+        prices = load_delivery_prices(conn, base, *price_window(expiry_ms))
         px_ = nearest_price(prices.get(base, []), expiry_ms)
         if px_ is not None:
             return px_

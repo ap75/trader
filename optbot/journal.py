@@ -200,9 +200,19 @@ def load_delivery_prices(conn, base: str | None = None, lo_ms: int | None = None
 
 
 def nearest_price(prices: list[tuple[int, float]], t: int) -> float | None:
-    """Цена поставки ближайшая к t в пределах ±1 ч (одно правило для журнала сделок и журнала сигналов)."""
+    """Цена поставки для экспирации t (одно правило для журналов и книг): ближайшая в пределах ±1 ч, иначе — с
+    временем ровно 00:00 UTC дня экспирации. Bybit new-delivery-price отдаёт deliveryTime началом дня (сверено на
+    demo 2026-11-22: цена 22NOV26 — 1795305600000, поставка — 08:00), не временем поставки."""
     near = [(abs(dt - t), px) for dt, px in prices if abs(dt - t) <= HOUR_MS]
-    return min(near)[1] if near else None
+    if near:
+        return min(near)[1]
+    day = t // DAY_MS * DAY_MS
+    return next((px for dt, px in prices if dt == day), None)
+
+
+def price_window(t: int) -> tuple[int, int]:
+    """Окно delivery_time, в котором nearest_price ищет цену для экспирации t."""
+    return t // DAY_MS * DAY_MS - HOUR_MS, t + HOUR_MS
 
 
 class Journal:
@@ -513,7 +523,7 @@ class Journal:
         record_entry = {r["symbol"]: r["entry_price"] for r in dels if r["entry_price"]}
 
         def delivery_px(sym: str, t: int) -> float | None:
-            """Цена поставки: из записи о поставке, иначе из market/new-delivery-price (±1 ч)."""
+            """Цена поставки: из записи о поставке, иначе из market/new-delivery-price (nearest_price)."""
             if sym in record_px:
                 return record_px[sym]
             return nearest_price(prices.get(sym.split("-")[0], []), t)

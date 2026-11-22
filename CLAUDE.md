@@ -54,6 +54,7 @@ cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служ
 - retCode 10000/10016/10019 — состояние неизвестно (как сбой сети); после сбоя искать ордер по `orderLinkId`.
 - `execution/list`, `order/history`: окно времени ≤ 7 дней, пагинация `nextPageCursor`.
 - Цена поставки опционов — `/v5/market/new-delivery-price` (`/delivery-price` для опционов пуст).
+  `deliveryTime` там — **00:00 UTC дня поставки**, не 08:00 (`journal.nearest_price`: ±1 ч, иначе начало дня).
 - `asset/delivery-record`: окно ≤ 30 дней.
 - `execution/list`, `order/history` для option без `baseCoin` отдают все базовые активы (не только BTC).
 - `order/history` фильтрует окно startTime/endTime по **времени создания** ордера; по `orderId` — без окна.
