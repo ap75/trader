@@ -435,22 +435,7 @@ class PaperEngine:
 
     # ---------- отметка и выход ----------
     def _marks(self, conn, symbols: list[str], now_ms: int) -> dict[str, dict]:
-        """Котировки ног из одного среза — последнего, где есть все ноги, не старше MARK_MAX_AGE_MS (ноги из
-        разных срезов дали бы цены, которых вместе не было). Нет такого — {}."""
-        if not symbols:
-            return {}
-        rows = conn.execute(
-            f"SELECT symbol, ts, mark, bid, ask, underlying FROM leg_marks WHERE symbol IN "
-            f"({','.join('?' * len(symbols))}) AND ts >= ? AND ts <= ? ORDER BY ts",
-            (*symbols, now_ms - MARK_MAX_AGE_MS, now_ms)).fetchall()
-        by_ts: dict[int, dict[str, dict]] = {}
-        for r in rows:
-            by_ts.setdefault(r["ts"], {})[r["symbol"]] = dict(r)
-        need = set(symbols)
-        for ts in sorted(by_ts, reverse=True):
-            if need <= set(by_ts[ts]):
-                return by_ts[ts]
-        return {}
+        return leg_marks(conn, symbols, now_ms)
 
     def _exit_value(self, t, legs: list[dict], marks: dict[str, dict], live: list[dict]) -> tuple[float, float] | None:
         """(премия закрытия live-ног: + получено, комиссия) по исполнимой стороне; короткую не откупить — None."""
@@ -674,15 +659,7 @@ class PaperEngine:
         открылась, — не отказ."""
         conn = self._db()
         try:
-            out: dict[str, list[int]] = {}
-            for r in conn.execute("SELECT s.book, COUNT(*) n FROM paper_skips s WHERE s.code = 'cost' AND s.ts >= ? "
-                                  "AND s.ts < ? AND NOT EXISTS (SELECT 1 FROM paper_trades t WHERE t.book = s.book "
-                                  "AND t.expiry = s.expiry AND t.opened_ms < ?) GROUP BY s.book", (start_ms, end_ms, end_ms)):
-                out.setdefault(r["book"], [0, 0])[0] = r["n"]
-            for r in conn.execute("SELECT book, COUNT(*) n FROM paper_trades WHERE book LIKE ? AND opened_ms >= ? "
-                                  "AND opened_ms < ? GROUP BY book", ("%" + COST_SUFFIX, start_ms, end_ms)):
-                out.setdefault(r["book"], [0, 0])[1] = r["n"]
-            return {k: (v[0], v[1]) for k, v in out.items()}
+            return cost_rejects(conn, start_ms, end_ms)
         finally:
             conn.close()
 
@@ -690,9 +667,7 @@ class PaperEngine:
         """Короткий горизонт по шагам книг: {(short | short_har, актив): (шагов с собранным сигналом, шагов)}."""
         conn = self._db()
         try:
-            return {(r["kind"], r["base"]): (r["n"], r["steps"]) for r in conn.execute(
-                "SELECT kind, base, SUM(outcome = 'signal') n, COUNT(*) steps FROM paper_signals WHERE ts >= ? "
-                "AND ts < ? AND kind IN ('short', 'short_har') GROUP BY kind, base", (start_ms, end_ms))}
+            return signal_freq(conn, start_ms, end_ms)
         finally:
             conn.close()
 
@@ -705,6 +680,45 @@ class PaperEngine:
                 (start_ms, end_ms))]
         finally:
             conn.close()
+
+
+def cost_rejects(conn, start_ms: int, end_ms: int) -> dict[str, tuple[int, int]]:
+    """См. PaperEngine.cost_rejects — на открытом соединении."""
+    out: dict[str, list[int]] = {}
+    for r in conn.execute("SELECT s.book, COUNT(*) n FROM paper_skips s WHERE s.code = 'cost' AND s.ts >= ? "
+                          "AND s.ts < ? AND NOT EXISTS (SELECT 1 FROM paper_trades t WHERE t.book = s.book "
+                          "AND t.expiry = s.expiry AND t.opened_ms < ?) GROUP BY s.book", (start_ms, end_ms, end_ms)):
+        out.setdefault(r["book"], [0, 0])[0] = r["n"]
+    for r in conn.execute("SELECT book, COUNT(*) n FROM paper_trades WHERE book LIKE ? AND opened_ms >= ? "
+                          "AND opened_ms < ? GROUP BY book", ("%" + COST_SUFFIX, start_ms, end_ms)):
+        out.setdefault(r["book"], [0, 0])[1] = r["n"]
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def signal_freq(conn, start_ms: int, end_ms: int) -> dict[tuple[str, str], tuple[int, int]]:
+    """См. PaperEngine.signal_freq — на открытом соединении."""
+    return {(r["kind"], r["base"]): (r["n"], r["steps"]) for r in conn.execute(
+        "SELECT kind, base, SUM(outcome = 'signal') n, COUNT(*) steps FROM paper_signals WHERE ts >= ? "
+        "AND ts < ? AND kind IN ('short', 'short_har') GROUP BY kind, base", (start_ms, end_ms))}
+
+
+def leg_marks(conn, symbols: list[str], now_ms: int) -> dict[str, dict]:
+    """Котировки ног из одного среза — последнего, где есть все ноги, не старше MARK_MAX_AGE_MS (ноги из
+    разных срезов дали бы цены, которых вместе не было). Нет такого — {}."""
+    if not symbols:
+        return {}
+    rows = conn.execute(
+        f"SELECT symbol, ts, mark, bid, ask, iv, underlying FROM leg_marks WHERE symbol IN "
+        f"({','.join('?' * len(symbols))}) AND ts >= ? AND ts <= ? ORDER BY ts",
+        (*symbols, now_ms - MARK_MAX_AGE_MS, now_ms)).fetchall()
+    by_ts: dict[int, dict[str, dict]] = {}
+    for r in rows:
+        by_ts.setdefault(r["ts"], {})[r["symbol"]] = dict(r)
+    need = set(symbols)
+    for ts in sorted(by_ts, reverse=True):
+        if need <= set(by_ts[ts]):
+            return by_ts[ts]
+    return {}
 
 
 DELIVERY_FEE_TOL_PCT = 5   # расхождение комиссии поставки с формулой больше — сообщить

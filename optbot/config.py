@@ -62,6 +62,27 @@ def _parse_hhmm(x: str) -> tuple[int, int] | None:
     return (int(h), int(m)) if ok else None
 
 
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _weekly(name: str, default: str) -> tuple[int, int, int] | None:
+    """«ДЕНЬ ЧЧ:ММ» UTC (mon … sun) -> (день недели 0–6, ч, мин); off — выключено; неверное — по умолчанию."""
+    v = (os.getenv(name) or "").strip().lower()
+    if v in ("off", "no", "false", "0", "-"):
+        return None
+
+    def parse(x: str):
+        d, _, t = x.partition(" ")
+        hm = _parse_hhmm(t.strip())
+        return (WEEKDAYS.index(d), *hm) if d in WEEKDAYS and hm else None
+    got = parse(v or default)
+    if got is None:
+        logging.getLogger("optbot.config").warning("%s=%r: нужно «ДЕНЬ ЧЧ:ММ» (mon…sun, UTC) или off — использую %s",
+                                                   name, v, default)
+        got = parse(default)
+    return got
+
+
 def _hhmm(name: str, default: str) -> tuple[int, int] | None:
     """Время суток UTC «ЧЧ:ММ»; off/no/false/0 — выключено (None); неверное — по умолчанию с предупреждением."""
     v = (os.getenv(name) or "").strip().lower()
@@ -207,6 +228,10 @@ class PaperSettings:
     calendar_take_pct: float = _float_in("PAPER_CALENDAR_TAKE_PCT", 35, 1, 500)  # прибыль ≥ % дебета
     im_short_pct: float = _float_in("PAPER_IM_SHORT_PCT", 10, 0, 100)          # IM короткой: mark + max(N%·S − OTM,
     im_min_pct: float = _float_in("PAPER_IM_MIN_PCT", 5, 0, 100)               #                     M%·S)
+    # условный капитал системы книг (RV, HAR, с фильтром и без — у каждой свой): % в /books и /stress
+    capital_usdt: float = _float_in("PAPER_CAPITAL_USDT", 10000, 1, 1e9)
+    # /stress, сценарии падения с ростом IV: у путов IV растёт во столько раз сильнее, чем у коллов (перекос)
+    stress_put_iv_mult: float = _float_in("STRESS_PUT_IV_MULT", 1.5, 1, 5)
 
 
 @dataclass(frozen=True)
@@ -302,6 +327,8 @@ class Settings:
     tg_admin_ids: set[int] = field(default_factory=lambda: _ids("TELEGRAM_ADMIN_IDS"))
     # Автосигналы администраторам в личку (в группы не идут); без TELEGRAM_ADMIN_IDS — не работают
     auto_signals_daily_utc: tuple[int, int] | None = _hhmm("AUTO_SIGNALS_DAILY_UTC", "09:05")  # сводка; None — нет
+    # еженедельный отчёт книг (/books 7d и /stress) в группы и трейдерам: «ДЕНЬ ЧЧ:ММ» UTC; off — нет
+    books_weekly_utc: tuple[int, int, int] | None = _weekly("BOOKS_WEEKLY_UTC", "mon 09:15")
     # сообщение о смене рекомендации по активу — не чаще раза в N часов; 0 — не присылать
     auto_signals_change_hours: float = _float_in("AUTO_SIGNALS_CHANGE_HOURS", 4, 0, 168)
     # срочные администратору (доступ к бирже, лимиты, сделки вне бота): одно и то же — не чаще раза в N минут

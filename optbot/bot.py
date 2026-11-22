@@ -84,6 +84,7 @@ from .collector import Collector, seconds_to_next_slot
 from . import backup as backup_mod
 from . import paper as paper_mod
 from . import vol as vol_mod
+from . import reports
 from .paper import PaperEngine
 from .perpbook import PerpBook
 from .linkid import parse_link_id
@@ -91,7 +92,7 @@ from .journal import Journal, fmt_report, parse_period
 from .multileg import MultiLegExecutor, SymbolGuard, fmt_result, leg_side, precheck, quote_mid
 from .signals import STRATEGIES, Signal, SignalEngine, fmt_signal, fmt_signal_brief, signal_key, strategy_name
 from .sigjournal import SETTLED_PER_MESSAGE, SignalJournal, compute_stats, fmt_settled, fmt_stats
-from .config import ROOT, Settings, settings
+from .config import ROOT, WEEKDAYS, Settings, settings
 from .ws import ExecutionWatcher
 from .fmt import (
     chunks, env_banner, fmt_amend_preview, fmt_balance, fmt_chain, fmt_expiries, fmt_greeks, fmt_order_preview, fmt_orders,
@@ -143,6 +144,8 @@ HELP = """Просмотр:
 /t SYMBOL — котировка и греки
 /signals [BASE] — сигнал: стратегия, ноги, риск (кнопка «Выставить» — трейдеру)
 /signals_stats [BASE] [ПЕРИОД] [csv] — как сработали сигналы (по умолчанию 30d)
+/books [short|long] [BASE] [ПЕРИОД] [csv] — бумажные книги: PnL, R, просадка, Шарп (30d)
+/stress — бумажные книги: BTC ±10/±20%, IV +20/+50, совмещённые, греки
 /bal /greeks [BASE] — счёт*
 /pos [BASE] — позиции (кнопки «Закрыть»)*
 /orders [BASE] — ордера (кнопки «Изменить», «Отменить»)*
@@ -665,6 +668,64 @@ class OptionsBot:
                                            w.can_trade and not w.is_group, rows)
             name = self._csv_name(f"signals-{self.cfg.env}-{(base or 'all').lower()}", label)
             await update.effective_chat.send_document(document=data, filename=name)
+
+    @guarded("view")
+    async def cmd_books(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
+        """/books [short|long] [BASE] [ПЕРИОД] [csv] — итоги бумажных книг (E3)."""
+        horizon = base = None
+        period, want_csv = [], False
+        usage = "Формат: /books [short|long] [BASE] [ПЕРИОД] [csv], например /books short BTC 30d"
+        for a in context.args:
+            al = a.lower()
+            if al == "csv" and not want_csv:
+                want_csv = True
+            elif al in ("short", "long") and horizon is None:
+                horizon = al
+            elif a.upper() in self.cfg.base_coins and base is None:
+                base = a.upper()
+            elif not period and self._is_period(a):
+                period = [a]
+            else:
+                raise ValueError(usage)
+        start, end, label = parse_period(period or ["30d"])
+        rep = await asyncio.to_thread(reports.books_report, start, end, label, self.cfg, horizon, base)
+        filt = "".join(f" · {x}" for x in (horizon, base) if x)
+        for part in reports.split_text(f"{env_banner(self.cfg.env)}\n\n{reports.fmt_books(rep, self.cfg, filt)}"):
+            await self.reply(update, part)
+        if want_csv:
+            name = self._csv_name(f"books-{self.cfg.env}" + "".join(f"-{x.lower()}" for x in (horizon, base) if x), label)
+            await update.effective_chat.send_document(document=reports.books_csv(rep), filename=name)
+
+    @guarded("view")
+    async def cmd_stress(self, update: Update, context: ContextTypes.DEFAULT_TYPE, w: Who):
+        """/stress — сценарии BTC ±10/±20% (ETH, SOL — по бете), IV +20/+50, совмещённые и греки открытых бумажных
+        позиций."""
+        st = await asyncio.to_thread(reports.stress, self.cfg)
+        for part in reports.split_text(f"{env_banner(self.cfg.env)}\n\n{reports.fmt_stress(st, self.cfg)}"):
+            await self.reply(update, part)
+
+    def books_weekly_text(self, now_ms: int | None = None) -> list[str]:
+        """Еженедельный отчёт: книги за 7 дн. и стресс -> части сообщения (без <pre>)."""
+        start, end, label = parse_period(["7d"], now_ms)
+        rep = reports.books_report(start, end, label, self.cfg)
+        st = reports.stress(self.cfg, now_ms)
+        # первая строка — худший совмещённый сценарий по каждой системе
+        text = (f"{reports.worst_combined(st, self.cfg)}\n{env_banner(self.cfg.env)}\nЕженедельный отчёт бумажных "
+                f"книг\n\n{reports.fmt_books(rep, self.cfg)}\n\n{reports.fmt_stress(st, self.cfg)}")
+        return reports.split_text(text)
+
+    async def _books_weekly_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            parts = await asyncio.to_thread(self.books_weekly_text)
+            if not self._targets():
+                log.info("Еженедельный отчёт книг: получателей нет")
+                return
+            sent = 0
+            for p in parts:
+                sent = max(sent, await self._broadcast(pre(p), "еженедельного отчёта книг"))
+            log.info("Еженедельный отчёт книг: %d сообщ., доставлено в %d чат(ов)", len(parts), sent)
+        except Exception:
+            log.exception("Еженедельный отчёт книг не отправлен")
 
     async def _sigeval_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Итоги сигналов после экспирации; о посчитанных — сводка в группы (и трейдерам в личку)."""
@@ -1886,6 +1947,8 @@ class OptionsBot:
         ("t", "cmd_ticker", "котировка инструмента"),
         ("signals", "cmd_signals", "сигнал: стратегия и риск"),
         ("signals_stats", "cmd_signals_stats", "статистика сигналов"),
+        ("books", "cmd_books", "бумажные книги: итоги"),
+        ("stress", "cmd_stress", "бумажные книги: стресс и греки"),
         ("bal", "cmd_bal", "баланс"),
         ("pos", "cmd_pos", "позиции"),
         ("orders", "cmd_orders", "открытые ордера"),
@@ -1951,6 +2014,12 @@ class OptionsBot:
                 # HAR7: при старте (свечи и модель — сразу) и ежедневно; переоценка — раз в месяц
                 app.job_queue.run_once(self._vol_job, when=300, name="har_first")
                 app.job_queue.run_daily(self._vol_job, time=dtime(0, 50, tzinfo=timezone.utc), name="har")
+                if self.cfg.books_weekly_utc and self.cfg.paper.enabled:
+                    d, h, m = self.cfg.books_weekly_utc
+                    # PTB: 0 — воскресенье; у нас 0 — понедельник
+                    app.job_queue.run_daily(self._books_weekly_job, time=dtime(h, m, tzinfo=timezone.utc),
+                                            days=((d + 1) % 7,), name="books_weekly")
+                    log.info("Отчёт книг: еженедельно, %s %02d:%02d UTC", WEEKDAYS[d], h, m)
             if self.cfg.journal_enabled:
                 # при старте (догрузить пропущенное, пока бот был выключен) и далее по расписанию
                 app.job_queue.run_repeating(self._sync_job, interval=self.cfg.journal_sync_min * 60, first=10,
