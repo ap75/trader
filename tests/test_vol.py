@@ -332,3 +332,34 @@ def test_system_risk_long_in_both_systems():
     assert paper.system_risk(rows, "short:x:SOL:har") == 500        # HAR + длинный
     assert paper.system_risk(rows, "long:x:SOL") == 600             # длинный — худшая из двух систем, не сумма
     assert paper.system_risk(rows, "short:x:SOL:cost") == 50
+
+
+def test_update_candles_continues_past_gap(cfg, make_client, fake, monkeypatch):
+    """Пропуск свечей внутри истории (короткая страница у Bybit) — не начало: докачка идёт до пустой страницы."""
+    _history(fake, days=100)
+    rows = fake.klines[("BTCUSDT", "60")]
+    gap = {r[0] for r in rows[1500:1530]}                       # 30 часов без свечей в середине
+    c = make_client(cfg)
+    real = c.perp_klines
+
+    def windowed(base, iv, end, limit=1000):                    # как Bybit: окно — limit интервалов до end
+        return [x for x in real(base, iv, end, limit) if x[0] > end - limit * HOUR_MS and str(x[0]) not in gap]
+    monkeypatch.setattr(c, "perp_klines", windowed)
+    conn = db.connect(cfg.db_file)
+    vol.update_candles(conn, c, "BTC", NOW)
+    assert len(vol.load_candles(conn, "BTC")) == 100 * 24 - 30
+    conn.close()
+
+
+def test_refit_fits_stored_history_when_download_fails(cfg, make_client, fake, monkeypatch):
+    _history(fake, "BTC", days=500)
+    c = make_client(cfg)
+    conn = db.connect(cfg.db_file)
+    vol.update_candles(conn, c, "BTC", NOW)
+    conn.close()
+
+    def boom(*a, **k):
+        raise RuntimeError("10016: svc error: Get kline failed")
+    monkeypatch.setattr(c, "perp_klines", boom)
+    res = vol.VolModels(cfg).refit(c, ["BTC"], NOW)
+    assert [m.base for m in res.fitted] == ["BTC"] and any("не докачаны" in e for e in res.errors)

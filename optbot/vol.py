@@ -184,13 +184,15 @@ def update_candles(conn, client, base: str, now_ms: int | None = None) -> int:
             oldest = min(t for t, _ in page)
             if stop is not None and oldest <= stop:
                 return False
-            if oldest > end or len(page) < KLINE_PAGE:   # неполная страница — дальше истории нет
+            if oldest > end:                             # биржа отдала не то окно — не зацикливаться
                 return True
+            # неполная страница — не начало истории: у Bybit окно без startTime — limit интервалов до end, и
+            # пропуск свечей внутри истории даёт короткую страницу; начало — только пустая страница
             end = oldest - 1
         log.warning("HAR: %s — свечи докачаны не полностью (больше %d страниц)", base, MAX_PAGES)
         return False
 
-    done_key = f"perp_h1_complete:{base}"
+    done_key = f"perp_h1_complete2:{base}"   # 2: прежний признак ставился и на пропуске внутри истории
     if last is not None:
         page_back(now_ms, last)             # новые — до последней сохранённой
     if conn.execute("SELECT 1 FROM bot_state WHERE key = ?", (done_key,)).fetchone() is None:
@@ -300,7 +302,11 @@ class VolModels:
             for base in bases or self.cfg.base_coins:
                 base = base.upper()
                 try:
-                    res.candles += update_candles(conn, client, base, now_ms)
+                    try:  # сбой докачки (10016 у биржи) — оценка по уже сохранённой истории; докачка — в следующий раз
+                        res.candles += update_candles(conn, client, base, now_ms)
+                    except Exception as e:
+                        log.warning("HAR: %s — свечи не докачаны: %s", base, e)
+                        res.errors.append(f"{base}: свечи не докачаны — {e}")
                     cur = model_at(conn, base)
                     if not force and cur is not None and cur.fitted_ms >= month_start(now_ms):
                         continue
