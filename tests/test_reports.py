@@ -278,6 +278,9 @@ def test_bot_books_stress_and_weekly(rcfg, make_client, monkeypatch):
     assert "Стресс открытых" in tg.last()
     parts = bot.books_weekly_text(NOW)
     assert parts[0].startswith("Худший совмещённый сценарий") and "Еженедельный отчёт" in parts[0] and "Стресс открытых" in "\n".join(parts)
+    line = next(x for x in parts[0].splitlines() if x.startswith("Без ответа бэктеста"))
+    assert "Бычий пут-спред (кредит): за период 1 сд., PnL +12.50" in line and "всего 1 сд." in line
+    assert "книг в плюсе 1 из 1" in line and "1 из 50" in line and "стрэддл" not in line
     got = []
     monkeypatch.setattr(bot, "_broadcast", AsyncMock(side_effect=lambda msg, what: got.append(msg) or 2))
     monkeypatch.setattr(bot, "books_weekly_text", lambda: ["a", "b"])
@@ -363,3 +366,16 @@ def test_worst_line_mentions_perp_and_unpriced():
     assert "перпетуалы -900 (-9.0%, BTC +20% & IV +10)" in line and "без оценки 1 сд." in line
     assert reports.leg_iv_shift("P", -0.03, 0.2, 1.5) == pytest.approx(0.3)
     assert reports.leg_iv_shift("P", 0.03, 0.2, 1.5) == 0.2 and reports.leg_iv_shift("C", -0.1, 0.2, 1.5) == 0.2
+
+
+def test_watch_line_counts_period_total_and_books(rcfg):
+    conn = conn_of(rcfg)
+    add_trade(conn, "short:bull_put:BTC", [], status="closed", closed_ms=NOW - DAY_MS, pnl=10.0, r_mult=0.1)
+    add_trade(conn, "short:bull_put:BTC", [], status="closed", closed_ms=NOW - 20 * DAY_MS, pnl=-30.0, r_mult=-0.3)
+    add_trade(conn, "long:bull_put:ETH:cost", [], status="closed", closed_ms=NOW - 2 * DAY_MS, pnl=5.0, r_mult=0.05)
+    add_trade(conn, "short:iron_condor:BTC", [], status="closed", closed_ms=NOW - DAY_MS, pnl=99.0, r_mult=1.0)
+    add_trade(conn, "short:bull_put:SOL", [], status="open")
+    line = reports.watch_line(NOW - 7 * DAY_MS, NOW, rcfg, conn)
+    conn.close()
+    assert "за период 2 сд., PnL +15.00; всего 3 сд., PnL -15.00, ΣR -0.15" in line
+    assert "книг в плюсе 1 из 2" in line and "больше всего сделок в книге 2 из 50" in line and "+99" not in line

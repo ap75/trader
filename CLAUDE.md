@@ -104,6 +104,8 @@ IV30 / k против DVOL за `SIG_LOOKBACK_DAYS`, k — медиана IV30/D
 `basis_events`, `basis_equity`; шаг — после перпетуалов; только бумага; SOL — «наблюдение» (вне Σ). Ставка «сверх
 ставки» — FRED DTB3 раз в сутки (`rates.py`, `RF_URL`, `bot_state` `rf:DTB3`; в тестах `RF_URL` пуст).
 Отчёты E3 (`reports.py`): `/books` (метрики книг и систем по `book_equity`/`perp_equity`), `/stress` (Black-76 по IV и
-underlying ног из `leg_marks`, бета ETH/SOL к BTC — по `perp_h1`), еженедельно `BOOKS_WEEKLY_UTC`; % — от `PAPER_CAPITAL_USDT`.
+underlying ног из `leg_marks`, бета ETH/SOL к BTC — по `perp_h1`), еженедельно `BOOKS_WEEKLY_UTC`; % — от `PAPER_CAPITAL_USDT`;
+в еженедельном — строка `watch_line` (bull put: без ответа бэктеста research 8; сделок против 50 к пересмотру 15.01.2027).
+Режим поддержки (2026-11-26): новые сигналы и стратегии не добавлять, E2 отложено — см. PLAN.md «Итоги research этапов 6–8».
 Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

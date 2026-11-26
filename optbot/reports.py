@@ -29,6 +29,7 @@ from .paper import (all_books, cost_rejects, fmt_rejects, fmt_versions, in_syste
                     is_har_book,
                     leg_marks, signal_freq, summarize)
 from .perpbook import corr, daily_pnl
+from .signals import STRATEGIES
 
 log = logging.getLogger("optbot.reports")
 YEAR_MS = 365 * DAY_MS
@@ -643,6 +644,38 @@ def fmt_basis(rows: list[dict], label: str, p=None) -> str:
     if any(r["days"] and r["days"] < 30 for r in rows):
         lines.append(" годовых за короткий срок — грубая оценка (research: BTC/ETH ≈ +3…5% сверх ставки)")
     return "\n".join(lines)
+
+
+WATCH_STRATEGIES = ("bull_put",)   # research этап 8: знак меняется с моделью IV — бэктест ответа не дал
+REVIEW_MIN_TRADES = 50              # январский пересмотр (PLAN.md): книга в плюсе после издержек при ≥ 50 сделках
+
+
+def watch_line(start_ms: int, end_ms: int, cfg: Settings = settings, conn=None) -> str:
+    """Строка еженедельного отчёта по стратегиям без ответа бэктеста: закрытые за период и всего, сколько книг в
+    плюсе и наибольшее число сделок в книге против REVIEW_MIN_TRADES."""
+    own = conn is None
+    conn = conn or db.connect(cfg.db_file)
+    try:
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT book, strategy, pnl, r_mult, closed_ms FROM paper_trades WHERE status = 'closed' AND "
+            f"strategy IN ({','.join('?' * len(WATCH_STRATEGIES))}) AND closed_ms < ?", (*WATCH_STRATEGIES, end_ms))]
+    finally:
+        if own:
+            conn.close()
+    cells = []
+    for s in WATCH_STRATEGIES:
+        part = [r for r in rows if r["strategy"] == s]
+        week = [r for r in part if r["closed_ms"] >= start_ms]
+        by_book: dict[str, list[dict]] = {}
+        for r in part:
+            by_book.setdefault(r["book"], []).append(r)
+        pos = sum(1 for v in by_book.values() if sum(x["pnl"] or 0 for x in v) > 0)
+        most = max((len(v) for v in by_book.values()), default=0)
+        cells.append(f"{STRATEGIES.get(s, s)}: за период {len(week)} сд., PnL {sum(r['pnl'] or 0 for r in week):+.2f}; "
+                     f"всего {len(part)} сд., PnL {sum(r['pnl'] or 0 for r in part):+.2f}, "
+                     f"ΣR {sum(r['r_mult'] or 0 for r in part):+.2f}; книг в плюсе {pos} из {len(by_book)}, "
+                     f"больше всего сделок в книге {most} из {REVIEW_MIN_TRADES}")
+    return "Без ответа бэктеста (research этап 8): " + "; ".join(cells)
 
 
 def fmt_books(r: BooksReport, cfg: Settings = settings, filt: str = "") -> str:

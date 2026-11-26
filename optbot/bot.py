@@ -714,8 +714,10 @@ class OptionsBot:
         rep = reports.books_report(start, end, label, self.cfg)
         st = reports.stress(self.cfg, now_ms)
         # первая строка — худший совмещённый сценарий по каждой системе
+        # отдельная строка — стратегии, на которые бэктест ответа не дал (research этап 8)
         text = (f"{reports.worst_combined(st, self.cfg)}\n{env_banner(self.cfg.env)}\nЕженедельный отчёт бумажных "
-                f"книг\n\n{reports.fmt_books(rep, self.cfg)}\n\n{reports.fmt_stress(st, self.cfg)}")
+                f"книг\n{reports.watch_line(start, end, self.cfg)}\n\n{reports.fmt_books(rep, self.cfg)}\n\n"
+                f"{reports.fmt_stress(st, self.cfg)}")
         return reports.split_text(text)
 
     async def _books_weekly_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
