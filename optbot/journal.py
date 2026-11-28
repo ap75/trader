@@ -225,7 +225,7 @@ class Journal:
 
     @contextmanager
     def _db(self, timeout: float = 30) -> Iterator[sqlite3.Connection]:
-        conn = db.connect(self.cfg.db_file, timeout=timeout)
+        conn = db.account(self.cfg, timeout)
         try:
             with conn:
                 yield conn
@@ -263,7 +263,7 @@ class Journal:
         if self.enabled:
             try:
                 with self._db(timeout=2) as c:
-                    c.execute("BEGIN IMMEDIATE")
+                    db.begin_write(c)
                     n = c.execute("SELECT COUNT(*) FROM order_links WHERE signal_id = ? AND leg = ?",
                                   (signal_id, leg)).fetchone()[0] + 1
                     link = signal_link_id(signal_id, leg, tag, n)

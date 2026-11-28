@@ -2,11 +2,12 @@
 при работающем боте, вместе с WAL), проверка копии (PRAGMA quick_check), сжатие gzip (BACKUP_COMPRESS, файл
 .db.gz — восстановить: gunzip), хранение BACKUP_KEEP_DAYS дней.
 
-Бот делает копию раз в сутки в BACKUP_DAILY_UTC; вручную: python -m optbot.backup.
+Бот делает копии БД счёта и рыночной раз в сутки в BACKUP_DAILY_UTC; вручную: python -m optbot.backup (обе).
 Копия лежит на том же сервере (BACKUP_DIR) — забирать на свой компьютер (rsync/scp по расписанию, deploy/README.md).
 """
 from __future__ import annotations
 
+import calendar
 import contextlib
 import glob
 import gzip
@@ -23,17 +24,19 @@ from .config import Settings, settings
 log = logging.getLogger("optbot.backup")
 
 
-def backup(cfg: Settings, now: float | None = None) -> str:
-    """Копия БД -> путь к файлу. Ошибка проверки копии — исключение (испорченная копия удаляется)."""
+def backup(cfg: Settings, now: float | None = None, path: str | None = None) -> str:
+    """Копия БД (path; по умолчанию — БД счёта) -> путь к файлу. Ошибка проверки копии — исключение (испорченная
+    копия удаляется). Имя копии — по имени файла БД: account-demo-…, market-…"""
     now = now if now is not None else time.time()
+    path = path or cfg.db_file
     os.makedirs(cfg.backup_dir_abs, exist_ok=True)
-    name = os.path.splitext(os.path.basename(cfg.db_file))[0]
+    name = os.path.splitext(os.path.basename(path))[0]
     dst = os.path.join(cfg.backup_dir_abs, f"{name}-{time.strftime('%Y%m%d-%H%M', time.gmtime(now))}.db")
-    if not os.path.isfile(cfg.db_file):  # не плодить пустые «копии» (и не вытеснять ими настоящие)
-        raise FileNotFoundError(f"нет базы {cfg.db_file}")
+    if not os.path.isfile(path):  # не плодить пустые «копии» (и не вытеснять ими настоящие)
+        raise FileNotFoundError(f"нет базы {path}")
     tmp = f"{dst}.{os.getpid()}.part"  # своё имя: ручной запуск и задача бота в одну минуту не мешают друг другу
     try:
-        src = sqlite3.connect(pathlib.Path(os.path.abspath(cfg.db_file)).as_uri() + "?mode=ro", uri=True,
+        src = sqlite3.connect(pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro", uri=True,
                               timeout=30)
         try:
             out = sqlite3.connect(tmp)
@@ -64,16 +67,36 @@ def backup(cfg: Settings, now: float | None = None) -> str:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(f)
     try:  # копия уже готова: сбой чистки — не «копия не сделана»
-        prune(cfg, now)
+        prune(cfg, now, path)
     except OSError as e:
         log.warning("Резервные копии: старые не удалены — %s", e)
     return dst
 
 
-def prune(cfg: Settings, now: float | None = None) -> list[str]:
-    """Удалить копии старше BACKUP_KEEP_DAYS (по времени изменения файла); последнюю — никогда."""
+def recent(cfg: Settings, path: str, max_age_s: float, now: float | None = None) -> tuple[str, float] | None:
+    """Копия БД path моложе max_age_s и по времени в имени, и по времени файла -> (файл, возраст, с) | None
+    (рыночную БД делят экземпляры — копирует первый за сутки; старая копия, возвращённая на место, — не свежая)."""
     now = now if now is not None else time.time()
-    name = os.path.splitext(os.path.basename(cfg.db_file))[0]
+    name = os.path.splitext(os.path.basename(path))[0]
+    best = None
+    for pat in ("db", "db.gz"):
+        for f in glob.glob(os.path.join(cfg.backup_dir_abs, f"{name}-[0-9]*.{pat}")):
+            stamp = os.path.basename(f)[len(name) + 1:].split(".")[0]
+            try:
+                made = calendar.timegm(time.strptime(stamp, "%Y%m%d-%H%M"))
+                age = now - max(made, 0)
+                if now - os.path.getmtime(f) < max_age_s and 0 <= age < max_age_s and (best is None or age < best[1]):
+                    best = (f, age)
+            except (OSError, ValueError):   # нечитаемый файл копии — не свежая копия: лучше сделать новую
+                pass
+    return best
+
+
+def prune(cfg: Settings, now: float | None = None, path: str | None = None) -> list[str]:
+    """Удалить копии БД path (по умолчанию — счёта) старше BACKUP_KEEP_DAYS (по времени изменения файла); последнюю
+    — никогда."""
+    now = now if now is not None else time.time()
+    name = os.path.splitext(os.path.basename(path or cfg.db_file))[0]
     def mtime(f):  # параллельный запуск мог уже удалить или переименовать файл
         try:
             return os.path.getmtime(f)
@@ -96,13 +119,16 @@ def prune(cfg: Settings, now: float | None = None) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-    try:
-        path = backup(settings)
-    except Exception as e:
-        print(f"Копия не сделана: {e}", file=sys.stderr)
-        return 1
-    print(f"{path} ({os.path.getsize(path) / 1e6:.1f} МБ)")
-    return 0
+    rc = 0
+    for src in (settings.db_file, settings.market_db_file):
+        try:
+            path = backup(settings, path=src)
+        except Exception as e:
+            print(f"Копия {src} не сделана: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"{path} ({os.path.getsize(path) / 1e6:.1f} МБ)")
+    return rc
 
 
 if __name__ == "__main__":

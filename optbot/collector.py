@@ -138,7 +138,7 @@ class Collector:
         bases = list(self.cfg.base_coins)
         with ThreadPoolExecutor(max_workers=len(bases) or 1) as pool:
             fetched = list(pool.map(self._fetch, bases))
-        conn = db.connect(self.cfg.db_file)
+        conn = db.market(self.cfg)
         try:
             tracked = {r["symbol"] for r in conn.execute(
                 "SELECT symbol FROM tracked_symbols WHERE until_ms > ?", (now_ms,))}
@@ -194,7 +194,7 @@ class Collector:
             return 0
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         try:
-            conn = db.connect(self.cfg.db_file)
+            conn = db.market(self.cfg)
             try:
                 last = conn.execute("SELECT MAX(ts) FROM fear_greed").fetchone()[0]
             finally:
@@ -217,7 +217,7 @@ class Collector:
                 log.warning("Сборщик: индекс страха и жадности — %s", type(e).__name__)
                 return 0
         try:
-            conn = db.connect(self.cfg.db_file)
+            conn = db.market(self.cfg)
             try:
                 with conn:
                     cur = conn.executemany("INSERT OR IGNORE INTO fear_greed (ts, value, label) VALUES (?,?,?)",
@@ -328,7 +328,9 @@ class Collector:
 
 def track(conn: sqlite3.Connection, symbols: list[str], until_ms: int, reason: str = "",
           now_ms: int | None = None) -> None:
-    """Поставить ноги на слежение в открытой транзакции (журнал сигналов пишет сигнал и слежение вместе)."""
+    """Поставить ноги на слежение в открытой транзакции (журнал сигналов пишет сигнал и слежение вместе). Таблица —
+    в рыночной БД: в транзакции БД счёта — последней записью (порядок — db.account); атомарность записи в две БД —
+    в каждой по отдельности."""
     conn.executemany(
         "INSERT INTO tracked_symbols (symbol, added_ms, until_ms, reason) VALUES (?,?,?,?) "
         "ON CONFLICT(symbol) DO UPDATE SET until_ms = MAX(until_ms, excluded.until_ms), "
@@ -336,8 +338,32 @@ def track(conn: sqlite3.Connection, symbols: list[str], until_ms: int, reason: s
         [(s, now_ms if now_ms is not None else int(time.time() * 1000), until_ms, reason) for s in symbols])
 
 
-def stats(path: str) -> str:
-    conn = db.connect(path)
+def retrack(conn: sqlite3.Connection, items, now_ms: int) -> int:
+    """Восстановить слежение открытых сделок и сигналов: [(символы, до, причина)] -> сколько символов не было на
+    слежении. Запись сделки (БД счёта) и слежения (рыночная) атомарны каждая отдельно — сбой между ними оставил бы
+    ноги без котировок; повтор безопасен (слежение не сокращается). Своей транзакцией — только рыночная БД."""
+    want = [(s, until, reason) for syms, until, reason in items if until > now_ms for s in syms]
+    if not want:
+        return 0
+    have = {r[0]: r[1] for r in conn.execute("SELECT symbol, until_ms FROM tracked_symbols WHERE until_ms > ?",
+                                             (now_ms,))}
+    missing = [(s, u, r) for s, u, r in want if have.get(s, 0) < u]
+    if missing:
+        with conn:
+            for s, u, r in missing:
+                track(conn, [s], u, r, now_ms)
+        log.warning("Слежение восстановлено: %s", ", ".join(sorted({s for s, _, _ in missing})))
+    return len(missing)
+
+
+def track_reason(cfg: Settings, kind: str, ident) -> str:
+    """Причина слежения (справочно, на работу не влияет): таблица общая для экземпляров, id записей уникальны только
+    в своей БД — с окружением; несколько экземпляров одного окружения — имя экземпляра (этап 2, BOT_INSTANCE)."""
+    return f"{cfg.env}:{kind}:{ident}"
+
+
+def stats(cfg: Settings) -> str:
+    conn = db.market(cfg)
     try:
         lines = []
         for r in conn.execute(
@@ -374,12 +400,12 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--stats", action="store_true", help="что накоплено")
     a = ap.parse_args(argv)
     if a.stats:
-        print(stats(settings.db_file))
+        print(stats(settings))
         return 0
     col = Collector(OptionsClient(), settings)  # settings — текущий (подменяемый) объект модуля
     res = col.collect()
     res.fng = col.update_fear_greed()
-    print(f"[{settings.env}] {settings.db_file}: {res}")
+    print(f"[{settings.env}] {settings.market_db_file}: {res}")
     return 1 if res.errors and not res.snapshots else 0
 
 

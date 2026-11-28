@@ -29,7 +29,7 @@ import time
 from dataclasses import asdict, dataclass, field
 
 from . import db
-from .collector import track
+from .collector import retrack, track, track_reason
 from .context import FNG_ORDER, FUNDING_ORDER, fng_bucket, funding_bucket
 from .config import SIG_LONG_FIELDS, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
@@ -142,7 +142,7 @@ class SignalJournal:
         self.cfg_hash, self.cfg_json = cfg_version(cfg)  # пороги неизменны на время жизни объекта
 
     def _db(self, timeout: float = 30):
-        return db.connect(self.cfg.db_file, timeout)
+        return db.account(self.cfg, timeout)
 
     # ---------- запись ----------
     def record(self, sig: Signal, source: str = "bot", user_id: int | None = None, user_name: str = "",
@@ -164,7 +164,7 @@ class SignalJournal:
                 return self._attach(sig, row)
             with conn:
                 # блокировка записи ДО поиска: бот и `cli signals` одновременно не вставят одну сделку дважды
-                conn.execute("BEGIN IMMEDIATE")
+                db.begin_write(conn)
                 row, fresh = self._open_and_seen(conn, sig, viewer, now_ms)
                 if row:
                     if not fresh:
@@ -192,8 +192,9 @@ class SignalJournal:
                      _inf_none(p.max_profit), _inf_none(p.max_loss), _json(p.breakevens), sig.forward, sig.em,
                      _json(metrics), "; ".join(sig.reasons), h, raw, source, user_id, user_name, chat_id))
                 sid = cur.lastrowid
-                track(conn, [l.symbol for l in sig.legs], sig.expiry_ms, f"sig:{sid}", now_ms)
                 self._viewed(conn, sid, viewer, now_ms)
+                track(conn, [l.symbol for l in sig.legs], sig.expiry_ms, track_reason(self.cfg, "sig", sid),
+                      now_ms)  # рыночная — последней
                 sig.id, sig.journal_first_ms, sig.journal_net = sid, None, None
                 return sid
         finally:
@@ -237,6 +238,13 @@ class SignalJournal:
             return res
         conn = self._db()
         try:
+            try:   # ноги открытых сигналов — на слежении (сбой между записью сигнала и слежения)
+                retrack(conn, [([d["symbol"] for d in json.loads(r["legs"])], r["expiry_ms"],
+                                 track_reason(self.cfg, "sig", r["id"]))
+                               for r in conn.execute("SELECT id, legs, expiry_ms FROM signals WHERE settled_ms IS NULL "
+                                                     "AND expiry_ms > ?", (now_ms,))], now_ms)
+            except Exception as e:
+                log.warning("Сигналы: слежение не проверено — %s", e)
             due = conn.execute("SELECT * FROM signals WHERE settled_ms IS NULL AND expiry_ms <= ? ORDER BY id",
                                (now_ms - SETTLE_GRACE_MS,)).fetchall()
             if not due:

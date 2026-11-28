@@ -111,7 +111,7 @@ def _history(fake, base="BTC", days=500, now=NOW):
 def test_update_candles_pages_back_and_increments(cfg, make_client, fake):
     _history(fake, days=100)
     c = make_client(cfg)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     n = vol.update_candles(conn, c, "BTC", NOW)
     assert n == 100 * 24                                           # незакрытая (последняя) не пишется
     pages = sum(1 for x in fake.calls if x[0] == "get_kline")
@@ -143,7 +143,7 @@ def test_refit_monthly_drift_and_fallback(cfg, make_client, fake):
     assert vm.refit(c, ["BTC"], NOW + DAY_MS).fitted == []        # тот же месяц — не переоценивает
     assert vm.refit(c, ["BTC"], NOW + DAY_MS, force=True).fitted
     assert vm.refit(c, ["BTC"], NOW + 20 * DAY_MS).fitted          # новый месяц (декабрь)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     assert vol.model_at(conn, "BTC", NOW - 1) is None and vol.model_at(conn, "BTC", NOW).fitted_ms == NOW
     conn.close()
 
@@ -191,7 +191,7 @@ def test_journal_records_har_and_retro(cfg, make_client, market):
     sj = SignalJournal(cfg)
     sig = SignalEngine(make_client(cfg), cfg).compute("BTC", NOW)
     sid = sj.record(sig, now_ms=NOW)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     met = json.loads(conn.execute("SELECT metrics FROM signals WHERE id = ?", (sid,)).fetchone()["metrics"])
     assert met["har7"] == pytest.approx(sig.metrics.har7) and met["har_strategy"] == "iron_condor"
     # второй сигнал — «старый», без HAR7 в metrics: итог есть, считается задним числом по perp_h1
@@ -252,7 +252,7 @@ def test_paper_har_books(make_client, cfg, tmp_path, market):
     assert paper.version_name("short:iron_condor:BTC:har:cost") == "HAR, с фильтром издержек"
     pe = paper.PaperEngine(make_client(pcfg), pcfg)
     pe.step(NOW)
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     books = {r["book"] for r in conn.execute("SELECT book FROM paper_trades")}
     kinds = {r["kind"] for r in conn.execute("SELECT kind FROM paper_signals")}
     met = json.loads(conn.execute("SELECT metrics FROM paper_trades WHERE book = 'short:iron_condor:BTC:har'")
@@ -301,7 +301,7 @@ def test_bot_vol_job_alerts_on_drift(monkeypatch):
 def test_update_candles_resumes_after_failure(cfg, make_client, fake, monkeypatch):
     _history(fake, days=100)
     c = make_client(cfg)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     real = c.perp_klines
     calls = []
 
@@ -350,7 +350,7 @@ def test_update_candles_continues_past_gap(cfg, make_client, fake, monkeypatch):
     def windowed(base, iv, end, limit=1000):                    # как Bybit: окно — limit интервалов до end
         return [x for x in real(base, iv, end, limit) if x[0] > end - limit * HOUR_MS and str(x[0]) not in gap]
     monkeypatch.setattr(c, "perp_klines", windowed)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     vol.update_candles(conn, c, "BTC", NOW)
     assert len(vol.load_candles(conn, "BTC")) == 100 * 24 - 30
     conn.close()
@@ -359,7 +359,7 @@ def test_update_candles_continues_past_gap(cfg, make_client, fake, monkeypatch):
 def test_refit_fits_stored_history_when_download_fails(cfg, make_client, fake, monkeypatch):
     _history(fake, "BTC", days=500)
     c = make_client(cfg)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     vol.update_candles(conn, c, "BTC", NOW)
     conn.close()
 
@@ -416,7 +416,7 @@ def test_har30_books_system_and_versions(make_client, cfg, tmp_path, long_market
     assert "long:calendar:BTC:har30" not in ids
     pe = paper.PaperEngine(make_client(pcfg), pcfg)
     pe.step(NOW)
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     books = {r["book"] for r in conn.execute("SELECT book FROM paper_trades")}
     kinds = {(r["kind"], r["base"]) for r in conn.execute("SELECT kind, base FROM paper_signals")}
     met = json.loads(conn.execute("SELECT metrics FROM paper_trades WHERE book = 'long:iron_condor:BTC:har30'")

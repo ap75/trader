@@ -23,7 +23,7 @@ def run(coro):
 
 
 def q(cfg, sql, *a):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     try:
         return [dict(r) for r in conn.execute(sql, a)]
     finally:

@@ -7,8 +7,9 @@ import os
 import tempfile
 
 os.environ.update(
-    # своя временная БД: тест не может записать подставные данные в настоящую data/market-<env>.db
-    DB_PATH=os.path.join(tempfile.mkdtemp(prefix="optbot-test-"), "market.db"),
+    # свои временные БД: тест не может записать подставные данные в настоящие data/account-<env>.db, data/market.db
+    DB_PATH=os.path.join(_tmp := tempfile.mkdtemp(prefix="optbot-test-"), "account.db"),
+    MARKET_DB_PATH=os.path.join(_tmp, "market.db"),
     COLLECTOR_ENABLED="true", COLLECTOR_INTERVAL_MIN="15",
     BYBIT_ENV="demo", BYBIT_API_KEY="test-key", BYBIT_API_SECRET="test-secret",
     SETTLE_COIN="USDT", BASE_COINS="BTC,ETH,SOL",
@@ -39,8 +40,18 @@ from tests.fakes import FakeHTTP  # noqa: E402
 
 @pytest.fixture
 def cfg(tmp_path) -> Settings:
-    # своя БД на тест: журнал и сборщик не делят данные между тестами
-    return dataclasses.replace(Settings(), db_path=str(tmp_path / "market.db"))
+    # свои БД на тест: журнал и сборщик не делят данные между тестами
+    return dataclasses.replace(Settings(), db_path=str(tmp_path / "account.db"),
+                               market_db_path=str(tmp_path / "market.db"))
+
+
+@pytest.fixture
+def clock_before_expiry(monkeypatch):
+    """Часы — в fakes.NOW (до подставной экспирации) и идут дальше: тестам, которые считают по текущему времени,
+    не мешает то, что настоящая дата уже прошла экспирацию EXP."""
+    from tests.fakes import NOW
+    t0 = time.monotonic()
+    monkeypatch.setattr(time, "time", lambda: NOW / 1000 + time.monotonic() - t0)
 
 
 @pytest.fixture
@@ -60,6 +71,14 @@ def make_client(fake):
 @pytest.fixture
 def client(make_client, cfg) -> OptionsClient:
     return make_client(cfg)
+
+
+@pytest.fixture(autouse=True)
+def no_real_legacy_db(monkeypatch):
+    """Старая общая БД на месте по умолчанию (data/ проекта) — в тестах несуществующая: локальная
+    data/market-<env>.db не должна влиять на тесты."""
+    monkeypatch.setattr(Settings, "default_legacy_file",
+                        property(lambda self: os.path.join(os.path.dirname(self.db_file), "no-such", "market.db")))
 
 
 @pytest.fixture(autouse=True)

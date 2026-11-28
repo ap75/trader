@@ -168,7 +168,7 @@ class BasisBook:
             log.error("Базис: %s — книга выключена", self.p_error)
 
     def _db(self):
-        return db.connect(self.cfg.db_file)
+        return db.account(self.cfg)
 
     def bases(self) -> list[str]:
         if not self.p:
@@ -232,7 +232,7 @@ class BasisBook:
         fund_ts = {t for t, _ in funding}
         events, msgs = [], []
         with conn:
-            conn.execute("BEGIN IMMEDIATE")          # ручной --step одновременно с ботом — состояние под блокировкой
+            db.begin_write(conn)          # ручной --step одновременно с ботом — состояние под блокировкой
             book = conn.execute("SELECT * FROM basis_books WHERE id = ?", (bid,)).fetchone()
             if book is None:  # новая книга: вход — по open следующей свечи
                 conn.execute("INSERT INTO basis_books (id, base, capital, cash, qty, s_in, p_in, last_bar_ms, "
@@ -363,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.rf:
         from . import rates
-        conn = db.connect(settings.db_file)
+        conn = db.market(settings)
         try:
             res = rates.update(conn, settings)
         finally:

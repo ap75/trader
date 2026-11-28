@@ -22,7 +22,7 @@ H = 3_600_000
 
 
 def q(cfg, sql, *a):
-    conn = db.connect(cfg.db_file)  # со схемой: запрос может идти раньше первой записи журнала
+    conn = db.account(cfg)  # со схемой: запрос может идти раньше первой записи журнала
     try:
         return [dict(r) for r in conn.execute(sql, a)]
     finally:
@@ -350,7 +350,7 @@ def test_sync_job_reports_missed_only_after_first_run(b, fake):
     fake.add_exec(BTC_PUT, exec_id="hist")
     run(b._sync_job(NS()))                          # первая выгрузка — история, без уведомлений
     assert not [t for k, t, _ in tg.out if k == "send"]
-    with db.connect(b.journal.cfg.db_file) as c:  # первая сверка была час назад
+    with db.account(b.journal.cfg) as c:  # первая сверка была час назад
         c.execute("UPDATE sync_state SET last_ms = last_ms - 3600000 WHERE stream = 'executions:history_until'")
     fake.add_exec(BTC_PUT, side="Sell", qty="0.02", price="120", exec_id="missed",
                   t=int(time.time() * 1000) - 5 * 60_000)
@@ -530,9 +530,9 @@ def test_csv_source_cli(j):
 def test_register_uses_short_timeout(j, cfg, monkeypatch):
     seen = []
     real = db.connect
-    monkeypatch.setattr(db, "connect", lambda path, timeout=30: seen.append(timeout) or real(path, timeout))
+    monkeypatch.setattr(db, "connect", lambda path, timeout=30, **kw: seen.append(timeout) or real(path, timeout, **kw))
     j.register_order(TRADER, "x")
-    assert seen == [2]
+    assert seen and set(seen) == {2}            # БД счёта и подключаемая рыночная
 
 
 def test_delivery_exec_of_position_older_than_history_no_fake_profit(j):
@@ -593,8 +593,8 @@ def test_intrinsic_rejects_nonstandard_symbol():
 def test_describe_many_one_query(j, cfg, monkeypatch):
     a, b_ = j.register_order(TRADER, "Павел"), j.register_order(11, "Наталья")
     opened = []
-    real = db.connect
-    monkeypatch.setattr(db, "connect", lambda *x, **kw: opened.append(1) or real(*x, **kw))
+    real = db.account
+    monkeypatch.setattr(db, "account", lambda *x, **kw: opened.append(1) or real(*x, **kw))
     out = j.describe_many([a, b_, a, "web-123", None])
     assert len(opened) == 1
     assert out[a] == "через бота · Павел" and out[b_] == "через бота · Наталья"
@@ -674,7 +674,7 @@ def test_sync_job_summary_not_lost_if_undelivered(b, fake, monkeypatch):
     tg = TG()
     b._app = NS(bot=tg.bot)
     run(b._sync_job(NS()))
-    with db.connect(b.journal.cfg.db_file) as c:
+    with db.account(b.journal.cfg) as c:
         c.execute("UPDATE sync_state SET last_ms = last_ms - 3600000 WHERE stream = 'executions:history_until'")
     fake.add_exec(BTC_PUT, exec_id="missed", t=int(time.time() * 1000) - 5 * 60_000)
 
@@ -691,7 +691,7 @@ def test_sync_job_summary_not_lost_if_undelivered(b, fake, monkeypatch):
 def test_sync_job_summary_error_keeps_unnotified(b, fake, monkeypatch):
     b._app = NS(bot=TG().bot)
     run(b._sync_job(NS()))
-    with db.connect(b.journal.cfg.db_file) as c:
+    with db.account(b.journal.cfg) as c:
         c.execute("UPDATE sync_state SET last_ms = last_ms - 3600000 WHERE stream = 'executions:history_until'")
     fake.add_exec(BTC_PUT, exec_id="missed", t=int(time.time() * 1000) - 5 * 60_000)
     monkeypatch.setattr(b.journal, "describe_many", lambda ids: 1 / 0)

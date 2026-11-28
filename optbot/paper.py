@@ -5,7 +5,7 @@
 BASE_COINS).
 
 Шаг (`PaperEngine.step`, после каждого среза сборщика и `--step`):
-1. Отметка открытых сделок по `leg_marks` (ноги на слежении у сборщика, reason `book:<id>`) и правила выхода:
+1. Отметка открытых сделок по `leg_marks` (ноги на слежении у сборщика, reason `<env>:book:<id>`) и правила выхода:
    - прибыль ≥ PAPER_TAKE_PCT % макс. прибыли (у стрэддла — % риска), стоп: убыток ≥ PAPER_STOP_PCT % риска;
    - за PAPER_EXIT_DAYS_SHORT / _LONG дн. до экспирации (0 — держать до экспирации);
    - календарь: за PAPER_CALENDAR_EXIT_H ч до ближней экспирации, прибыль ≥ PAPER_CALENDAR_TAKE_PCT % дебета,
@@ -52,7 +52,7 @@ from decimal import ROUND_FLOOR, Decimal
 
 from . import db
 from .bybit_client import OptionsClient, option_intrinsic, parse_option_symbol
-from .collector import track
+from .collector import retrack, track, track_reason
 from .context import FNG_ORDER, FUNDING_ORDER, fng_bucket, funding_bucket
 from .config import PaperSettings, Settings, settings
 from .fmt import DAY_MS, HOUR_MS, csv_safe, utc
@@ -223,7 +223,7 @@ class PaperEngine:
         self._lock = threading.Lock()  # бот и ручной шаг в одном процессе не идут одновременно
 
     def _db(self):
-        return db.connect(self.cfg.db_file)
+        return db.account(self.cfg)
 
     # ---------- шаг ----------
     def step(self, now_ms: int | None = None, signals: dict[str, dict[str, Signal]] | None = None) -> StepResult:
@@ -238,6 +238,7 @@ class PaperEngine:
             self._px_cache: dict[str, list[tuple[int, float]] | None] = {}  # актив -> ответ биржи за этот шаг
             try:
                 self._ensure_books(conn, now_ms)
+                self._retrack(conn, now_ms)
                 self._exits(conn, now_ms, res)
                 self._settle(conn, now_ms, res)
                 if signals is None:
@@ -255,6 +256,19 @@ class PaperEngine:
             finally:
                 conn.close()
         return res
+
+    def _retrack(self, conn, now_ms: int) -> None:
+        """Ноги открытых сделок — на слежении (сбой между записью сделки и слежения); сбой — только лог."""
+        try:
+            items = []
+            for r in conn.execute("SELECT id, legs FROM paper_trades WHERE status = 'open'"):
+                legs = json.loads(r["legs"])
+                for exp_ms in {l["expiry_ms"] for l in legs}:
+                    items.append(([l["symbol"] for l in legs if l["expiry_ms"] == exp_ms], exp_ms,
+                                  track_reason(self.cfg, "book", r["id"])))
+            retrack(conn, items, now_ms)
+        except Exception as e:
+            log.warning("Бумажные книги: слежение не проверено — %s", e)
 
     def _ensure_books(self, conn, now_ms: int) -> None:
         with conn:
@@ -438,7 +452,7 @@ class PaperEngine:
         over, tid = None, None
         with conn:
             # ручной --step одновременно с ботом: та же сделка и суммарный риск — проверка под блокировкой записи
-            conn.execute("BEGIN IMMEDIATE")
+            db.begin_write(conn)
             if conn.execute("SELECT 1 FROM paper_trades WHERE book = ? AND expiry = ? LIMIT 1",
                             (bid, expiry)).fetchone():
                 return
@@ -467,7 +481,8 @@ class PaperEngine:
                      sig.cost_pct))
                 tid = cur.lastrowid
                 for exp_ms in {l["expiry_ms"] for l in legs}:
-                    track(conn, [l["symbol"] for l in legs if l["expiry_ms"] == exp_ms], exp_ms, f"book:{tid}", now_ms)
+                    track(conn, [l["symbol"] for l in legs if l["expiry_ms"] == exp_ms], exp_ms,
+                          track_reason(self.cfg, "book", tid), now_ms)
         if over:
             self._skip(conn, bid, expiry, "total_risk", over, now_ms, res)
             return
@@ -1074,7 +1089,7 @@ def main(argv: list[str] | None = None) -> int:
         print(fmt_skips(*eng.skips(start, end), label))
         return 0
     if a.check_delivery_fees:
-        conn = db.connect(settings.db_file)
+        conn = db.account(settings)
         try:
             got = check_delivery_fees(settings, conn, mark=False)
         finally:

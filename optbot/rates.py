@@ -1,6 +1,6 @@
 """Безрисковая ставка для «сверх ставки» книги базиса: векселя США 3 мес. (FRED DTB3, CSV без ключа).
 
-Бот берёт ставку раз в сутки (`RF_URL`, пусто — не брать) и хранит последнее значение в `bot_state`. Не удалось —
+Бот берёт ставку раз в сутки (`RF_URL`, пусто — не брать) и хранит последнее значение в `market_state` (рыночная БД). Не удалось —
 остаётся последнее известное; значение старше 7 дней (по дате наблюдения) — предупреждение администратору. Действует
 более свежая (по дате наблюдения) из FRED и `rf_annual`/`rf_date` в config/basis.json — запасное значение можно
 обновить вручную.
@@ -78,14 +78,14 @@ def _config_rate() -> Rate:
 
 
 def current(conn) -> Rate:
-    """Последняя известная ставка — более свежая по дате наблюдения из FRED (bot_state) и config/basis.json
+    """Последняя известная ставка — более свежая по дате наблюдения из FRED (market_state) и config/basis.json
     (администратор вписал новую ставку при недоступном FRED — она и действует)."""
     try:
         cfg_rate = _config_rate()
     except Exception as e:      # config/basis.json испорчен — без запасного значения
         log.warning("Ставка: config/basis.json не прочитан (%s)", e)
         cfg_rate = None
-    row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (STATE_KEY,)).fetchone()
+    row = conn.execute("SELECT value FROM market_state WHERE key = ?", (STATE_KEY,)).fetchone()
     if row:
         try:
             v = json.loads(row["value"])
@@ -117,7 +117,7 @@ def update(conn, cfg: Settings = settings, now_ms: int | None = None, fetcher=fe
         try:
             d, v = fetcher(cfg.rf_url, now_ms)
             with conn:
-                conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)",
+                conn.execute("INSERT OR REPLACE INTO market_state (key, value) VALUES (?, ?)",
                              (STATE_KEY, json.dumps({"rate": v, "date_ms": d, "fetched_ms": now_ms})))
         except Exception as e:
             err = f"{type(e).__name__}: {e}"

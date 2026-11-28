@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--update", action="store_true", help="докачать часовые бары DVOL (BTC, ETH)")
     g.add_argument("--show", action="store_true", help="что накоплено и последнее значение")
     a = ap.parse_args(argv)
-    conn = db.connect(settings.db_file)
+    conn = db.market(settings)
     try:
         if a.update:
             res = update(conn, settings)

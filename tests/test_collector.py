@@ -23,11 +23,11 @@ NOW = EXP_MS - 10 * 86_400_000 + 7 * 60_000  # за 10 дней до экспи�
 
 @pytest.fixture
 def cfg_db(cfg, tmp_path):
-    return with_cfg(cfg, db_path=str(tmp_path / "market.db"))
+    return with_cfg(cfg, db_path=str(tmp_path / "account.db"), market_db_path=str(tmp_path / "market.db"))
 
 
 def q(cfg, sql, *a):
-    conn = sqlite3.connect(cfg.db_path)
+    conn = sqlite3.connect(cfg.market_db_file)
     conn.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in conn.execute(sql, a)]
@@ -159,8 +159,8 @@ def test_collect_without_perp(make_client, cfg_db, fake):
 
 
 def test_tracked_legs(make_client, cfg_db):
-    track_symbols(cfg_db.db_path, [BTC_PUT], until_ms=EXP_MS, reason="sig1")
-    track_symbols(cfg_db.db_path, [BTC_PUT], until_ms=EXP_MS - 1)   # не сокращает слежение
+    track_symbols(cfg_db, [BTC_PUT], until_ms=EXP_MS, reason="sig1")
+    track_symbols(cfg_db, [BTC_PUT], until_ms=EXP_MS - 1)   # не сокращает слежение
     res = Collector(make_client(cfg_db), cfg_db).collect(NOW)
     assert res.legs == 1
     leg = q(cfg_db, "SELECT * FROM leg_marks")[0]
@@ -170,9 +170,9 @@ def test_tracked_legs(make_client, cfg_db):
 
 
 def test_stats(make_client, cfg_db):
-    assert "данных нет" in stats(cfg_db.db_path)
+    assert "данных нет" in stats(cfg_db)
     Collector(make_client(cfg_db), cfg_db).collect(NOW)
-    assert "BTC: срезов 1" in stats(cfg_db.db_path)
+    assert "BTC: срезов 1" in stats(cfg_db)
 
 
 def test_cli_once_and_stats(monkeypatch, make_client, cfg_db, capsys):
@@ -185,18 +185,21 @@ def test_cli_once_and_stats(monkeypatch, make_client, cfg_db, capsys):
 
 # ---------- база ----------
 def test_migrations_idempotent(tmp_path):
-    p = str(tmp_path / "x" / "m.db")
-    db.connect(p).close()
-    conn = db.connect(p)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(db.MIGRATIONS)
-    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-    conn.close()
+    for role in (db.ACCOUNT, db.MARKET):
+        p = str(tmp_path / "x" / f"{role}.db")
+        db.connect(p, role=role).close()
+        conn = db.connect(p, role=role)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.LEGACY_VERSION + len(db.ROLE_MIGRATIONS[role])
+        assert conn.execute("PRAGMA application_id").fetchone()[0] == db.APP_ID[role]
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        conn.close()
 
 
 def test_newer_schema_rejected(tmp_path):
     p = str(tmp_path / "m.db")
     conn = sqlite3.connect(p)
-    conn.execute(f"PRAGMA user_version={len(db.MIGRATIONS) + 1}")
+    conn.execute(f"PRAGMA application_id={db.APP_ID[db.ACCOUNT]}")
+    conn.execute(f"PRAGMA user_version={db.LEGACY_VERSION + len(db.ACCOUNT_MIGRATIONS) + 1}")
     conn.close()
     with pytest.raises(RuntimeError, match="новее кода"):
         db.connect(p)
@@ -204,7 +207,8 @@ def test_newer_schema_rejected(tmp_path):
 
 def test_migration_statements_have_no_semicolons():
     # операторы выполняются по одному через execute — «;» внутри (даже в комментарии) разорвал бы схему
-    assert all(";" not in st for m in db.MIGRATIONS for st in m)
+    assert all(";" not in st for ms in (db.MIGRATIONS, db.MARKET_MIGRATIONS, db.ACCOUNT_MIGRATIONS)
+               for m in ms for st in m)
 
 
 def test_concurrent_first_open(tmp_path):
@@ -223,13 +227,15 @@ def test_concurrent_first_open(tmp_path):
 
 
 def test_failed_migration_rolls_back(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS + [["CREATE TABLE t (x)", "CREATE TABLE t (x)"]])
+    monkeypatch.setitem(db.ROLE_MIGRATIONS, db.ACCOUNT,
+                        db.ACCOUNT_MIGRATIONS + [["CREATE TABLE t (x)", "CREATE TABLE t (x)"]])
     p = str(tmp_path / "m.db")
     with pytest.raises(sqlite3.OperationalError):
         db.connect(p)
     conn = sqlite3.connect(p)
     # все миграции — одна транзакция: при сбое схема откатывается целиком, без полуприменённых таблиц
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert conn.execute("PRAGMA application_id").fetchone()[0] == 0
     assert not conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     conn.close()
 
@@ -252,20 +258,27 @@ def test_minutes_divisor_env(monkeypatch, raw, out):
 
 def test_db_file_per_env_and_from_project_root(cfg, tmp_path):
     from optbot.config import ROOT
-    assert with_cfg(cfg, db_path="").db_file == os.path.join(ROOT, "data", "market-demo.db")
-    assert not cfg.db_file.startswith(ROOT)            # тесты никогда не пишут в настоящую БД проекта
-    assert with_cfg(cfg, env="mainnet", db_path="").db_file.endswith("market-mainnet.db")  # от итогового env
+    assert with_cfg(cfg, db_path="").db_file == os.path.join(ROOT, "data", "account-demo.db")
+    assert not cfg.db_file.startswith(ROOT)            # тесты никогда не пишут в настоящие БД проекта
+    assert not cfg.market_db_file.startswith(ROOT)
+    assert with_cfg(cfg, env="mainnet", db_path="").db_file.endswith("account-mainnet.db")  # от итогового env
+    assert with_cfg(cfg, market_db_path="").market_db_file == os.path.join(ROOT, "data", "market.db")
+    assert with_cfg(cfg, env="mainnet", market_db_path="").market_db_file == os.path.join(ROOT, "data", "market.db")
+    # у testnet свой рынок; имя не совпадает со старой общей market-testnet.db
+    tn = with_cfg(cfg, env="testnet", market_db_path="")
+    assert tn.market_db_file == os.path.join(ROOT, "data", "testnet-market.db") != tn.legacy_db_file
+    assert with_cfg(cfg, env="mainnet", db_path="").legacy_db_file == os.path.join(ROOT, "data", "market-mainnet.db")
     assert with_cfg(cfg, db_path="x/my.db").db_file == os.path.join(ROOT, "x", "my.db")
     assert with_cfg(cfg, db_path=str(tmp_path / "a.db")).db_file == str(tmp_path / "a.db")
 
 
 def test_db_recreated_if_deleted(tmp_path):
     p = str(tmp_path / "m.db")
-    db.connect(p).close()
+    db.connect(p, role=db.MARKET).close()
     for suffix in ("", "-wal", "-shm"):
         if os.path.exists(p + suffix):
             os.remove(p + suffix)
-    conn = db.connect(p)
+    conn = db.connect(p, role=db.MARKET)
     assert conn.execute("SELECT COUNT(*) FROM tracked_symbols").fetchone()[0] == 0
     conn.close()
 
@@ -285,16 +298,16 @@ def test_perp_unexpected_error_keeps_options(make_client, cfg_db, monkeypatch):
 
 
 def test_missing_tracked_legs_reported(make_client, cfg_db, caplog):
-    track_symbols(cfg_db.db_path, ["XRP-27NOV26-1-C-USDT"], until_ms=EXP_MS)
+    track_symbols(cfg_db, ["XRP-27NOV26-1-C-USDT"], until_ms=EXP_MS)
     res = Collector(make_client(cfg_db), cfg_db).collect(NOW)
     assert res.legs_missing == ["XRP-27NOV26-1-C-USDT"] and "нет котировок ног" in str(res)
 
 
 def test_track_reason_follows_longer_tracking(cfg_db):
-    track_symbols(cfg_db.db_path, [BTC_PUT], until_ms=100, reason="A")
-    track_symbols(cfg_db.db_path, [BTC_PUT], until_ms=50, reason="B")
+    track_symbols(cfg_db, [BTC_PUT], until_ms=100, reason="A")
+    track_symbols(cfg_db, [BTC_PUT], until_ms=50, reason="B")
     assert q(cfg_db, "SELECT reason FROM tracked_symbols")[0]["reason"] == "A"
-    track_symbols(cfg_db.db_path, [BTC_PUT], until_ms=200, reason="C")
+    track_symbols(cfg_db, [BTC_PUT], until_ms=200, reason="C")
     assert q(cfg_db, "SELECT reason, until_ms FROM tracked_symbols")[0] == {"reason": "C", "until_ms": 200}
 
 
@@ -359,7 +372,7 @@ def test_connect_closes_on_migration_failure(tmp_path, monkeypatch):
             self._c.close()
 
     monkeypatch.setattr(db.sqlite3, "connect", Conn)
-    monkeypatch.setattr(db, "migrate", lambda conn: 1 / 0)
+    monkeypatch.setattr(db, "migrate", lambda conn, *a: 1 / 0)
     with pytest.raises(ZeroDivisionError):
         db.connect(str(tmp_path / "m.db"))
     assert closed == [True]
@@ -368,7 +381,7 @@ def test_connect_closes_on_migration_failure(tmp_path, monkeypatch):
 def test_migration_checked_once_per_file(tmp_path, monkeypatch):
     calls = []
     real = db.migrate
-    monkeypatch.setattr(db, "migrate", lambda conn: calls.append(1) or real(conn))
+    monkeypatch.setattr(db, "migrate", lambda conn, *a: calls.append(1) or real(conn, *a))
     p = str(tmp_path / "m.db")
     db.connect(p).close()
     db.connect(p).close()
@@ -385,7 +398,7 @@ def test_bot_without_job_queue_still_starts(make_client, cfg_db, monkeypatch, ca
     assert "нет JobQueue" in caplog.text
 
 
-def test_bot_collect_job_survives_errors(make_client, cfg_db, caplog):
+def test_bot_collect_job_survives_errors(make_client, cfg_db, caplog, clock_before_expiry):
     b = OptionsBot(make_client(cfg_db), cfg_db)
     asyncio.run(b._collect_job(NS()))
     assert q(cfg_db, "SELECT COUNT(*) n FROM snapshots")[0]["n"] == 3
@@ -435,7 +448,7 @@ def test_bot_journal_disabled_no_signal_eval(make_client, cfg_db, monkeypatch):
 
 
 def test_store_failure_reports_legs_missing(make_client, cfg_db, monkeypatch):
-    track_symbols(cfg_db.db_path, [BTC_PUT], until_ms=EXP_MS)
+    track_symbols(cfg_db, [BTC_PUT], until_ms=EXP_MS)
     col = Collector(make_client(cfg_db), cfg_db)
     real = col._store_base
 

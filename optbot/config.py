@@ -279,11 +279,14 @@ class Settings:
     # Сборщик рыночных данных (этап 1): срез каждые N минут в SQLite
     collector_enabled: bool = _bool("COLLECTOR_ENABLED", True)
     collector_interval_min: int = _minutes_divisor("COLLECTOR_INTERVAL_MIN", 15)  # 0 — неверное значение
-    # Пусто — своя БД на окружение (data/market-<env>.db): данные testnet не смешиваются с mainnet/demo.
-    # Итоговый путь — свойство db_file (относительные пути — от корня проекта, а не от текущей папки).
+    # БД счёта и экземпляра бота; пусто — своя на окружение (data/account-<env>.db): данные testnet не смешиваются
+    # с mainnet/demo. Итоговый путь — свойство db_file (относительные пути — от корня проекта, а не от текущей папки).
     db_path: str = os.getenv("DB_PATH", "").strip()
+    # Рыночная БД (общая для экземпляров на одном сервере); пусто — data/market.db (demo торгует на рынке mainnet —
+    # данные одни), у testnet свой рынок — data/testnet-market.db. Свойство market_db_file.
+    market_db_path: str = os.getenv("MARKET_DB_PATH", "").strip()
 
-    # Журнал сделок (этап 2): ордера, исполнения, поставки — в той же БД
+    # Журнал сделок (этап 2): ордера, исполнения, поставки — в БД счёта (DB_PATH)
     journal_enabled: bool = _bool("JOURNAL_ENABLED", True)
     journal_sync_min: int = _int_in("JOURNAL_SYNC_MIN", 60, 5, 1440)        # сверка по REST
     journal_backfill_days: int = _int_in("JOURNAL_BACKFILL_DAYS", 30, 1, 730)  # глубина первой выгрузки
@@ -362,8 +365,24 @@ class Settings:
 
     @property
     def db_file(self) -> str:
-        path = self.db_path or os.path.join("data", f"market-{self.env}.db")
+        path = self.db_path or os.path.join("data", f"account-{self.env}.db")
         return path if os.path.isabs(path) else os.path.join(ROOT, path)
+
+    @property
+    def market_db_file(self) -> str:
+        path = self.market_db_path or os.path.join("data", "testnet-market.db" if self.env == "testnet" else "market.db")
+        return path if os.path.isabs(path) else os.path.join(ROOT, path)
+
+    @property
+    def legacy_db_file(self) -> str:
+        """Общая БД до разделения (рынок и счёт вместе; в папке БД счёта) — источник для python -m optbot.market --split."""
+        return os.path.join(os.path.dirname(self.db_file), f"market-{self.env}.db")
+
+    @property
+    def default_legacy_file(self) -> str:
+        """Общая БД на старом месте по умолчанию (data/). Не рядом с БД счёта — может быть чужой (другой экземпляр
+        того же окружения): только предупреждение при старте, разделять — лишь явным --from."""
+        return os.path.join(ROOT, "data", f"market-{self.env}.db")
 
     @property
     def backup_dir_abs(self) -> str:

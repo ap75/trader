@@ -825,7 +825,7 @@ class OptionsBot:
 
     def _state(self, key: str, value: str | None = None) -> str | None:
         """bot_state: чтение (value=None) или запись значения."""
-        conn = db.connect(self.cfg.db_file)
+        conn = db.account(self.cfg)
         try:
             with conn:
                 if value is not None:
@@ -1686,13 +1686,21 @@ class OptionsBot:
 
     # ---------- сборщик рыночных данных ----------
     async def _backup_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
-        """Ежедневная копия БД (sqlite backup API); сбой — срочно администратору."""
-        try:
-            path = await asyncio.to_thread(backup_mod.backup, self.cfg)
-            log.info("Резервная копия БД: %s", path)
-        except Exception as e:
-            log.exception("Резервная копия БД не сделана")
-            await self.admin_alert("backup", f"Резервная копия БД не сделана: {e}")
+        """Ежедневные копии БД счёта и рыночной (sqlite backup API); сбой — срочно администратору."""
+        for src in (self.cfg.db_file, self.cfg.market_db_file):
+            if src == self.cfg.market_db_file and (
+                    fresh := await asyncio.to_thread(backup_mod.recent, self.cfg, src, MARKET_BACKUP_SHARED_S)):
+                log.info("Резервная копия рыночной БД: есть свежая %s (%.1f ч, сделана другим экземпляром "
+                         "или вручную) — пропуск",
+                         fresh[0], fresh[1] / 3600)
+                continue
+            try:
+                path = await asyncio.to_thread(backup_mod.backup, self.cfg, None, src)
+                log.info("Резервная копия БД: %s", path)
+            except Exception as e:
+                log.exception("Резервная копия БД %s не сделана", src)
+                await self.admin_alert(f"backup:{os.path.basename(src)}",
+                                       f"Резервная копия БД {os.path.basename(src)} не сделана: {e}")
 
     async def _vol_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
         """HAR7 и HAR30: докачать часовые свечи; в новом месяце — переоценить; расхождение с эталоном — администратору."""
@@ -1709,7 +1717,7 @@ class OptionsBot:
     async def _rf_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
         """Ставка векселей (FRED DTB3) для книги базиса: раз в сутки; старше 7 дней — администратору."""
         def run():
-            conn = db.connect(self.cfg.db_file)
+            conn = db.market(self.cfg)
             try:
                 return rates.update(conn, self.cfg)
             finally:
@@ -1727,7 +1735,7 @@ class OptionsBot:
     async def _dvol_job(self, context: ContextTypes.DEFAULT_TYPE | None) -> None:
         """DVOL Deribit (перцентиль IV30 BTC/ETH): раз в сутки; последнее значение старше 3 дней — администратору."""
         def run():
-            conn = db.connect(self.cfg.db_file)
+            conn = db.market(self.cfg)
             try:
                 return dvol_mod.update(conn, self.cfg)
             finally:
@@ -1833,7 +1841,7 @@ class OptionsBot:
         """Новая поставка в деньгах в журнале — сверить формулу комиссии поставки бумажных книг (справки Bybit
         расходятся): администратору — первое совпадение и каждое расхождение."""
         def run():
-            conn = db.connect(self.cfg.db_file)
+            conn = db.account(self.cfg)
             try:
                 return paper_mod.check_delivery_fees(self.cfg, conn)
             finally:
@@ -2092,7 +2100,7 @@ class OptionsBot:
                 app.job_queue.run_repeating(self._collect_job, interval=self.cfg.collector_interval_min * 60,
                                             first=first, name="collector")
                 log.info("Сборщик: каждые %d мин, первый срез через %.0f с, БД %s",
-                         self.cfg.collector_interval_min, first, self.cfg.db_file)
+                         self.cfg.collector_interval_min, first, self.cfg.market_db_file)
 
         async def post_stop(app: Application):  # Telegram ещё доступен (post_shutdown — уже нет)
             undelivered = [x for t, x in self._alert_retries.items() if not t.done()]
@@ -2137,6 +2145,11 @@ def check_config(cfg: Settings) -> list[str]:
     errors = []
     if not cfg.tg_token:
         errors.append("TELEGRAM_BOT_TOKEN не задан")
+    if os.path.abspath(cfg.db_file) == os.path.abspath(cfg.market_db_file):
+        errors.append("DB_PATH и MARKET_DB_PATH — один файл: БД счёта и рыночная должны быть разными")
+    elif os.path.basename(cfg.db_file) == os.path.basename(cfg.market_db_file):
+        errors.append("DB_PATH и MARKET_DB_PATH — одно имя файла в разных папках: резервные копии по имени файла "
+                      "смешались бы — дайте разные имена")
     if not (cfg.tg_admin_ids or cfg.tg_trader_ids or cfg.tg_viewer_ids or
             (cfg.allow_all_group_members_view and cfg.tg_allowed_chat_ids)):
         errors.append("Никому нет доступа: заполните TELEGRAM_ADMIN_IDS / TELEGRAM_TRADER_IDS / TELEGRAM_VIEWER_IDS")
@@ -2167,6 +2180,12 @@ def check_config(cfg: Settings) -> list[str]:
 def config_warnings(cfg: Settings) -> list[str]:
     """Нефатальное: бот стартует, но часть функций не работает."""
     out = []
+    old = cfg.default_legacy_file
+    if os.path.exists(old) and os.path.abspath(old) not in (os.path.abspath(cfg.legacy_db_file),
+                                                            os.path.abspath(cfg.db_file)):
+        out.append(f"в {old} — старая общая БД (до разделения), не рядом с DB_PATH: если это данные этого экземпляра — "
+                   f"бот остановить, его новые пустые БД убрать, python -m optbot.market --split --from {old}; "
+                   f"если другого экземпляра — разделяет он")
     if not cfg.tg_admin_ids:
         out.append("TELEGRAM_ADMIN_IDS пуст — срочные уведомления (доступ к бирже, лимиты, сделки вне бота, "
                    "запуск и остановка), автосигналы и проверка комиссии поставки никому не отправляются")
@@ -2181,6 +2200,25 @@ def config_warnings(cfg: Settings) -> list[str]:
     return out
 
 
+EXIT_NO_DB = 3
+# копия общей рыночной моложе — уже сделал другой экземпляр в своё время копий (окно мало: ручная копия накануне
+# не отменяет ежедневную)
+MARKET_BACKUP_SHARED_S = 3 * 3600   # БД требует действий администратора (не разделена, чужая роль, схема новее кода): служба не
+                 # перезапускается по кругу (RestartPreventExitStatus); временный сбой (занята, диск) — код 1, перезапуск
+
+
+def check_db(cfg: Settings) -> tuple[int, str] | None:
+    """БД счёта и рыночная открываются (схема, роли; старая общая БД разделена) — None, иначе (код выхода, текст):
+    без БД бот работал бы, а журнал, сигналы и книги молча не писались."""
+    try:
+        db.account(cfg).close()
+    except (db.SplitRequired, db.SchemaError) as e:
+        return EXIT_NO_DB, f"БД не открывается: {e}"
+    except Exception as e:
+        return 1, f"БД не открывается (повтор при перезапуске): {e}"
+    return None
+
+
 def main() -> int:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе в лог попадает URL с токеном
@@ -2190,16 +2228,20 @@ def main() -> int:
         for e in errors:
             print(e, file=sys.stderr)
         return 1
+    if err := check_db(settings):
+        print(err[1], file=sys.stderr)
+        return err[0]
     if settings.allow_all_group_members_view and not settings.tg_allowed_chat_ids:
         log.warning("ALLOW_ALL_GROUP_MEMBERS_VIEW=true, но TELEGRAM_ALLOWED_CHAT_IDS пуст — флаг ни на что не влияет")
     for w in config_warnings(settings):
         log.warning("%s", w)
 
     log.info("Старт: env=%s, активы=%s, администраторов=%d, трейдеров=%d, зрителей=%d, групп=%d, "
-             "просмотр всем в группах=%s, счёт только в личке=%s",
+             "просмотр всем в группах=%s, счёт только в личке=%s, БД счёта %s, рыночная %s",
              settings.env, ",".join(settings.base_coins), len(settings.tg_admin_ids), len(settings.tg_trader_ids),
              len(settings.tg_viewer_ids), len(settings.tg_allowed_chat_ids),
-             settings.allow_all_group_members_view, settings.sensitive_commands_dm_only)
+             settings.allow_all_group_members_view, settings.sensitive_commands_dm_only, settings.db_file,
+             settings.market_db_file)
     app = OptionsBot(OptionsClient(settings), settings).build_app()
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     return 0

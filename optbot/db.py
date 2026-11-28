@@ -1,17 +1,52 @@
-"""SQLite (по умолчанию data/market-<BYBIT_ENV>.db, см. Settings.db_file): подключение и миграции схемы.
+"""SQLite: две БД — рынок (`data/market.db`, `Settings.market_db_file`) и счёт с экземпляром бота
+(`data/account-<BYBIT_ENV>.db`, `Settings.db_file`); подключение и миграции схемы.
 
-Пишут бот и при ручном запуске CLI сборщика (WAL, timeout 30 с; миграции — под BEGIN IMMEDIATE).
-Соединение не делится между потоками: каждый проход открывает своё.
-Время везде — UTC, миллисекунды.
+Рынок — одинаковый для всех счетов (demo торгует на рынке mainnet): срезы сборщика, цепочка, котировки ног на
+слежении, фондирование, индекс страха и жадности, свечи и модели HAR, DVOL, состояние (`market_state`). Счёт —
+журнал сделок, сигналы и их исполнения, бумажные книги, `bot_state`. БД счёта открывается с подключённой рыночной
+(`account(cfg)`: ATTACH под именем `mkt`); рыночных таблиц в БД счёта нет — запросы без имени схемы находят их в
+рыночной (и JOIN между ними работает). Транзакция, пишущая в обе БД, атомарна в каждой по отдельности (WAL).
+
+Схема: MIGRATIONS — общая схема до разделения (одна БД на всё, версии 1–13; заморожена); дальше — свои
+миграции у каждой роли (MARKET_MIGRATIONS, ACCOUNT_MIGRATIONS; версия = 13 + номер). Роль файла — в
+`PRAGMA application_id`: открыть рыночную как БД счёта (и наоборот) нельзя. Первая миграция роли удаляет таблицы
+другой роли — у старой общей БД с данными она не выполняется сама (`SplitRequired`): разделение — один раз,
+`python -m optbot.market --split`.
+
+WAL, timeout 30 с; миграции — под BEGIN IMMEDIATE. Соединение не делится между потоками: каждый проход открывает
+своё. Время везде — UTC, миллисекунды.
 """
 from __future__ import annotations
 
 import os
+import pathlib
 import sqlite3
 import time
 
-# Миграции: список операторов на версию; номер версии = индекс + 1. Только дописывать.
-# ВАЖНО: каждый элемент — ОДИН оператор (без «;» внутри) — выполняются в одной транзакции.
+MARKET, ACCOUNT = "market", "account"
+APP_ID = {MARKET: 0x6F6D6B74, ACCOUNT: 0x6F616363}   # 'omkt', 'oacc'
+ATTACH_AS = "mkt"
+
+# Таблицы общей схемы (MIGRATIONS) по ролям; новые таблицы — в миграциях своей роли.
+MARKET_TABLES = ("snapshots", "spot", "tracked_symbols", "leg_marks", "chain_snapshots", "perp_context",
+                 "fear_greed", "perp_h1", "har_models", "dvol_h1")
+ACCOUNT_TABLES = ("order_links", "orders", "executions", "deliveries", "delivery_prices", "sync_state", "signals",
+                  "signal_views", "signal_executions", "bot_state", "books", "paper_trades", "book_equity",
+                  "paper_skips", "paper_signals", "perp_books", "perp_trades", "perp_equity", "basis_books",
+                  "basis_events", "basis_equity")
+# ключи bot_state общей БД, которые при разделении переезжают в market_state (ставка FRED, признак истории свечей)
+MARKET_STATE_KEYS = ("rf:*", "perp_h1_complete*")   # GLOB
+
+
+class SchemaError(RuntimeError):
+    """БД не той роли, без роли с чужой версией или новее кода — нужны действия администратора."""
+
+
+class SplitRequired(SchemaError):
+    """Общая БД (до разделения) с данными — открыть её как рыночную или БД счёта нельзя без --split."""
+
+
+# Общая схема до разделения (версии 1–13) — заморожена: новое — в MARKET_/ACCOUNT_MIGRATIONS ниже.
 MIGRATIONS: list[list[str]] = [
     # 1: сборщик рыночных данных
     [
@@ -547,29 +582,130 @@ MIGRATIONS: list[list[str]] = [
     ],
 ]
 
-_migrated: set[str] = set()  # файлы, схема которых уже проверена в этом процессе
+# Миграции ролей: список операторов на версию; версия = LEGACY_VERSION + индекс + 1. Только дописывать.
+# ВАЖНО: каждый элемент — ОДИН оператор (без «;» внутри) — выполняются в одной транзакции.
+MARKET_MIGRATIONS: list[list[str]] = [
+    # 14: рыночная БД — без таблиц счёта; своё состояние (ставка FRED, признак полной истории свечей, срез)
+    [*(f"DROP TABLE {t}" for t in ACCOUNT_TABLES),
+     """
+     CREATE TABLE market_state (
+         key   TEXT PRIMARY KEY,
+         value TEXT
+     )
+     """],
+]
+ACCOUNT_MIGRATIONS: list[list[str]] = [
+    # 14: БД счёта — без рыночных таблиц (они в рыночной БД, подключённой через ATTACH)
+    [f"DROP TABLE {t}" for t in MARKET_TABLES],
+]
+ROLE_MIGRATIONS = {MARKET: MARKET_MIGRATIONS, ACCOUNT: ACCOUNT_MIGRATIONS}
+
+_migrated: set[tuple[str, str]] = set()  # (файл, роль), схема которых уже проверена в этом процессе
 
 
-def connect(path: str, timeout: float = 30) -> sqlite3.Connection:
-    """Открывает БД (создаёт файл и папку при необходимости); схема проверяется один раз на файл за процесс."""
+def connect(path: str, timeout: float = 30, *, role: str = ACCOUNT, market: str | None = None) -> sqlite3.Connection:
+    """Открывает БД роли role (создаёт файл и папку при необходимости); схема проверяется один раз на файл за
+    процесс. market — путь рыночной БД: подключить её (ATTACH) к БД счёта."""
     key = os.path.abspath(path) if path != ":memory:" else None
     if key:
         os.makedirs(os.path.dirname(key), exist_ok=True)
     if key and not os.path.exists(key):
-        _migrated.discard(key)  # файл удалили на ходу — схему создать заново
+        _migrated.discard((key, role))  # файл удалили на ходу — схему создать заново
+    if market is not None:
+        if role != ACCOUNT:
+            raise ValueError("рыночная БД подключается только к БД счёта")
+        mkey = os.path.abspath(market)
+        if (mkey, MARKET) not in _migrated or not os.path.exists(mkey):
+            connect(market, timeout, role=MARKET).close()   # схема рыночной — до ATTACH (ATTACH создал бы пустой файл)
     conn = sqlite3.connect(path, timeout=timeout)
     try:
         conn.row_factory = sqlite3.Row
-        if key not in _migrated:
+        if (key, role) not in _migrated:
             _set_wal(conn, timeout)  # хранится в файле — достаточно один раз; timeout — как у connect
-            migrate(conn)
+            migrate(conn, role)
             if key:
-                _migrated.add(key)
+                _migrated.add((key, role))
         conn.execute("PRAGMA synchronous=NORMAL")
+        if market is not None:
+            conn.execute(f"ATTACH DATABASE ? AS {ATTACH_AS}", (os.path.abspath(market),))
+            conn.execute(f"PRAGMA {ATTACH_AS}.synchronous=NORMAL")
     except BaseException:
         conn.close()  # иначе каждая неудачная попытка оставляет открытый файл
         raise
     return conn
+
+
+def account(cfg, timeout: float = 30) -> sqlite3.Connection:
+    """БД счёта экземпляра с подключённой рыночной (см. _guard_legacy).
+
+    Порядок записи (иначе две транзакции ждут друг друга по кругу до таймаута): транзакция, пишущая в обе БД, —
+    сначала в таблицы счёта, рыночные (`collector.track`) — последними; в таблицы счёта из рыночной БД не пишут.
+    Блокировку записи заранее — `begin_write(conn)`, не `BEGIN IMMEDIATE`: тот блокирует и подключённую рыночную
+    (её пишут сборщик и другие экземпляры)."""
+    _guard_legacy(cfg)
+    _guard_market_missing(cfg)
+    return connect(cfg.db_file, timeout, role=ACCOUNT, market=cfg.market_db_file)
+
+
+def ro_uri(path: str) -> str:
+    """URI только для чтения (путь экранирован: ?, #, % в имени)."""
+    return pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+
+
+def _is_legacy(path: str) -> bool:
+    try:
+        c = sqlite3.connect(ro_uri(path), uri=True)
+        try:
+            return c.execute("PRAGMA application_id").fetchone()[0] == 0 and \
+                c.execute("PRAGMA user_version").fetchone()[0] > 0
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return False
+
+
+def _guard_market_missing(cfg) -> None:
+    """БД счёта есть, а рыночной нет (не тот MARKET_DB_PATH, восстановлена одна копия) — SchemaError: пустая
+    рыночная — без истории IV, свечей, HAR и котировок ног. Начать с пустой — только явно (market --init)."""
+    if os.path.exists(cfg.db_file) and not os.path.exists(cfg.market_db_file):
+        if _is_legacy(cfg.db_file):
+            name = "" if os.path.basename(cfg.db_file) == f"market-{cfg.env}.db" else " --any-name"
+            raise SplitRequired(f"DB_PATH указывает на старую общую БД {cfg.db_file} — уберите DB_PATH из .env и "
+                                f"выполните python -m optbot.market --split --from {cfg.db_file}{name} "
+                                f"(бот остановлен)")
+        raise SchemaError(f"БД счёта {cfg.db_file} есть, а рыночной {cfg.market_db_file} нет — проверьте MARKET_DB_PATH "
+                          f"или восстановите её из копии (пустая рыночная — без истории IV, свечей, HAR и котировок "
+                          f"ног); начать с пустой — python -m optbot.market --init")
+
+
+def _guard_legacy(cfg) -> None:
+    """Старая общая БД (рядом с БД счёта) на месте, а БД счёта ещё нет — SplitRequired: иначе команда до разделения
+    создала бы пустые БД (бот начал бы с пустым журналом, рыночная — помешала бы --split). DB_PATH указывает на
+    саму общую БД — её не пропустит migrate."""
+    if os.path.exists(cfg.db_file):
+        return
+    legacy = cfg.legacy_db_file
+    if os.path.abspath(cfg.db_file) != os.path.abspath(legacy) and os.path.exists(legacy):
+        raise SplitRequired(f"есть старая общая БД {legacy}, а БД счёта {cfg.db_file} нет — сначала "
+                            f"python -m optbot.market --split (бот остановлен)")
+
+
+def begin_write(conn: sqlite3.Connection) -> None:
+    """Начать транзакцию с блокировкой записи только БД счёта (main) — как BEGIN IMMEDIATE, но без подключённой
+    рыночной: пустая запись в main.bot_state берёт блокировку main и ничего не меняет.
+
+    Рыночную в такой транзакции — только писать последним (collector.track) и не читать до записи: прочитанный
+    снимок mkt, который сборщик успел обновить, при записи даёт SQLITE_BUSY_SNAPSHOT сразу, без ожидания."""
+    conn.execute("BEGIN")
+    conn.execute("UPDATE main.bot_state SET value = value WHERE 0")
+
+
+def market(cfg, timeout: float = 30) -> sqlite3.Connection:
+    """Рыночная БД (сборщик, свечи, DVOL, ставка — и чтение истории)."""
+    if not os.path.exists(cfg.market_db_file):
+        _guard_legacy(cfg)
+        _guard_market_missing(cfg)
+    return connect(cfg.market_db_file, timeout, role=MARKET)
 
 
 def _set_wal(conn: sqlite3.Connection, timeout: float = 30) -> None:
@@ -586,22 +722,74 @@ def _set_wal(conn: sqlite3.Connection, timeout: float = 30) -> None:
             time.sleep(0.05)
 
 
-def migrate(conn: sqlite3.Connection) -> int:
-    """Применяет недостающие миграции; возвращает итоговую версию схемы.
+LEGACY_VERSION = len(MIGRATIONS)
+
+
+def has_rows(conn: sqlite3.Connection, tables) -> list[str]:
+    """Какие из таблиц (если есть) не пусты."""
+    have = {r[0] for r in conn.execute("SELECT name FROM main.sqlite_master WHERE type = 'table'")}
+    return [t for t in tables if t in have and conn.execute(f"SELECT 1 FROM main.{t} LIMIT 1").fetchone()]
+
+
+def migrate_legacy(conn: sqlite3.Connection) -> None:
+    """Общую БД (без роли) старее последней общей схемы — до LEGACY_VERSION (перед --split); таблиц не удаляет."""
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if conn.execute("PRAGMA application_id").fetchone()[0] != 0:
+            raise RuntimeError("у БД уже есть роль — это не общая БД")
+        for i in range(version, LEGACY_VERSION):
+            for stmt in MIGRATIONS[i]:
+                conn.execute(stmt)
+            conn.execute(f"PRAGMA user_version={i + 1}")
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = ""
+
+
+def migrate(conn: sqlite3.Connection, role: str = ACCOUNT) -> int:
+    """Применяет недостающие миграции роли; возвращает итоговую версию схемы.
 
     BEGIN IMMEDIATE берёт блокировку записи ДО чтения версии: второй процесс, открывающий новую БД
     одновременно, дождётся и увидит уже применённую схему, а не будет создавать таблицы повторно.
+    Общая БД (application_id 0) получает роль, только если все её таблицы пусты (новый файл); общую с данными
+    разделяет python -m optbot.market --split (переносом таблиц в новые БД — эта миграция данных не удаляет).
     """
+    if role not in ROLE_MIGRATIONS:
+        raise ValueError(f"неизвестная роль БД: {role!r}")
+    own = ROLE_MIGRATIONS[role]
+    final = LEGACY_VERSION + len(own)
     conn.isolation_level = None  # транзакциями управляем сами
     try:
         conn.execute("BEGIN IMMEDIATE")
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version > len(MIGRATIONS):
-            raise RuntimeError(f"Схема БД v{version} новее кода (v{len(MIGRATIONS)}) — обновите код")
-        for i in range(version, len(MIGRATIONS)):
+        app = conn.execute("PRAGMA application_id").fetchone()[0]
+        if app not in (0, APP_ID[role]):
+            other = next((r for r, a in APP_ID.items() if a == app), f"application_id {app}")
+            raise SchemaError(f"БД — {other}, а открывается как {role}")
+        if app == 0 and version > LEGACY_VERSION:
+            raise SchemaError(f"Схема БД v{version} без роли — не наша БД или испорчена")
+        if version > final:
+            raise SchemaError(f"Схема БД v{version} новее кода (v{final}) — обновите код")
+        for i in range(version, LEGACY_VERSION):
             for stmt in MIGRATIONS[i]:
                 conn.execute(stmt)
             conn.execute(f"PRAGMA user_version={i + 1}")
+        if app == 0:
+            # любая общая БД с данными (и своей роли тоже: ключи рынка в bot_state) — только через --split
+            if busy := has_rows(conn, MARKET_TABLES + ACCOUNT_TABLES):
+                raise SplitRequired(f"общая БД с данными ({', '.join(busy[:4])}…) — сначала python -m optbot.market "
+                                    f"--split")
+            conn.execute(f"PRAGMA application_id={APP_ID[role]}")
+        for i in range(max(version, LEGACY_VERSION) - LEGACY_VERSION, len(own)):
+            for stmt in own[i]:
+                conn.execute(stmt)
+            conn.execute(f"PRAGMA user_version={LEGACY_VERSION + i + 1}")
         conn.execute("COMMIT")
     except BaseException:
         if conn.in_transaction:  # BEGIN мог не выполниться (БД занята) — тогда откатывать нечего
@@ -609,4 +797,4 @@ def migrate(conn: sqlite3.Connection) -> int:
         raise
     finally:
         conn.isolation_level = ""  # обратно к обычному режиму модуля sqlite3
-    return len(MIGRATIONS)
+    return final

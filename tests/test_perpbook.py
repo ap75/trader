@@ -61,7 +61,7 @@ def run_steps(pb, c, bars, start, end, every=1, lag=perpbook.BAR_LAG_MS + 60_000
 
 
 def trades(cfg):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     try:
         return [dict(r) for r in conn.execute("SELECT * FROM perp_trades ORDER BY id")]
     finally:
@@ -203,7 +203,7 @@ def test_stats_and_correlation_with_option_books(pcfg):
     c = Client(bars, funding)
     pb = perpbook.PerpBook(c, pcfg)
     run_steps(pb, c, bars, 1001, 1200)
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     eq = conn.execute("SELECT ts, equity FROM perp_equity ORDER BY ts").fetchall()
     with conn:  # опционная книга с тем же дневным ходом, что у перпетуалов (корреляция +1)
         conn.executemany("INSERT INTO book_equity (ts, book, realized, unrealized, open_n, open_risk, im_regular) "

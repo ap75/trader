@@ -13,6 +13,8 @@ ExecStart=%h/trader/.venv/bin/python -m optbot.bot
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=15
+# 3 — БД не открывается (старая общая не разделена: python -m optbot.market --split) — не перезапускать по кругу
+RestartPreventExitStatus=3
 TimeoutStopSec=30
 UMask=0077
 NoNewPrivileges=true

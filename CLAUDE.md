@@ -24,7 +24,9 @@
 - Бот работает **на сервере** (`~/trader`, служба `options-bot`, `systemctl --user`). Локально `optbot.bot` не запускать:
   один токен — один экземпляр (Telegram `Conflict`). Рабочая БД — на сервере; локальная `data/` устарела,
   `collector`/`journal` локально дают старые данные — запускать на сервере.
-- Обновление сервера: `git pull`; изменились зависимости — `.venv/bin/pip install -r requirements.txt`; затем
+- Обновление сервера: `git pull`; изменились зависимости — `.venv/bin/pip install -r requirements.txt`; первое
+  обновление после 2026-11-27 — один раз разделить БД (бот остановлен, `python -m optbot.market --split`,
+  `deploy/README.md` «Две БД»), иначе бот не стартует; затем
   `systemctl --user restart options-bot` не ближе минуты к :00/:15/:30/:45 (иначе пропуск среза сборщика)
   и не во время сделки по сигналу («Выставить»: до минуты и дольше) — перезапуск оборвёт её между ногами без итога.
 - Реальные ордера в проверках — далеко от рынка и сразу отменять (на demo пользователь разрешал мелкие сделки).
@@ -43,12 +45,13 @@
 .venv/bin/python -m optbot.cli signals BTC       # сигнал этапа 3 (pctl — по истории БД: на сервере)
 .venv/bin/python -m optbot.sigjournal --evaluate | --stats 30d [--base BTC] [--csv f]   # журнал сигналов (на сервере)
 .venv/bin/python -m optbot.paper --status | --stats 30d [--csv f] | --skips 7d | --step | --check-delivery-fees   # книги E1 (на сервере)
-.venv/bin/python -m optbot.backup                # резервная копия БД сейчас (бот — раз в сутки, BACKUP_*)
+.venv/bin/python -m optbot.backup                # резервные копии обеих БД сейчас (бот — раз в сутки, BACKUP_*)
 .venv/bin/python -m optbot.perpbook --status | --stats 30d | --step   # бумажная книга перпетуалов EMA 4h (на сервере)
 .venv/bin/python -m optbot.basisbook --status | --stats 30d | --step | --rf   # книга базиса BTC/ETH (+SOL наблюдение) | ставка FRED (на сервере)
 .venv/bin/python -m optbot.reports --books 30d [--horizon short] [--base BTC] [--csv f] | --stress   # отчёты E3 (на сервере)
 .venv/bin/python -m optbot.vol --show | --fit [--base BTC]   # прогноз HAR7/HAR30: модели | докачать свечи и переоценить (на сервере)
 .venv/bin/python -m optbot.dvol --update | --show   # DVOL Deribit для перцентиля IV30 BTC/ETH: докачать | что есть (на сервере)
+.venv/bin/python -m optbot.market --split [--force|--merge|--any-name] | --init   # один раз: общую data/market-<env>.db -> market.db + account-<env>.db (бот остановлен) | пустая рыночная при имеющейся БД счёта
 deploy/offsite/pull_backups.py --help            # компьютер: выгрузка копий с сервера, ротация 7/4/6 (таймер — deploy/README.md)
 cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служба systemctl --user, шаги — deploy/README.md
 <venv с reportlab>/bin/python docs/guides.py docs/   # PDF-инструкции (ru/uk: admin, trader, viewer)
@@ -73,7 +76,11 @@ cp deploy/options-bot.service ~/.config/systemd/user/   # сервер: служ
 
 ## Данные
 
-SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`) и журнал сделок (`journal.py`);
+SQLite (gitignored), две БД (`db.py`): рыночная `data/market.db` (`MARKET_DB_PATH`, `db.market(cfg)`; таблицы
+`db.MARKET_TABLES` и `market_state` — ставка FRED, признак истории свечей) и счёта `data/account-<BYBIT_ENV>.db`
+(`DB_PATH`, `db.account(cfg)` — с подключённой рыночной через ATTACH `mkt`, запросы без имени схемы; остальное).
+Роль файла — `PRAGMA application_id`; старая общая `data/market-<env>.db` — `python -m optbot.market --split`.
+Сборщик (`collector.py`) пишет в рыночную, журнал сделок (`journal.py`) — в БД счёта;
 сигналы (`signals.py`) читают `snapshots` для IV percentile; журнал сигналов (`sigjournal.py`) — таблица `signals`,
 путь сделки — по `leg_marks`, итог — по `delivery_prices`. Кнопка «Выставить» — `multileg.py` (ноги IOC, сначала покупки),
 итог исполнения — таблица `signal_executions`, ордера — `order_links` с `source=signal`. Пороги сигналов — `SIG_*` (`config.SignalSettings`).
@@ -81,7 +88,7 @@ SQLite `data/market-<BYBIT_ENV>.db` (gitignored): сборщик (`collector.py`
 (отказы книг: первый `ts`, последний `last_ts`), `paper_signals` (итог расчёта сигнала на каждом шаге, `--skips`; у `not_built` в `reason` — отказ по каждой
 экспирации окна, с кредитом/дебетом и шириной спреда);
 каждая книга — в двух версиях: без фильтра издержек и `…:cost` (`SIG_MAX_COST_PCT`);
-ноги — на слежение (`tracked_symbols`, reason `book:<id>`); длинный горизонт и календарь — `signals.py`
+ноги — на слежение (`tracked_symbols`, reason `<env>:book:<id>`, у сигналов `<env>:sig:<id>`; потерянное — `collector.retrack` на шаге книг и итогах сигналов); длинный горизонт и календарь — `signals.py`
 (`horizon="long"`, `calendar_signal`); тег event — `events.csv` (`events.py`, дописывать вперёд).
 Рыночный фон (`context.py`: фондирование, OI, индекс страха и жадности `FNG_URL`) — справочно в карточке и в `metrics`
 журналов сигналов и книг; в тестах `FNG_URL` пуст (без сети). История для проверок (сборщик): `chain_snapshots`
@@ -102,11 +109,12 @@ IV30 / k против DVOL за `SIG_LOOKBACK_DAYS`, k — медиана IV30/D
 `perp_trades`, `perp_equity`; шаг — в задаче бумажных книг после опционных; только бумага, ордеров нет.
 Книга базиса (`basisbook.py`, спот лонг + перп шорт; параметры и ставка — `config/basis.json`): `basis_books`,
 `basis_events`, `basis_equity`; шаг — после перпетуалов; только бумага; SOL — «наблюдение» (вне Σ). Ставка «сверх
-ставки» — FRED DTB3 раз в сутки (`rates.py`, `RF_URL`, `bot_state` `rf:DTB3`; в тестах `RF_URL` пуст).
+ставки» — FRED DTB3 раз в сутки (`rates.py`, `RF_URL`, `market_state` `rf:DTB3` рыночной БД; в тестах `RF_URL` пуст).
 Отчёты E3 (`reports.py`): `/books` (метрики книг и систем по `book_equity`/`perp_equity`), `/stress` (Black-76 по IV и
 underlying ног из `leg_marks`, бета ETH/SOL к BTC — по `perp_h1`), еженедельно `BOOKS_WEEKLY_UTC`; % — от `PAPER_CAPITAL_USDT`;
 в еженедельном — строка `watch_line` (bull put: без ответа бэктеста research 8; сделок против 50 к пересмотру 15.01.2027).
 Режим поддержки (2026-11-26): новые сигналы и стратегии не добавлять — см. PLAN.md «Итоги research этапов 6–8». E2 (автоторговля
 на demo, эксперимент по исполнению) — возвращено 2026-11-27, после этапа 2 «Несколько счетов» (PLAN.md).
-Схема — `db.MIGRATIONS`, только дописывать (одна миграция — список операторов без `;`).
+Схема — `db.MIGRATIONS` (общая до разделения, заморожена) и дальше `db.MARKET_MIGRATIONS` / `db.ACCOUNT_MIGRATIONS`
+по роли таблицы — только дописывать (одна миграция — список операторов без `;`).
 Тесты пишут во временную БД (фикстура `cfg`), не в `data/`.

@@ -125,7 +125,7 @@ class PerpBook:
             log.error("Перпетуалы: %s — книга выключена", self.p_error)
 
     def _db(self):
-        return db.connect(self.cfg.db_file)
+        return db.account(self.cfg)
 
     def bases(self) -> list[str]:
         return [b for b in self.cfg.paper.bases if b in self.cfg.base_coins]
@@ -188,7 +188,7 @@ class PerpBook:
         opened, closed_msgs = [], []
         with conn:
             # ручной --step одновременно с ботом: состояние книги — читать под блокировкой записи
-            conn.execute("BEGIN IMMEDIATE")
+            db.begin_write(conn)
             book = conn.execute("SELECT * FROM perp_books WHERE id = ?", (bid,)).fetchone()
             if book is None:  # новая книга: первое исполнение — по open следующей свечи
                 conn.execute("INSERT INTO perp_books (id, base, strategy, capital, cash, qty, entry, last_bar_ms, "

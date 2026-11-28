@@ -62,7 +62,7 @@ def bull_put(fake, **kw):
 
 
 def trades(cfg, where="1=1"):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     try:
         return [dict(r) for r in conn.execute(f"SELECT * FROM paper_trades WHERE {where} ORDER BY id")]
     finally:
@@ -71,7 +71,7 @@ def trades(cfg, where="1=1"):
 
 def put_marks(cfg, ts, quotes, underlying=65000.0):
     """quotes: {symbol: (bid, ask)} или (bid, ask, mark)."""
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         for s, q in quotes.items():
             bid, ask = q[0], q[1]
@@ -137,9 +137,9 @@ def test_entry_sizes_by_risk_budget_and_tracks_legs(make_client, pcfg, fake):
     assert t["entry_net"] > 0 and t["entry_fees"] > 0 and t["status"] == "open" and t["qty_cap"] is None
     assert t["im_regular"] > 0 and t["im_pm"] is None
     assert json.loads(t["metrics"])["pctl_used"] is False
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     tracked = {r["symbol"]: r["reason"] for r in conn.execute("SELECT * FROM tracked_symbols")}
-    assert set(tracked) == {l.symbol for l in sig.legs} and set(tracked.values()) == {f"book:{t['id']}"}
+    assert set(tracked) == {l.symbol for l in sig.legs} and set(tracked.values()) == {f"demo:book:{t['id']}"}
     # с фильтром и без × (короткий: RV и HAR — 6 стратегий × 2; длинный: 7)
     # 3 актива × (6 коротких × RV/HAR + 7 длинных) + у BTC/ETH 6 длинных :har30 — × с фильтром и без
     assert conn.execute("SELECT COUNT(*) FROM books").fetchone()[0] == 2 * (3 * (6 * 2 + 7) + 2 * 6)
@@ -170,7 +170,7 @@ def test_below_min_lot_skipped_once(make_client, pcfg, fake):
     r1 = step(pe, NOW, condor(fake))
     r2 = step(pe, NOW + 900_000, condor(fake))
     assert not trades(pcfg) and len(r1.skipped) == 1 and "мин. лота" in r1.skipped[0] and not r2.skipped
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     assert conn.execute("SELECT code FROM paper_skips").fetchone()["code"] == "qty"
     conn.close()
 
@@ -270,7 +270,7 @@ def test_equity_curve_rows(make_client, pcfg, fake):
     t, legs = _legs(pcfg)
     put_marks(pcfg, NOW + 900_000, {l["symbol"]: (l["bid"], l["ask"], l["fill"]) for l in legs})  # mark = вход
     pe.step(NOW + 900_000, {})
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     rows = [dict(r) for r in conn.execute("SELECT * FROM book_equity ORDER BY ts")]
     conn.close()
     assert len(rows) == 2 and rows[-1]["book"] == "short:bull_put:BTC" and rows[-1]["open_n"] == 1
@@ -332,7 +332,7 @@ def test_calendar_paper_entry_and_exits(make_client, pcfg, fake):
     assert t["strategy"] == "calendar" and t["far_expiry"] == FAR and t["book"] == "long:calendar:BTC"
     assert t["max_loss"] == pytest.approx(-t["entry_net"] + t["entry_fees"])
     assert {l["expiry_ms"] for l in legs} == {EXP_MS, FAR_MS}
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     until = {r["symbol"]: r["until_ms"] for r in conn.execute("SELECT * FROM tracked_symbols")}
     conn.close()
     assert sorted(until.values()) == [EXP_MS, FAR_MS]
@@ -616,7 +616,7 @@ def test_marks_from_one_slot_only(make_client, pcfg, fake):
     a, b = legs
     put_marks(pcfg, NOW + 900_000, {a["symbol"]: (0.01, 0.02), b["symbol"]: (0.01, 0.02)})
     put_marks(pcfg, NOW + 1_800_000, {a["symbol"]: (0.01, 0.02)})          # вторая нога в этом срезе не пришла
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     got = pe._marks(conn, [a["symbol"], b["symbol"]], NOW + 1_800_000)
     conn.close()
     assert {m["ts"] for m in got.values()} == {NOW + 900_000}
@@ -627,7 +627,7 @@ def test_missing_mark_does_not_trigger_stop(make_client, pcfg, fake):
     pe = eng(make_client, pcfg)
     step(pe, NOW, mksig(fake, "bull_call", [(sym(65000, "C"), +1), (sym(67000, "C"), -1)]))
     t, legs = _legs(pcfg)
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     with conn:
         for l in legs:
             conn.execute("INSERT INTO leg_marks (ts, symbol, mark, bid, ask, underlying) VALUES (?,?,?,?,?,?)",
@@ -747,7 +747,7 @@ def test_stats_split_by_cost_variant():
 
 # ---------- комиссия поставки: сверка с биржей ----------
 def _delivery(cfg, sym_, pos, strike, price, fee, t=EXP_MS):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         conn.execute("INSERT INTO deliveries (symbol, delivery_time, side, position, strike, delivery_price, fee) "
                      "VALUES (?,?,?,?,?,?,?)", (sym_, t, "Sell", pos, strike, price, fee))
@@ -758,7 +758,7 @@ def test_delivery_fee_check_reports_first_match_and_mismatches(pcfg):
     from optbot.paper import check_delivery_fees, fmt_delivery_check
     s1 = sym(60000, "C")
     _delivery(pcfg, s1, 0.01, 60000, 65000, 0.00015 * 65000 * 0.01)           # совпадает
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     got = check_delivery_fees(pcfg, conn)
     assert len(got) == 1 and got[0]["ok"] and got[0]["report"] and "совпала" in fmt_delivery_check(got[0])
     assert check_delivery_fees(pcfg, conn) == []                              # уже проверена
@@ -840,7 +840,7 @@ def test_delivery_check_grouped_and_skipped_when_paper_off(cfg):
 
 def test_delivery_check_late_same_expiry_and_zero_fee_itm(pcfg):
     from optbot.paper import check_delivery_fees
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     _delivery(pcfg, sym(60000, "C"), 0.01, 60000, 65000, 0.00015 * 65000 * 0.01)
     assert len(check_delivery_fees(pcfg, conn)) == 1
     _delivery(pcfg, sym(61000, "C"), 0.01, 61000, 65000, 0.0)               # та же экспирация, позже; fee 0 в деньгах
@@ -854,7 +854,7 @@ def test_delivery_check_late_same_expiry_and_zero_fee_itm(pcfg):
 
 def test_delivery_check_caps_mismatch_reports_and_abs_fee(pcfg):
     from optbot.paper import check_delivery_fees
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     _delivery(pcfg, sym(60000, "C"), 0.01, 60000, 65000, -0.00015 * 65000 * 0.01)   # знак — не важен
     assert check_delivery_fees(pcfg, conn)[0]["ok"]
     for i in range(5):
@@ -909,7 +909,7 @@ def test_signal_outcomes_logged_and_skips_report(make_client, pcfg, fake, monkey
     set_klines(fake, rv=0.4)
     pe = eng(make_client, pcfg)
     pe.step(NOW)
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     rows = [dict(r) for r in conn.execute("SELECT * FROM paper_signals")]
     conn.close()
     assert {(r["base"], r["kind"]) for r in rows} >= {("BTC", "short"), ("BTC", "long"), ("BTC", "calendar")}
@@ -963,7 +963,7 @@ def test_traded_expiry_recorded_as_skip(make_client, pcfg, fake):
     set_chain(fake)
     pe = eng(make_client, pcfg)
     pe.step(NOW, {"BTC": {"short:bull_put:BTC": bull_put(fake)}})
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     with conn:
         conn.execute("UPDATE paper_trades SET status = 'closed', closed_ms = ?", (NOW + 1,))
     conn.close()
@@ -981,7 +981,7 @@ def test_calendar_inversion_not_built_logged_as_not_built(make_client, pcfg, fak
     monkeypatch.setattr(pe.engine, "calendar_signal", lambda *a, **k: S(
         metrics=m, strategy="calendar", reasons=[], horizon="long", no_signal="инверсия IV есть, но календарь не собрался"))
     pe.step(NOW)
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     r = conn.execute("SELECT * FROM paper_signals WHERE base='BTC' AND kind='calendar'").fetchone()
     conn.close()
     assert r["outcome"] == "not_built" and r["strategy"] == "calendar"
@@ -1010,7 +1010,7 @@ def test_settlement_with_day_start_delivery_time(make_client, pcfg, fake):
     t = trades(pcfg)[0]
     assert t["close_reason"] == "expiry" and t["delivery_price"] == 61000
     pe2 = eng(make_client, pcfg)                                      # второй раз — из БД (окно с начала дня)
-    assert pe2._delivery_price(db.connect(pcfg.db_file), "BTC", EXP_MS) == 61000
+    assert pe2._delivery_price(db.account(pcfg), "BTC", EXP_MS) == 61000
 
 
 def test_outcome_reason_lists_rejected_expiries():
@@ -1031,12 +1031,12 @@ def test_step_logs_rejections_per_expiry(make_client, pcfg, fake):
     set_klines(fake, rv=0.4)
     pe = eng(make_client, dataclasses.replace(pcfg, sig=dataclasses.replace(pcfg.sig, min_credit_ratio=0.9)))
     pe.step(NOW)
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     r = conn.execute("SELECT reason FROM paper_signals WHERE kind = 'short' AND outcome = 'not_built'").fetchone()
     conn.close()
     assert r and "не собралась" in r["reason"] and f"✗ {EXP}: кредит " in r["reason"]
     assert "ширины" in r["reason"] and "< 90%" in r["reason"]
-    conn = db.connect(pcfg.db_file)
+    conn = db.account(pcfg)
     none = [x["reason"] for x in conn.execute("SELECT reason FROM paper_signals WHERE outcome = 'none'")]
     conn.close()
     assert all("✗" not in (x or "") for x in none)                    # у «нет сигнала» — только итог

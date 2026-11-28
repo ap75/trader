@@ -26,7 +26,7 @@ def run(coro):
 
 
 def q(cfg, sql, *a):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     try:
         return [dict(r) for r in conn.execute(sql, a)]
     finally:
@@ -270,7 +270,7 @@ def test_execute_stuck_alerts_admin(b, market, monkeypatch):
 def test_execute_expired_signal_refused(b, market):
     tg = TG()
     btn = _card(b, tg)
-    conn = db.connect(b.cfg.db_file)
+    conn = db.account(b.cfg)
     with conn:
         conn.execute("UPDATE signals SET expiry_ms = ?", (NOW + 60_000,))
     conn.close()

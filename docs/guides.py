@@ -995,8 +995,10 @@ def admin_settings(d: Doc):
                "страйки с |Δ| ≥ 0.02, хранить всегда (0) или N дней",
                "повний ланцюжок опціонів у БД: раз на 60 хв (перший зріз періоду; 0 — ні), експірації до 60 дн., "
                "страйки з |Δ| ≥ 0.02, зберігати завжди (0) або N днів")],
-            [c("DB_PATH"), T("файл базы; пусто — " + c("data/market-<BYBIT_ENV>.db") + " (своя на окружение)",
-                             "файл бази; порожньо — " + c("data/market-<BYBIT_ENV>.db") + " (своя на середовище)")],
+            [c("DB_PATH"), T("БД счёта (журналы, книги); пусто — " + c("data/account-<BYBIT_ENV>.db") + " (своя на окружение)",
+                             "БД рахунку (журнали, книги); порожньо — " + c("data/account-<BYBIT_ENV>.db") + " (своя на середовище)")],
+            [c("MARKET_DB_PATH"), T("рыночная БД (срезы, свечи, DVOL, ставка); пусто — " + c("data/market.db"),
+                                    "ринкова БД (зрізи, свічки, DVOL, ставка); порожньо — " + c("data/market.db"))],
             [c("JOURNAL_ENABLED"), T("журнал сделок и журнал сигналов (" + c("true") + "); итоги сигналов — с периодом "
                                      + c("JOURNAL_SYNC_MIN") + "; без сборщика — без просадки и «50%»",
                                      "журнал угод і журнал сигналів (" + c("true") + "); підсумки сигналів — з періодом "
@@ -1149,7 +1151,9 @@ DATA_CMDS_RU = """.venv/bin/python -m optbot.collector --once      срез ры
 .venv/bin/python -m optbot.collector --stats      что накоплено
 .venv/bin/python -m optbot.journal --sync         сверка журнала с биржей
 .venv/bin/python -m optbot.journal --report 30d   отчёт журнала (+ --csv f.csv)
-.venv/bin/python -m optbot.backup                 резервная копия БД сейчас (бот делает сам раз в сутки)
+.venv/bin/python -m optbot.backup                 резервные копии обеих БД сейчас (бот делает сам раз в сутки)
+.venv/bin/python -m optbot.market --split         один раз: разделить старую общую БД (бот остановлен)
+.venv/bin/python -m optbot.market --init          пустая рыночная БД, если её нет, а БД счёта есть
 .venv/bin/python -m optbot.vol --show             прогноз HAR7 и HAR30: модели в работе, расхождение с эталоном
 .venv/bin/python -m optbot.vol --fit              докачать часовые свечи и переоценить HAR сейчас
 .venv/bin/python -m optbot.dvol --update          докачать DVOL Deribit (BTC, ETH; бот делает сам раз в сутки)
@@ -1159,7 +1163,9 @@ DATA_CMDS_UK = """.venv/bin/python -m optbot.collector --once      зріз ри
 .venv/bin/python -m optbot.collector --stats      що накопичено
 .venv/bin/python -m optbot.journal --sync         звірка журналу з біржею
 .venv/bin/python -m optbot.journal --report 30d   звіт журналу (+ --csv f.csv)
-.venv/bin/python -m optbot.backup                 резервна копія БД зараз (бот робить сам раз на добу)
+.venv/bin/python -m optbot.backup                 резервні копії обох БД зараз (бот робить сам раз на добу)
+.venv/bin/python -m optbot.market --split         один раз: розділити стару спільну БД (бот зупинений)
+.venv/bin/python -m optbot.market --init          порожня ринкова БД, якщо її немає, а БД рахунку є
 .venv/bin/python -m optbot.vol --show             прогноз HAR7 і HAR30: моделі в роботі, розбіжність з еталоном
 .venv/bin/python -m optbot.vol --fit              докачати годинні свічки і переоцінити HAR зараз
 .venv/bin/python -m optbot.dvol --update          докачати DVOL Deribit (BTC, ETH; бот робить сам раз на добу)
@@ -1169,10 +1175,16 @@ DATA_CMDS_UK = """.venv/bin/python -m optbot.collector --once      зріз ри
 
 def admin_data(d: Doc):
     d.h1(T("Данные: сборщик, журнал сделок, журнал сигналов", "Дані: збирач, журнал угод, журнал сигналів"))
-    d(p(T("Бот ведёт базу SQLite " + c("data/market-<BYBIT_ENV>.db") + " (у demo и mainnet — разные файлы). "
-          "Все задачи работают внутри бота, отдельный запуск не нужен.",
-          "Бот веде базу SQLite " + c("data/market-<BYBIT_ENV>.db") + " (у demo і mainnet — різні файли). "
-          "Усі задачі працюють усередині бота, окремий запуск не потрібен.")))
+    d(p(T("Бот ведёт две базы SQLite: рыночную " + c("data/market.db") + " (срезы, цепочка, котировки ног, свечи, "
+          "DVOL, ставка — одинаковы для всех счетов) и базу счёта " + c("data/account-<BYBIT_ENV>.db") + " (журналы "
+          "сделок и сигналов, книги; у demo и mainnet — разные файлы). Старую общую " + c("data/market-<env>.db")
+          + " разделяет один раз " + c("python -m optbot.market --split") + " (бот остановлен; пока не разделена, "
+          "бот не стартует). Все задачи работают внутри бота, отдельный запуск не нужен.",
+          "Бот веде дві бази SQLite: ринкову " + c("data/market.db") + " (зрізи, ланцюжок, котирування ніг, свічки, "
+          "DVOL, ставка — однакові для всіх рахунків) і базу рахунку " + c("data/account-<BYBIT_ENV>.db") + " (журнали "
+          "угод і сигналів, книги; у demo і mainnet — різні файли). Стару спільну " + c("data/market-<env>.db")
+          + " розділяє один раз " + c("python -m optbot.market --split") + " (бот зупинений; доки не розділена, "
+          "бот не стартує). Усі задачі працюють усередині бота, окремий запуск не потрібен.")))
     d(bullets([
         T("<b>Сборщик</b> каждые 15 минут (в :00, :15, :30, :45) записывает по каждой экспирации BTC/ETH/SOL "
           "ATM IV, цену ATM-стрэддла, 25-дельтовый risk reversal, спред и OI, а также индекс, цену перпетуала, "
@@ -1284,7 +1296,7 @@ def admin_data(d: Doc):
           "Ордерів на біржу немає. Вручну: " + c("python -m optbot.paper --status") + " / " + c("--stats 30d")
           + " / " + c("--skips 7d") + " (чому без угод: немає сигналу — за режимом IV і трендом, або відмова книги). "
           "Календар подій " + c("events.csv") + " (FOMC, CPI) — дописувати наперед хоча б на 45 днів."),
-        T("<b>Резервная копия</b> — раз в сутки (" + c("BACKUP_DAILY_UTC") + ") через sqlite backup API в "
+        T("<b>Резервная копия</b> обеих БД — раз в сутки (" + c("BACKUP_DAILY_UTC") + ") через sqlite backup API в "
           + c("backups/") + " с проверкой и сжатием gzip (" + c(".db.gz") + "), хранится " + c("BACKUP_KEEP_DAYS")
           + " дней; сбой — срочное "
           "администратору. Копия на том же сервере — забирайте на свой компьютер: скрипт "
@@ -1293,7 +1305,7 @@ def admin_data(d: Doc):
           + c("deploy/README.md") + ". "
           "<b>Внешний мониторинг</b> — " + c("HEALTHCHECK_URL") + " (healthchecks.io, период 15 мин, grace 30): "
           "бот пингует после каждого среза, пропали пинги — сервис сообщит сам.",
-          "<b>Резервна копія</b> — раз на добу (" + c("BACKUP_DAILY_UTC") + ") через sqlite backup API у "
+          "<b>Резервна копія</b> обох БД — раз на добу (" + c("BACKUP_DAILY_UTC") + ") через sqlite backup API у "
           + c("backups/") + " з перевіркою і стисненням gzip (" + c(".db.gz") + "), зберігається "
           + c("BACKUP_KEEP_DAYS") + " днів; збій — термінове "
           "адміністраторові. Копія на тому ж сервері — забирайте на свій комп'ютер: скрипт "
@@ -1405,12 +1417,14 @@ systemctl --user restart options-bot                  після зміни .env
           "(рядок раз на 5 хвилин)."),
         T("Размер лога ограничьте в " + c("/etc/systemd/journald.conf") + " (" + c("SystemMaxUse=500M") + ").",
           "Розмір логу обмежте в " + c("/etc/systemd/journald.conf") + " (" + c("SystemMaxUse=500M") + ")."),
-        T("Резервные копии: " + c(".env") + " (храните в менеджере паролей) и база " + c("data/market-<env>.db")
-          + " (журнал сделок и история рынка). Копируйте её на ходу командой " + c("sqlite3 data/market-mainnet.db "
-          "\".backup /backup/market.db\"") + " (пакет " + c("sqlite3") + "), а не простым " + c("cp") + ".",
-          "Резервні копії: " + c(".env") + " (зберігайте в менеджері паролів) і база " + c("data/market-<env>.db")
-          + " (журнал угод та історія ринку). Копіюйте її на ходу командою " + c("sqlite3 data/market-mainnet.db "
-          "\".backup /backup/market.db\"") + " (пакет " + c("sqlite3") + "), а не простим " + c("cp") + "."),
+        T("Резервные копии: " + c(".env") + " (храните в менеджере паролей) и обе базы — " + c("data/account-<env>.db")
+          + " (журнал сделок, книги) и " + c("data/market.db") + " (история рынка). Копируйте их на ходу командой "
+          + c("sqlite3 data/account-mainnet.db \".backup /backup/account.db\"") + " (пакет " + c("sqlite3")
+          + "), а не простым " + c("cp") + "; бот делает такие копии сам раз в сутки.",
+          "Резервні копії: " + c(".env") + " (зберігайте в менеджері паролів) і обидві бази — " + c("data/account-<env>.db")
+          + " (журнал угод, книги) і " + c("data/market.db") + " (історія ринку). Копіюйте їх на ходу командою "
+          + c("sqlite3 data/account-mainnet.db \".backup /backup/account.db\"") + " (пакет " + c("sqlite3")
+          + "), а не простим " + c("cp") + "; бот робить такі копії сам раз на добу."),
         T("Безопасность VPS: вход по SSH-ключу, " + c("PasswordAuthentication no") + ", " + c("ufw allow OpenSSH")
           + " и " + c("ufw enable") + ", автоматические обновления (" + c("unattended-upgrades") + ").",
           "Безпека VPS: вхід за SSH-ключем, " + c("PasswordAuthentication no") + ", " + c("ufw allow OpenSSH")

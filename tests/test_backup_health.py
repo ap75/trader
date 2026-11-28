@@ -19,7 +19,7 @@ def bcfg(cfg, tmp_path):
 
 
 def test_backup_online_consistent_copy(bcfg):
-    conn = db.connect(bcfg.db_file)
+    conn = db.account(bcfg)
     with conn:
         conn.execute("INSERT INTO bot_state (key, value) VALUES ('x', '1')")
     # открытая читающая транзакция другого соединения не мешает (онлайн-копия, не копирование файла)
@@ -32,12 +32,12 @@ def test_backup_online_consistent_copy(bcfg):
     assert os.path.exists(path) and not path.endswith(".part")
     c = sqlite3.connect(path)
     assert c.execute("SELECT value FROM bot_state WHERE key='x'").fetchone()[0] == "1"
-    assert c.execute("PRAGMA user_version").fetchone()[0] == len(db.MIGRATIONS)
+    assert c.execute("PRAGMA user_version").fetchone()[0] == db.LEGACY_VERSION + len(db.ACCOUNT_MIGRATIONS)
     c.close()
 
 
 def test_backup_prunes_old_keeps_last(bcfg):
-    db.connect(bcfg.db_file).close()
+    db.account(bcfg).close()
     now = time.time()
     old = backup.backup(bcfg, now - 20 * 86400)
     os.utime(old, (now - 20 * 86400, now - 20 * 86400))
@@ -48,10 +48,10 @@ def test_backup_prunes_old_keeps_last(bcfg):
 
 
 def test_backup_cli(bcfg, monkeypatch, capsys):
-    db.connect(bcfg.db_file).close()
+    db.account(bcfg).close()
     monkeypatch.setattr(backup, "settings", bcfg)
     assert backup.main([]) == 0 and "МБ" in capsys.readouterr().out
-    monkeypatch.setattr(backup, "backup", lambda c: (_ for _ in ()).throw(RuntimeError("диск")))
+    monkeypatch.setattr(backup, "backup", lambda c, **k: (_ for _ in ()).throw(RuntimeError("диск")))
     assert backup.main([]) == 1
 
 
@@ -69,9 +69,10 @@ def test_backup_job_alerts_on_failure(bcfg, monkeypatch):
         sent.append((key, text))
         return True
     b.admin_alert = alert
-    monkeypatch.setattr(backup, "backup", lambda c: (_ for _ in ()).throw(RuntimeError("нет места")))
+    monkeypatch.setattr(backup, "backup", lambda c, now=None, path=None: (_ for _ in ()).throw(RuntimeError("нет места")))
     asyncio.run(b._backup_job(None))
-    assert sent == [("backup", "Резервная копия БД не сделана: нет места")]
+    assert sent == [("backup:account.db", "Резервная копия БД account.db не сделана: нет места"),
+                    ("backup:market.db", "Резервная копия БД market.db не сделана: нет места")]
 
 
 def test_health_ping_ok_and_fail(cfg, monkeypatch):
@@ -149,7 +150,7 @@ def test_backup_missing_db_and_failure_cleanup(bcfg, monkeypatch):
     with pytest.raises(FileNotFoundError):
         backup.backup(bcfg)
     assert not os.path.exists(bcfg.db_file)                               # пустую базу не создала
-    db.connect(bcfg.db_file).close()
+    db.account(bcfg).close()
 
     class Bad:
         def __init__(self, c):
@@ -186,7 +187,7 @@ def test_warning_healthcheck_without_collector(cfg):
 
 
 def test_prune_tolerates_concurrent_removal_and_failure_not_fatal(bcfg, monkeypatch):
-    db.connect(bcfg.db_file).close()
+    db.account(bcfg).close()
     real = os.path.getmtime
     monkeypatch.setattr(backup.os.path, "getmtime",
                         lambda f: (_ for _ in ()).throw(FileNotFoundError(f)) if f.endswith("gone.db") else real(f))
@@ -194,7 +195,7 @@ def test_prune_tolerates_concurrent_removal_and_failure_not_fatal(bcfg, monkeypa
     name = os.path.splitext(os.path.basename(bcfg.db_file))[0]
     open(os.path.join(bcfg.backup_dir_abs, f"{name}-0gone.db"), "w").close()
     assert backup.prune(bcfg) == []
-    monkeypatch.setattr(backup, "prune", lambda c, now=None: (_ for _ in ()).throw(PermissionError("ro")))
+    monkeypatch.setattr(backup, "prune", lambda c, now=None, path=None: (_ for _ in ()).throw(PermissionError("ro")))
     assert os.path.exists(backup.backup(bcfg))                          # копия есть — чистка не роняет
 
 
@@ -236,7 +237,7 @@ def test_backup_compressed_restorable_and_pruned_with_plain(bcfg, tmp_path):
     import gzip
     import shutil
     c = dataclasses.replace(bcfg, backup_compress=True)
-    conn = db.connect(c.db_file)
+    conn = db.account(c)
     with conn:
         conn.execute("INSERT INTO bot_state (key, value) VALUES ('x', '42')")
     conn.close()
@@ -257,7 +258,7 @@ def test_backup_compressed_restorable_and_pruned_with_plain(bcfg, tmp_path):
 
 def test_backup_compress_failure_cleans_part(bcfg, monkeypatch):
     c = dataclasses.replace(bcfg, backup_compress=True)
-    db.connect(c.db_file).close()
+    db.account(c).close()
 
     def boom(*a, **k):
         raise OSError("disk full")
@@ -269,7 +270,7 @@ def test_backup_compress_failure_cleans_part(bcfg, monkeypatch):
 
 def test_backup_compressed_crc_checked(bcfg, monkeypatch):
     c = dataclasses.replace(bcfg, backup_compress=True)
-    db.connect(c.db_file).close()
+    db.account(c).close()
     real = backup.shutil.copyfileobj
 
     def corrupt(fi, fo, n):  # пишет не то: подменённый поток — проверка CRC при чтении ловит

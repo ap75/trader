@@ -59,7 +59,7 @@ def params(**kw):
 
 
 def book(cfg):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     try:
         return dict(conn.execute("SELECT * FROM basis_books").fetchone())
     finally:
@@ -67,7 +67,7 @@ def book(cfg):
 
 
 def last_eq(cfg):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     try:
         return conn.execute("SELECT equity FROM basis_equity ORDER BY ts DESC LIMIT 1").fetchone()[0]
     finally:
@@ -163,7 +163,7 @@ def test_status_stats_and_books(bcfg):
     start, end = spot[40][0], c.now + 1
     rows = reports.basis_rows(start, end, bcfg, rf=0.04)
     r, = rows
-    conn = db.connect(bcfg.db_file)
+    conn = db.account(bcfg)
     before = conn.execute("SELECT equity FROM basis_equity WHERE ts < ? ORDER BY ts DESC LIMIT 1", (start,)).fetchone()[0]
     conn.close()
     assert r["pnl"] == pytest.approx(last_eq(bcfg) - before)            # от последней точки до периода
@@ -230,7 +230,7 @@ def test_rebalance_cost_is_fees_and_slippage_only(bcfg):
     for k in range(10, 159):
         c.now = spot[k][0] + DAY - 60_000
         bb.step(c.now)
-    conn = db.connect(bcfg.db_file)
+    conn = db.account(bcfg)
     rows = conn.execute("SELECT * FROM basis_events WHERE kind = 'rebalance' ORDER BY ts").fetchall()
     prev = {r["ts"]: r for r in conn.execute("SELECT * FROM basis_events WHERE kind IN ('enter', 'rebalance')")}
     conn.close()
@@ -263,7 +263,7 @@ def test_restarted_book_ignores_old_history(bcfg):
     for k in range(10, 40):
         c.now = spot[k][0] + DAY - 60_000
         bb.step(c.now)
-    conn = db.connect(bcfg.db_file)
+    conn = db.account(bcfg)
     with conn:
         conn.execute("DELETE FROM basis_books")
     conn.close()
@@ -312,7 +312,7 @@ def test_stress_worst_funding_week(bcfg):
 
 def test_period_without_point_before_starts_from_first_point(bcfg):
     bb, spot, c = run_days(bcfg, params(), 40)
-    conn = db.connect(bcfg.db_file)
+    conn = db.account(bcfg)
     with conn:   # бот «не работал» 10 дней до периода: точек кривой нет
         conn.execute("DELETE FROM basis_equity WHERE ts < ?", (spot[30][0],))
     first = conn.execute("SELECT equity FROM basis_equity WHERE ts >= ? ORDER BY ts LIMIT 1", (spot[30][0],)).fetchone()[0]

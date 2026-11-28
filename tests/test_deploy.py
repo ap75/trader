@@ -19,6 +19,8 @@ def test_unit_paths_consistent():
     assert wd.startswith("%h/")                    # без жёсткого пути и пользователя
     assert svc["ExecStart"] == f"{wd}/.venv/bin/python -m optbot.bot"
     assert svc["Restart"] == "always"
+    from optbot.bot import EXIT_NO_DB
+    assert svc["RestartPreventExitStatus"] == str(EXIT_NO_DB)   # БД не разделена — не перезапускать по кругу
     assert importlib.util.find_spec("optbot.bot") is not None
 
 

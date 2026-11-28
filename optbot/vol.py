@@ -198,11 +198,11 @@ def update_candles(conn, client, base: str, now_ms: int | None = None) -> int:
     done_key = f"perp_h1_complete2:{base}"   # 2: прежний признак ставился и на пропуске внутри истории
     if last is not None:
         page_back(now_ms, last)             # новые — до последней сохранённой
-    if conn.execute("SELECT 1 FROM bot_state WHERE key = ?", (done_key,)).fetchone() is None:
+    if conn.execute("SELECT 1 FROM market_state WHERE key = ?", (done_key,)).fetchone() is None:
         # начало истории ещё не загружено (первый раз или прошлая загрузка оборвалась) — с самой ранней свечи назад
         if page_back(first - 1 if first is not None else now_ms, None):   # не дошли — продолжим в следующий раз
             with conn:
-                conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, '1')", (done_key,))
+                conn.execute("INSERT OR REPLACE INTO market_state (key, value) VALUES (?, '1')", (done_key,))
     return n
 
 
@@ -278,7 +278,7 @@ class VolModels:
             return hit[1]
         m = None
         try:
-            conn = db.connect(self.cfg.db_file)
+            conn = db.market(self.cfg)
             try:
                 m = model_at(conn, base, horizon=horizon)
             finally:
@@ -303,7 +303,7 @@ class VolModels:
             self._refit_lock.release()
 
     def _refit(self, client, bases, now_ms: int, force: bool, res: RefitResult) -> RefitResult:
-        conn = db.connect(self.cfg.db_file)
+        conn = db.market(self.cfg)
         try:
             for base in bases or self.cfg.base_coins:
                 base = base.upper()

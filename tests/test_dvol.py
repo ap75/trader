@@ -35,7 +35,7 @@ class Deribit:
 
 
 def put_dvol(cfg, base, data: dict[int, float]):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         conn.executemany("INSERT INTO dvol_h1 (base, ts, close) VALUES (?,?,?)", [(base, t, v) for t, v in data.items()])
     conn.close()
@@ -77,7 +77,7 @@ def test_update_pages_back_fills_window_and_increments(dcfg, monkeypatch):
     monkeypatch.setattr(dvol, "PAGE", 100)
     data = series(80, H0 + HOUR_MS)          # последний бар ещё не закрыт к NOW — не сохраняется
     fake = Deribit(data)
-    conn = db.connect(dcfg.db_file)
+    conn = db.account(dcfg)
     res = dvol.update(conn, dcfg, NOW, fake, bases=("BTC",))
     lo = NOW - (dcfg.sig.lookback_days + dvol.SPARE_DAYS) * DAY_MS
     rows = dict(conn.execute("SELECT ts, close FROM dvol_h1 WHERE base = 'BTC'").fetchall())
@@ -98,7 +98,7 @@ def test_update_pages_back_fills_window_and_increments(dcfg, monkeypatch):
 
 
 def test_update_errors_stale_and_no_url(dcfg, cfg):
-    conn = db.connect(dcfg.db_file)
+    conn = db.account(dcfg)
 
     def boom(*a):
         raise OSError("нет сети")
@@ -165,7 +165,7 @@ def test_long_percentile_falls_back(cfg, make_client, long_market, fake):
     assert m.pctl_src is None and not m.enough_history
 
     # своей истории год и больше — своя
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     conn.execute("DELETE FROM dvol_h1")
     conn.commit()
     conn.close()
@@ -197,7 +197,7 @@ def test_journal_records_dvol(cfg, make_client, long_market):
     sig = SignalEngine(make_client(cfg), cfg).compute("BTC", NOW, horizon="long")
     assert sig.metrics.pctl == 100 and sig.strategy == "iron_condor", sig.no_signal
     sid = SignalJournal(cfg).record(sig, now_ms=NOW)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     met = json.loads(conn.execute("SELECT metrics FROM signals WHERE id = ?", (sid,)).fetchone()["metrics"])
     conn.close()
     assert met["pctl_src"] == "dvol" and met["dvol_ratio"] == dvol.REF_RATIO["BTC"] and met["har30"] > 0

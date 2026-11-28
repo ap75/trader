@@ -35,7 +35,7 @@ def sig(make_client, cfg, market):
 
 
 def q(cfg, sql, *a):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     try:
         return [dict(r) for r in conn.execute(sql, a)]
     finally:
@@ -54,7 +54,20 @@ def test_record_and_track_legs(cfg, sig):
     assert [d["symbol"] for d in json.loads(r["legs"])] == [l.symbol for l in sig.legs]
     tracked = q(cfg, "SELECT symbol, until_ms, reason FROM tracked_symbols")
     assert {t["symbol"] for t in tracked} == {l.symbol for l in sig.legs}
-    assert all(t["until_ms"] == EXP_MS and t["reason"] == f"sig:{sid}" for t in tracked)
+    assert all(t["until_ms"] == EXP_MS and t["reason"] == f"demo:sig:{sid}" for t in tracked)
+
+
+def test_evaluate_restores_lost_tracking(cfg, sig):
+    sj = SignalJournal(cfg)
+    sid = sj.record(sig, now_ms=NOW)
+    conn = db.account(cfg)
+    with conn:                                             # сбой между записью сигнала и слежения
+        conn.execute("DELETE FROM tracked_symbols")
+    conn.close()
+    sj.evaluate(now_ms=NOW + 1000)
+    tracked = q(cfg, "SELECT symbol, until_ms, reason FROM tracked_symbols")
+    assert {t["symbol"] for t in tracked} == {l.symbol for l in sig.legs}
+    assert all(t["until_ms"] == EXP_MS and t["reason"] == f"demo:sig:{sid}" for t in tracked)
 
 
 def test_record_same_trade_once(cfg, sig, make_client, market):
@@ -138,7 +151,7 @@ def test_evaluate_settles_after_expiry(cfg, sig):
 def test_evaluate_loss_and_path(cfg, sig):
     sj = SignalJournal(cfg)
     sid = sj.record(sig, now_ms=NOW)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         for l in sig.legs:  # один срез котировок: цены как при входе — PnL на закрытие = −спред
             conn.execute("INSERT INTO leg_marks (ts, symbol, mark, bid, ask) VALUES (?,?,?,?,?)",
@@ -189,7 +202,7 @@ def test_settle_only_once_across_runs(cfg, sig):
     sj.record(sig, now_ms=NOW)
     _set_price(cfg, 65000)
     row = q(cfg, "SELECT * FROM signals")[0]
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         assert SignalJournal._settle(conn, row, 65000, EXP_MS + 1) is True
         assert SignalJournal._settle(conn, row, 65000, EXP_MS + 2) is False
@@ -224,7 +237,7 @@ def _settled_rows(cfg, sig, prices):
     for i, p in enumerate(prices):
         sig.expiry_ms = EXP_MS + i * DAY_MS
         sj.record(sig, now_ms=NOW + i)
-        conn = db.connect(cfg.db_file)
+        conn = db.account(cfg)
         with conn:  # ключ ног тот же — открытая строка была бы переиспользована; закрываем её сразу
             conn.execute("UPDATE signals SET legs_key = legs_key || ? WHERE legs_key NOT LIKE '%#%'", (f"#{i}",))
         conn.close()
@@ -244,7 +257,7 @@ def test_stats_and_format(cfg, sig):
     assert "Сигналов с ногами за период нет" in fmt_stats(compute_stats([], "7 дн."))
 
 
-def test_stats_counts_open(cfg, sig):
+def test_stats_counts_open(cfg, sig, clock_before_expiry):
     SignalJournal(cfg).record(sig, now_ms=NOW)
     st = compute_stats(SignalJournal(cfg).rows(0, 10 ** 15), "7 дн.")
     assert (st.total.n, st.total.settled) == (1, 0)
@@ -299,7 +312,7 @@ def test_bot_record_failure_does_not_block_card(b, monkeypatch, caplog):
 def test_bot_signals_stats_and_csv(b, cfg):
     tg = TG()
     run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("BTC")))
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:  # запись — по реальным часам бота, а время расчёта подменено; для отбора по периоду — «сейчас»
         conn.execute("UPDATE signals SET ts = ?", (int(__import__("time").time() * 1000) - 1000,))
     conn.close()
@@ -395,7 +408,7 @@ def test_half_target_with_zero_max_profit(cfg, sig, monkeypatch):
     sj = SignalJournal(cfg)
     sid = sj.record(sig, now_ms=NOW)
     _set_price(cfg, 65000)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         conn.execute("UPDATE signals SET max_profit = 0 WHERE id = ?", (sid,))
     conn.close()
@@ -551,7 +564,7 @@ def test_record_failure_retried_on_next_view(b, cfg, monkeypatch):
 
 
 # ---------- ревью 6 ----------
-def test_double_tap_counts_once(b, cfg):
+def test_double_tap_counts_once(b, cfg, clock_before_expiry):
     tg = TG()
     run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("BTC")))
 
@@ -578,13 +591,13 @@ def test_track_uses_record_time(cfg, sig):
 
 
 # ---------- ревью 7 ----------
-def test_same_user_after_cache_ttl_not_counted_again(b, cfg):
+def test_same_user_after_cache_ttl_not_counted_again(b, cfg, clock_before_expiry):
     tg = TG()
     run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("BTC")))
     b._sig_cache.clear()                                   # прошло больше SIGNAL_CACHE_TTL — пересчёт
     run(b.cmd_signals(tg.upd(VIEWER), tg.ctx("BTC")))
     assert q(cfg, "SELECT shown FROM signals")[0]["shown"] == 1
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:                                             # прошли сутки — снова показ
         conn.execute("UPDATE signal_views SET ts = ts - ?", (2 * DAY_MS,))
     conn.close()
@@ -610,7 +623,7 @@ def test_void_not_double_counted(cfg, sig, make_client, monkeypatch):
     orig = client.delivery_prices
 
     def closing(base):  # пока этот проход спрашивал биржу, другой закрыл запись
-        conn = db.connect(cfg.db_file)
+        conn = db.account(cfg)
         with conn:
             conn.execute("UPDATE signals SET settled_ms = 1 WHERE id = ?", (sid,))
         conn.close()
@@ -634,7 +647,7 @@ def test_eval_job_no_targets_marks_announced(b, cfg, sig):
 def test_evaluate_broken_row_does_not_stop_others(cfg, sig):
     sj = SignalJournal(cfg)
     a = sj.record(sig, now_ms=NOW)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         conn.execute("UPDATE signals SET legs = '[{}]', legs_key = 'broken' WHERE id = ?", (a,))
     conn.close()
@@ -657,10 +670,11 @@ def test_repeat_line_when_journal_prices_differ(sig):
 def test_show_uses_short_db_timeout(cfg, sig, monkeypatch):
     seen = []
     real = db.connect
-    monkeypatch.setattr(sigjournal.db, "connect", lambda path, timeout=30: seen.append(timeout) or real(path, timeout))
+    monkeypatch.setattr(sigjournal.db, "connect",
+                        lambda path, timeout=30, **kw: seen.append(timeout) or real(path, timeout, **kw))
     sj = SignalJournal(cfg)
     sj.record(sig, now_ms=NOW)
-    assert seen == [sigjournal.SHOW_DB_TIMEOUT_S]
+    assert seen and set(seen) == {sigjournal.SHOW_DB_TIMEOUT_S}   # БД счёта и подключаемая рыночная
 
 
 # ---------- ревью 9 ----------
@@ -676,7 +690,7 @@ def test_path_long_leg_zero_bid_is_exit_value():
 def test_path_includes_slot_captured_after_entry(cfg, sig):
     sj = SignalJournal(cfg)
     sid = sj.record(sig, now_ms=NOW + 2000)                     # показ в 08:00:02
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         for l in sig.legs:  # срез 08:00 снят в 08:00:05 — после входа, должен войти в путь
             conn.execute("INSERT INTO leg_marks (ts, symbol, mark, bid, ask, captured_ms) VALUES (?,?,?,?,?,?)",
@@ -690,7 +704,7 @@ def test_path_includes_slot_captured_after_entry(cfg, sig):
 def test_broken_row_closed_after_timeout(cfg, sig, caplog):
     sj = SignalJournal(cfg)
     a = sj.record(sig, now_ms=NOW)
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         conn.execute("UPDATE signals SET legs = '[{}]' WHERE id = ?", (a,))
     conn.close()
@@ -743,7 +757,7 @@ def test_eval_job_gives_up_when_undeliverable(b, cfg, sig, caplog):
     b.sigjournal.evaluate = lambda client: sigjournal.EvalResult()
     run(b._sigeval_job(NS()))                                  # свежий итог — повторим позже
     assert len(SignalJournal(cfg).unannounced()) == 1
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         conn.execute("UPDATE signals SET settled_ms = ?", (int(__import__("time").time() * 1000) - 2 * DAY_MS,))
     conn.close()
@@ -771,8 +785,8 @@ def test_repeat_view_needs_no_write_lock(cfg, sig, monkeypatch):
     real = db.connect
     stmts = []
 
-    def spy(path, timeout=30):
-        c = real(path, timeout)
+    def spy(path, timeout=30, **kw):
+        c = real(path, timeout, **kw)
         c.set_trace_callback(stmts.append)
         return c
     monkeypatch.setattr(sigjournal.db, "connect", spy)
@@ -784,7 +798,7 @@ def test_repeat_view_needs_no_write_lock(cfg, sig, monkeypatch):
 # ---------- ревью 11 ----------
 def test_giveup_marks_only_stale_rows(b, cfg, sig):
     rows = _settled_rows(cfg, sig, [65000, 65000])
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:  # первый посчитан двое суток назад, второй — только что
         conn.execute("UPDATE signals SET settled_ms = ? WHERE id = ?",
                      (int(__import__("time").time() * 1000) - 2 * DAY_MS, rows[0]["id"]))

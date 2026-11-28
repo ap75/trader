@@ -164,7 +164,7 @@ def stress(cfg: Settings = settings, now_ms: int | None = None, conn=None) -> St
     import time
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     own = conn is None
-    conn = conn or db.connect(cfg.db_file)
+    conn = conn or db.account(cfg)
     try:
         trades = conn.execute("SELECT * FROM paper_trades WHERE status = 'open' ORDER BY id").fetchall()
         try:
@@ -445,7 +445,7 @@ class BooksReport:
 def books_report(start_ms: int, end_ms: int, label: str, cfg: Settings = settings, horizon: str | None = None,
                  base: str | None = None, conn=None) -> BooksReport:
     own = conn is None
-    conn = conn or db.connect(cfg.db_file)
+    conn = conn or db.account(cfg)
     cap = cfg.paper.capital_usdt
     try:
         closed = [dict(r) for r in conn.execute(
@@ -550,7 +550,7 @@ def basis_rows(start_ms: int, end_ms: int, cfg: Settings = settings, base: str |
     ставки, номинал / капитал книги на конец периода; observe — книга «наблюдение» (в итог базиса не входит)."""
     from .basisbook import is_observe, load_params
     own = conn is None
-    conn = conn or db.connect(cfg.db_file)
+    conn = conn or db.account(cfg)
     try:
         try:
             p = load_params()
@@ -654,7 +654,7 @@ def watch_line(start_ms: int, end_ms: int, cfg: Settings = settings, conn=None) 
     """Строка еженедельного отчёта по стратегиям без ответа бэктеста: закрытые за период и всего, сколько книг в
     плюсе и наибольшее число сделок в книге против REVIEW_MIN_TRADES."""
     own = conn is None
-    conn = conn or db.connect(cfg.db_file)
+    conn = conn or db.account(cfg)
     try:
         rows = [dict(r) for r in conn.execute(
             f"SELECT book, strategy, pnl, r_mult, closed_ms FROM paper_trades WHERE status = 'closed' AND "

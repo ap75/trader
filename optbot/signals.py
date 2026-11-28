@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
 from decimal import Decimal
 import time
@@ -170,8 +171,11 @@ def percentile(history: list[float], x: float) -> float | None:
 
 
 def iv7_history(path: str, base: str, since_ms: int, target_days: float) -> list[tuple[int, float]]:
-    """IV7 по каждому срезу сборщика с since_ms: [(ts, IV7)] по возрастанию ts."""
-    conn = db.connect(path)
+    """IV7 по каждому срезу сборщика с since_ms: [(ts, IV7)] по возрастанию ts. Рыночной БД нет — истории нет (файл
+    не создаётся: пустая рыночная до --split помешала бы разделению)."""
+    if path != ":memory:" and not os.path.exists(path):
+        return []
+    conn = db.connect(path, role=db.MARKET)
     try:
         rows = conn.execute("SELECT ts, dte, atm_iv FROM snapshots WHERE base = ? AND ts >= ? ORDER BY ts",
                             (base, since_ms)).fetchall()
@@ -639,8 +643,8 @@ class SignalEngine:
     def __init__(self, client: OptionsClient, cfg: Settings = settings):
         self.c = client
         self.cfg = cfg
-        self.history = IV7History(cfg.db_file, cfg.sig.target_days)
-        self.history_long = IV7History(cfg.db_file, cfg.sig.long_target_days)  # IV30 (E1)
+        self.history = IV7History(cfg.market_db_file, cfg.sig.target_days)
+        self.history_long = IV7History(cfg.market_db_file, cfg.sig.long_target_days)  # IV30 (E1)
         self.events = events_calendar(cfg.events_file)
         self.vol = VolModels(cfg)
         self._own_first: dict[str, int] = {}   # актив -> первый срез сборщика (своя история IV30 — с него)
@@ -742,7 +746,7 @@ class SignalEngine:
         if base not in dvol.BASES:
             return False
         try:
-            conn = db.connect(self.cfg.db_file)
+            conn = db.market(self.cfg)
             try:
                 if base not in self._own_first:
                     first = conn.execute("SELECT MIN(ts) t FROM snapshots WHERE base = ?", (base,)).fetchone()["t"]

@@ -19,10 +19,10 @@ def test_parse_csv_skips_missing():
 
 def test_update_saves_and_falls_back(cfg):
     c = dataclasses.replace(cfg, rf_url="https://x/csv?id=DTB3")
-    conn = db.connect(c.db_file)
+    conn = db.account(c)
     got = rates.update(conn, c, D19 + DAY_MS, fetcher=lambda url, now: (D19, 0.0420))
     assert got.rate.rate == 0.042 and got.rate.source == "fred" and not got.stale and got.error is None
-    saved = json.loads(conn.execute("SELECT value FROM bot_state WHERE key = ?", (rates.STATE_KEY,)).fetchone()[0])
+    saved = json.loads(conn.execute("SELECT value FROM market_state WHERE key = ?", (rates.STATE_KEY,)).fetchone()[0])
     assert saved["date_ms"] == D19
 
     def boom(url, now):
@@ -35,7 +35,7 @@ def test_update_saves_and_falls_back(cfg):
 
 
 def test_config_fallback_when_never_fetched(cfg):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     r = rates.current(conn)
     assert r.source == "config" and r.rate == pytest.approx(0.0416) and r.date_ms == D19
     assert rates.update(conn, cfg, D19 + 10 * DAY_MS).stale                     # RF_URL пуст — не берём, но видно
@@ -81,22 +81,22 @@ def test_rf_url_must_be_https(cfg):
 
 
 def test_newer_config_rate_wins_over_old_fred(cfg, monkeypatch):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
-        conn.execute("INSERT INTO bot_state (key, value) VALUES (?, ?)",
+        conn.execute("INSERT INTO market_state (key, value) VALUES (?, ?)",
                      (rates.STATE_KEY, json.dumps({"rate": 0.05, "date_ms": D19 - 30 * DAY_MS})))
     assert rates.current(conn).source == "config"                                # config 2026-11-19 свежее
     with conn:
-        conn.execute("UPDATE bot_state SET value = ? WHERE key = ?",
+        conn.execute("UPDATE market_state SET value = ? WHERE key = ?",
                      (json.dumps({"rate": 0.039, "date_ms": D19 + DAY_MS}), rates.STATE_KEY))
     assert rates.current(conn).rate == 0.039
     conn.close()
 
 
 def test_fred_used_when_config_broken(cfg, monkeypatch):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
-        conn.execute("INSERT INTO bot_state (key, value) VALUES (?, ?)",
+        conn.execute("INSERT INTO market_state (key, value) VALUES (?, ?)",
                      (rates.STATE_KEY, json.dumps({"rate": 0.04, "date_ms": D19})))
 
     def broken():
@@ -104,7 +104,7 @@ def test_fred_used_when_config_broken(cfg, monkeypatch):
     monkeypatch.setattr(rates, "_config_rate", broken)
     assert rates.current(conn).rate == 0.04
     with conn:
-        conn.execute("DELETE FROM bot_state")
+        conn.execute("DELETE FROM market_state")
     with pytest.raises(ValueError):
         rates.current(conn)
     conn.close()

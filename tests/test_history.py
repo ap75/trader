@@ -17,12 +17,12 @@ DAY = 86_400_000
 
 @pytest.fixture
 def hcfg(cfg, tmp_path):
-    return with_cfg(cfg, db_path=str(tmp_path / "market.db"), chain_snapshot_min=60, chain_max_dte=60,
+    return with_cfg(cfg, db_path=str(tmp_path / "account.db"), market_db_path=str(tmp_path / "market.db"), chain_snapshot_min=60, chain_max_dte=60,
                     chain_min_delta=0.02, chain_keep_days=0, fng_url="")
 
 
 def q(cfg, sql, *a):
-    conn = sqlite3.connect(cfg.db_path)
+    conn = sqlite3.connect(cfg.market_db_file)
     conn.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in conn.execute(sql, a)]
@@ -123,7 +123,7 @@ def test_fear_greed_backfill_then_daily(make_client, hcfg, monkeypatch):
     col._fng_tried = -1e18
     assert col.update_fear_greed(NOW + 30 * 60_000) == 0 and len(urls) == 2   # сегодняшний день уже есть
     assert [r["value"] for r in q(c, "SELECT value FROM fear_greed ORDER BY ts")] == [40, 41, 41]
-    assert "индекс страха и жадности: 3 дн." in stats(c.db_file)
+    assert "индекс страха и жадности: 3 дн." in stats(c)
 
 
 def test_fear_greed_failure_throttled_and_not_fatal(make_client, hcfg, monkeypatch):
@@ -145,7 +145,7 @@ def test_fear_greed_failure_throttled_and_not_fatal(make_client, hcfg, monkeypat
 def test_stats_lists_history(make_client, hcfg, fake):
     set_chain(fake)
     Collector(make_client(hcfg), hcfg).collect(NOW)
-    s = stats(hcfg.db_file)
+    s = stats(hcfg)
     assert "цепочка BTC: срезов 1" in s and "фондирование и OI:" in s
 
 
@@ -211,20 +211,20 @@ def test_chain_failure_does_not_lose_snapshot(make_client, hcfg, fake, monkeypat
     orig = col._chain_due
     col._chain_due = lambda conn, base, ts: True
     from optbot import db
-    c = db.connect(hcfg.db_file)
+    c = db.account(hcfg)
     c.execute("DROP TABLE chain_snapshots")                          # запись цепочки упадёт
     c.commit()
     c.close()
     res = col.collect(NOW)
     assert res.snapshots == 3 and not res.errors and res.chain == 0
     col._chain_due = orig
-    assert not col._chain_due(db.connect(hcfg.db_file), "BTC", NOW)   # SELECT по пропавшей таблице — False
+    assert not col._chain_due(db.account(hcfg), "BTC", NOW)   # SELECT по пропавшей таблице — False
 
 
 def test_fear_greed_db_error_not_fatal(make_client, hcfg):
     from optbot import db
     c = with_cfg(hcfg, fng_url="https://api.example/fng/")
-    conn = db.connect(c.db_file)
+    conn = db.account(c)
     conn.execute("DROP TABLE fear_greed")
     conn.commit()
     conn.close()
@@ -241,7 +241,7 @@ def test_keep_days_prunes_with_chain_off(make_client, hcfg, fake):
 
 def test_perp_context_failure_keeps_snapshot(make_client, hcfg):
     from optbot import db
-    conn = db.connect(hcfg.db_file)
+    conn = db.account(hcfg)
     conn.execute("DROP TABLE perp_context")
     conn.commit()
     conn.close()

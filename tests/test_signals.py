@@ -20,7 +20,7 @@ YEAR_H = 365 * 24
 
 
 def add_history(cfg, base, ivs, start_ms, step_ms=DAY_MS, dte=7.0):
-    conn = db.connect(cfg.db_file)
+    conn = db.account(cfg)
     with conn:
         for i, iv in enumerate(ivs):
             conn.execute("INSERT INTO snapshots (ts, base, expiry, expiry_ms, dte, atm_iv) VALUES (?,?,?,?,?,?)",

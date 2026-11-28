@@ -19,9 +19,10 @@ def with_cfg(cfg: Settings, **kw) -> Settings:
     return dataclasses.replace(cfg, **kw)
 
 
-def track_symbols(path: str, symbols: list[str], until_ms: int, reason: str = "") -> None:
-    """Поставить ноги на слежение отдельным соединением (в коде — track() в транзакции журнала сигналов)."""
-    conn = db.connect(path)
+def track_symbols(cfg: Settings, symbols: list[str], until_ms: int, reason: str = "") -> None:
+    """Поставить ноги на слежение отдельным соединением БД счёта (в коде — track() в транзакции журнала сигналов;
+    таблица — в рыночной БД)."""
+    conn = db.account(cfg)
     try:
         with conn:
             track(conn, symbols, until_ms, reason)

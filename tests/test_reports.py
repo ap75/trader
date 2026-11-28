@@ -24,7 +24,7 @@ def rcfg(cfg):
 
 
 def conn_of(cfg):
-    return db.connect(cfg.db_file)
+    return db.account(cfg)
 
 
 def add_trade(conn, book, legs, qty=1.0, status="open", forward=60000.0, **kw):
